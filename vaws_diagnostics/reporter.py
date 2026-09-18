@@ -16,7 +16,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 from .outbox import Outbox
 from .community import ConsentWithdrawn, check_remote_action, guard_consent, require_consent
 
-DEFAULT_REPOSITORY = "vllm-ascend-workspace/vllm-ascend-workspace"
+DEFAULT_REPOSITORY = "mindie-agent/mindie-agent"
 MARKER = "<!-- vaws-incident:"
 
 

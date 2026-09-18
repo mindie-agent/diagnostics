@@ -1,4 +1,4 @@
-# vaws-diagnostics
+# diagnostics · MindIE Agent
 
 Structured logs, phase timings, sanitized support bundles, automatic GitHub
 issues and an independent Grok diagnosis worker for VAWS components. The Python
@@ -134,7 +134,7 @@ deleted by changing local consent. These limits are not an exactly-once or
 remote deletion guarantee.
 
 The default destination is
-`vllm-ascend-workspace/vllm-ascend-workspace`; `--repository owner/repo` overrides
+`mindie-agent/mindie-agent`; `--repository owner/repo` overrides
 it. Repeat `--root` to watch multiple explicit diagnostic roots. `--once` runs one
 cycle for Task Scheduler, systemd timers or other service managers; otherwise the
 worker repeats every 60 seconds. `--interval` changes this (minimum 5 seconds).
@@ -267,7 +267,7 @@ A maintainer can explicitly authorize a separate central worker:
 
 ```sh
 vaws-diagnostics worker --central-bot --state /path/to/central-state \
-  --repository vllm-ascend-workspace/vllm-ascend-workspace \
+  --repository mindie-agent/mindie-agent \
   --grok grok --grok-home /path/to/grok-bot-home --grok-work /path/to/empty-bot-work
 ```
 

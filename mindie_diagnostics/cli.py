@@ -54,7 +54,7 @@ def run_cycle(args, queue, github, recorder, health, grok=None, bot_queue=None, 
 
 
 def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(prog="vaws-diagnostics", description="Local diagnostics and independently enabled automatic issue reporting")
+    result = argparse.ArgumentParser(prog="mindie-diagnostics", description="Local diagnostics and independently enabled automatic issue reporting")
     sub = result.add_subparsers(dest="command", required=True)
     bundle = sub.add_parser("bundle", help="export a bounded sanitized support bundle, without uploading")
     bundle.add_argument("--root", required=True)
@@ -157,7 +157,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.central_bot and not args.root:
         parser().error('a local reporting worker requires --root')
     from . import configure, __version__
-    recorder = configure("vaws-diagnostics", root=state / "diagnostics", version=__version__)
+    recorder = configure("mindie-diagnostics", root=state / "diagnostics", version=__version__)
     queue = None if args.central_bot else Outbox(state / "reporter.sqlite3")
     github = GitHub(args.repository, executable=args.gh)
     stop = threading.Event()

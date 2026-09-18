@@ -19,8 +19,8 @@ import sys
 import tempfile
 import time
 
-UNIT = "vaws-diagnostics.service"
-MARKER = "# Owned by vaws-diagnostics user-service schema=1\n"
+UNIT = "mindie-diagnostics.service"
+MARKER = "# Owned by mindie-diagnostics user-service schema=1\n"
 METADATA = "# Installation: "
 MAX_UNIT_BYTES = 32768
 
@@ -148,11 +148,11 @@ def _executable(value):
 
 def _interpreter(runner, python):
     path = _executable(python or sys.executable)
-    code = ("import importlib.metadata as m,json,sys;d=m.distribution('vaws-diagnostics');"
+    code = ("import importlib.metadata as m,json,sys;d=m.distribution('mindie-diagnostics');"
             "u=json.loads(d.read_text('direct_url.json') or '{}');"
             "print(json.dumps({'prefix':sys.prefix,'base':sys.base_prefix,'version':d.version,"
             "'editable':u.get('dir_info',{}).get('editable',False),"
-            "'package':str(d.locate_file('vaws_diagnostics'))}))")
+            "'package':str(d.locate_file('mindie_diagnostics'))}))")
     reply = _run(runner, [str(path), "-I", "-c", code], action="interpreter.verify")
     try:
         facts = json.loads(reply.stdout)
@@ -194,7 +194,7 @@ def _reporter_executable(value, environment_file):
 def _locked(path):
     import fcntl
     path.parent.mkdir(parents=True, exist_ok=True)
-    lock = path.parent / ".vaws-diagnostics-service.lock"
+    lock = path.parent / ".mindie-diagnostics-service.lock"
     descriptor = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     try:
         deadline = time.monotonic() + 10
@@ -216,8 +216,8 @@ def _publish(path, text, runner):
         raise ServiceError("unit_too_large")
     # An isolated sibling directory keeps systemd-analyze from loading a broken
     # old unit alongside the candidate. It remains on the same filesystem.
-    staging = Path(tempfile.mkdtemp(prefix='.vaws-unit-', dir=path.parent))
-    descriptor, temporary = tempfile.mkstemp(prefix="vaws-diagnostics-", suffix=".service", dir=staging)
+    staging = Path(tempfile.mkdtemp(prefix='.mindie-unit-', dir=path.parent))
+    descriptor, temporary = tempfile.mkstemp(prefix="mindie-diagnostics-", suffix=".service", dir=staging)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
             stream.write(text)
@@ -297,7 +297,7 @@ def install_service(roots, state, repository, *, python=None, gh=None, grok=None
         environment_file = _environment_file(environment_file) if environment_file is not None else None
         gh_path = (str(_executable(gh)) if ensure and existing and environment_file is None
                    else _reporter_executable(gh, environment_file))
-        argv = [str(interpreter), "-I", "-m", "vaws_diagnostics.cli", "worker"]
+        argv = [str(interpreter), "-I", "-m", "mindie_diagnostics.cli", "worker"]
         if central_bot:
             argv.append("--central-bot")
         for root in dict.fromkeys(roots):
@@ -309,13 +309,13 @@ def install_service(roots, state, repository, *, python=None, gh=None, grok=None
                      "--grok-work", str(_absolute(grok_work))]
         metadata = {"schema": 1, "since": fixed_since}
         text = (MARKER + METADATA + json.dumps(metadata, separators=(",", ":")) + "\n"
-                "[Unit]\nDescription=VAWS local diagnostics reporter\nAfter=network-online.target\n"
+                "[Unit]\nDescription=MindIE local diagnostics reporter\nAfter=network-online.target\n"
                 "\n[Service]\nType=exec\nExecStart=" + " ".join(map(_quoted, argv)) + "\n"
                 "WorkingDirectory=/\n"
                 + ("EnvironmentFile=" + str(environment_file).replace('%', '%%') + "\n" if environment_file else "") +
                 "UnsetEnvironment=PYTHONPATH PYTHONHOME\nRestart=on-failure\nRestartSec=10\n"
                 "TimeoutStopSec=20\nKillMode=control-group\nUMask=0077\n"
-                "StandardOutput=journal\nStandardError=journal\nSyslogIdentifier=vaws-diagnostics\n"
+                "StandardOutput=journal\nStandardError=journal\nSyslogIdentifier=mindie-diagnostics\n"
                 "LogRateLimitIntervalSec=30s\nLogRateLimitBurst=100\n"
                 "\n[Install]\nWantedBy=default.target\n")
         changed = existing is None or existing[0] != text

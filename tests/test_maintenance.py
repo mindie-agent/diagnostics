@@ -1,6 +1,6 @@
 import os
 
-from vaws_diagnostics.maintenance import prune
+from mindie_diagnostics.maintenance import prune
 
 
 def test_retention_preserves_fresh_and_unrelated_files(tmp_path):
@@ -20,9 +20,9 @@ def test_retention_preserves_fresh_and_unrelated_files(tmp_path):
 
 
 def test_worker_retention_preserves_unread_old_evidence(tmp_path, community_consent):
-    from vaws_diagnostics import configure
-    from vaws_diagnostics.ingestion import ingest
-    from vaws_diagnostics.outbox import Outbox
+    from mindie_diagnostics import configure
+    from mindie_diagnostics.ingestion import ingest
+    from mindie_diagnostics.outbox import Outbox
     from pathlib import Path
 
     recorder = configure('retention-test', root=tmp_path)

@@ -13,12 +13,12 @@ import os
 from pathlib import Path, PureWindowsPath
 import re
 
-POLICY_ENV = "VAWS_COMMUNITY_POLICY"
-SCHEMA = "vaws.community.v1"
+POLICY_ENV = "MINDIE_COMMUNITY_POLICY"
+SCHEMA = "mindie.community.v1"
 _ID = re.compile(r"[0-9a-f]{32}\Z")
 _UNSET = object()
-_POLICY = ContextVar("vaws_community_policy", default=_UNSET)
-_GUARD = ContextVar("vaws_community_guard", default=_UNSET)
+_POLICY = ContextVar("mindie_community_policy", default=_UNSET)
+_GUARD = ContextVar("mindie_community_guard", default=_UNSET)
 
 
 class ConsentWithdrawn(RuntimeError):

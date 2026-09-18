@@ -11,7 +11,7 @@ MAX_LINE_BYTES = 16_384
 _LEVEL = re.compile(r"(?:^|\s)(DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL)(?:\s|:|\])")
 _CAPTURE_LOCK = threading.Lock()
 _CAPTURE_PID = os.getpid()
-_STORAGE_WARNING = "vaws-diagnostics: WARNING diagnostic storage unavailable; business outcome unchanged"
+_STORAGE_WARNING = "mindie-diagnostics: WARNING diagnostic storage unavailable; business outcome unchanged"
 
 
 def drain(descriptor, operation, stream, storage_warning=None):
@@ -89,7 +89,7 @@ def capture_output(operation):
                     os.dup2(write_fd, descriptor)
                     thread = threading.Thread(target=wrap_context(drain),
                                               args=(read_fd, operation, stream, storage_warning), daemon=True,
-                                              name="vaws-output-" + stream)
+                                              name="mindie-output-" + stream)
                     thread.start()
                 except BaseException:
                     if backup is not None:

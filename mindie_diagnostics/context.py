@@ -8,10 +8,10 @@ import json
 import os
 import re
 
-_CURRENT: ContextVar[dict | None] = ContextVar("vaws_diagnostics_context", default=None)
+_CURRENT: ContextVar[dict | None] = ContextVar("mindie_diagnostics_context", default=None)
 _KEYS = ("trace_id", "operation_id", "parent_operation_id", "phase_id")
 _ID = re.compile(r"[0-9a-f]{32}\Z")
-CONTEXT_ENV = "VAWS_DIAGNOSTICS_CONTEXT"
+CONTEXT_ENV = "MINDIE_DIAGNOSTICS_CONTEXT"
 
 
 def _validated(value) -> dict:

@@ -3,9 +3,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "vaws-diagnostics"
+name = "mindie-diagnostics"
 version = "0.2.1"
-description = "Bounded structured diagnostics and safe support bundles for VAWS owners"
+description = "Bounded structured diagnostics and safe support bundles for MindIE owners"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []
@@ -14,7 +14,7 @@ dependencies = []
 test = ["pytest>=8,<10"]
 
 [project.scripts]
-vaws-diagnostics = "vaws_diagnostics.cli:main"
+mindie-diagnostics = "mindie_diagnostics.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["vaws_diagnostics"]
+packages = ["mindie_diagnostics"]

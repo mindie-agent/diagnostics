@@ -8,17 +8,17 @@ import uuid
 
 import pytest
 
-from vaws_diagnostics import bind_community_policy, collect_bundle, configure
-from vaws_diagnostics.bot import Grok, diagnose_one, enqueue_issues
-from vaws_diagnostics.community import (ConsentWithdrawn, consent_allowed, current_consent,
+from mindie_diagnostics import bind_community_policy, collect_bundle, configure
+from mindie_diagnostics.bot import Grok, diagnose_one, enqueue_issues
+from mindie_diagnostics.community import (ConsentWithdrawn, consent_allowed, current_consent,
                                         guard_consent, read_policy)
-from vaws_diagnostics.ingestion import ingest
-from vaws_diagnostics.outbox import Outbox
-from vaws_diagnostics.reporter import GitHub, publish_one, render_issue
+from mindie_diagnostics.ingestion import ingest
+from mindie_diagnostics.outbox import Outbox
+from mindie_diagnostics.reporter import GitHub, publish_one, render_issue
 
 
 def policy(path, *, decision='enabled', workspace_id=None):
-    receipt = {'schema': 'vaws.community.v1', 'workspace_id': workspace_id or uuid.uuid4().hex,
+    receipt = {'schema': 'mindie.community.v1', 'workspace_id': workspace_id or uuid.uuid4().hex,
                'decision': decision, 'revision': uuid.uuid4().hex}
     path.parent.mkdir(parents=True, exist_ok=True)
     stage = path.with_suffix('.tmp')
@@ -65,7 +65,7 @@ class Publisher:
 
 
 def test_default_and_explicit_disabled_keep_logs_but_never_enqueue(tmp_path, monkeypatch):
-    monkeypatch.delenv('VAWS_COMMUNITY_POLICY', raising=False)
+    monkeypatch.delenv('MINDIE_COMMUNITY_POLICY', raising=False)
     receipt = tmp_path / 'community.json'
     policy(receipt, decision='disabled')
     for selected in (None, receipt):
@@ -221,7 +221,7 @@ def test_grok_rechecks_after_local_inspection_before_paid_request(tmp_path, comm
 
 
 @pytest.mark.parametrize('contents', ['{}', '[]', 'null', '{', 'x' * 16385,
-                                     '{"schema":"vaws.community.v1","decision":[]}'])
+                                     '{"schema":"mindie.community.v1","decision":[]}'])
 def test_missing_or_malformed_policy_fails_closed(tmp_path, contents):
     path = tmp_path / 'community.json'
     assert read_policy(path) is None
@@ -235,7 +235,7 @@ def test_request_bindings_isolate_parallel_workspaces(tmp_path, monkeypatch):
     first, second = tmp_path / 'first.json', tmp_path / 'second.json'
     policy(first)
     policy(second)
-    monkeypatch.setenv('VAWS_COMMUNITY_POLICY', str(first))
+    monkeypatch.setenv('MINDIE_COMMUNITY_POLICY', str(first))
 
     async def request(path):
         with bind_community_policy(path):
@@ -253,13 +253,13 @@ def test_request_bindings_isolate_parallel_workspaces(tmp_path, monkeypatch):
 
 
 def test_windows_policy_path_is_mapped_for_wsl_reader(monkeypatch):
-    from vaws_diagnostics import community
+    from mindie_diagnostics import community
     monkeypatch.setattr(community.os, 'name', 'posix')
     # Avoid instantiating PosixPath on a Windows interpreter by injecting a
     # pure path constructor; the production mapping is exercised in WSL CI.
     from pathlib import PurePosixPath
     monkeypatch.setattr(community, 'Path', PurePosixPath)
-    assert str(community._path('D:\\workspace\\.vaws-local\\community.json')) == '/mnt/d/workspace/.vaws-local/community.json'
+    assert str(community._path('D:\\workspace\\.mindie-local\\community.json')) == '/mnt/d/workspace/.mindie-local/community.json'
     with pytest.raises(ValueError):
         community._path('\\\\host\\share\\community.json')
     with pytest.raises(ValueError):

@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from vaws_diagnostics.redact import Allowlist, REDACTION_PROFILE, RULE_IDS, redact_text, scan_text, scan_tree
+from mindie_diagnostics.redact import Allowlist, REDACTION_PROFILE, RULE_IDS, redact_text, scan_text, scan_tree
 
 
 @pytest.mark.parametrize(("value", "rule"), [
@@ -15,7 +15,7 @@ from vaws_diagnostics.redact import Allowlist, REDACTION_PROFILE, RULE_IDS, reda
     ("ghp_" + "A" * 36, "credential-known-format"),
     ("Authorization: Bearer " + "abcdEFGH1234", "credential-bearer"),
     ("token " + "Zq9" * 12, "credential-high-entropy"),
-    ("container: " + "vaws-a3-01", "container-name-assignment"),
+    ("container: " + "mindie-a3-01", "container-name-assignment"),
     ("sha256:" + "ab" * 32, None),
     ("torch_npu 2.10.0; NPU index 4; 8192x8192 dense matmul", None),
     ("https://example.com and /home/<user>/work", None),

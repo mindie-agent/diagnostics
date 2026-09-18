@@ -1,7 +1,7 @@
 # diagnostics · MindIE Agent
 
 Structured logs, phase timings, sanitized support bundles, automatic GitHub
-issues and an independent Grok diagnosis worker for VAWS components. The Python
+issues and an independent Grok diagnosis worker for MindIE components. The Python
 package has **no runtime dependencies**. GitHub publishing uses an existing `gh`
 login or a token from the process environment when `gh` is unavailable; Grok
 diagnosis uses an optional, separately installed Grok Build CLI.
@@ -13,9 +13,9 @@ resource state. Importing this package does not configure Python's root logger.
 ## Record an operation
 
 ```python
-from vaws_diagnostics import configure, wrap_context
+from mindie_diagnostics import configure, wrap_context
 
-log = configure("vaws-coordinator")
+log = configure("mindie-coordinator")
 with log.operation("prepare") as operation:
     with operation.phase("lock.wait"):
         acquire_lock()
@@ -34,12 +34,12 @@ Use `wrap_context(callable)` when submitting work to a thread pool;
 internal RPC metadata. These identifiers are never task or resource authority.
 
 `DEBUG`, `INFO` (default), `WARNING` (`WARN` accepted), `ERROR`, and `CRITICAL`
-follow Python logging levels. `VAWS_LOG_LEVEL` sets the level.
-`VAWS_DIAGNOSTICS_ROOT` overrides the platform user state directory:
+follow Python logging levels. `MINDIE_LOG_LEVEL` sets the level.
+`MINDIE_DIAGNOSTICS_ROOT` overrides the platform user state directory:
 
-- Windows: `%LOCALAPPDATA%/vaws/diagnostics`
-- Linux/macOS: `$XDG_STATE_HOME/vaws/diagnostics`, defaulting to
-  `~/.local/state/vaws/diagnostics`
+- Windows: `%LOCALAPPDATA%/mindie/diagnostics`
+- Linux/macOS: `$XDG_STATE_HOME/mindie/diagnostics`, defaulting to
+  `~/.local/state/mindie/diagnostics`
 
 Each process writes `events/<component>/<pid>-<nonce>.jsonl`, rotating at 1 MiB
 with three backups. Records are limited to 16 KiB. UTC timestamps and a random
@@ -58,7 +58,7 @@ Do not use process-wide FD capture around concurrent MCP request handlers.
 ## Inspect or attach diagnostics
 
 ```sh
-vaws-diagnostics bundle --root /path/to/diagnostics --operation-id OPERATION_ID --output support.json
+mindie-diagnostics bundle --root /path/to/diagnostics --operation-id OPERATION_ID --output support.json
 ```
 
 This command is offline. It reads existing logger segments only, without live
@@ -82,24 +82,24 @@ community consent. Installing or running a worker alone grants no contribution
 permission. Merely importing or installing the library does not upload anything.
 No per-tool approval or Agent report is needed after the workspace choice.
 Explicit caller input errors and user cancellation remain in local diagnostics;
-they do not automatically create VAWS bug reports. Unknown failures are retained
+they do not automatically create MindIE bug reports. Unknown failures are retained
 for diagnosis rather than guessed to be caller mistakes.
 
 ```sh
 gh auth login
-vaws-diagnostics worker --root /path/to/diagnostics --state /path/to/reporter-state
+mindie-diagnostics worker --root /path/to/diagnostics --state /path/to/reporter-state
 ```
 
-The workspace onboarding owns an atomic, untracked `.vaws-local/community.json`:
+The workspace onboarding owns an atomic, untracked `.mindie-local/community.json`:
 
 ```json
-{"schema":"vaws.community.v1","workspace_id":"0123456789abcdef0123456789abcdef","decision":"enabled","revision":"fedcba9876543210fedcba9876543210"}
+{"schema":"mindie.community.v1","workspace_id":"0123456789abcdef0123456789abcdef","decision":"enabled","revision":"fedcba9876543210fedcba9876543210"}
 ```
 
 `workspace_id` is a stable random 32-character lowercase hexadecimal identifier.
 Each explicit decision change gets a new random `revision`; idempotent setup
 keeps it. Pass the canonical project's absolute receipt path through
-`VAWS_COMMUNITY_POLICY` to task processes. A task clone reuses that pointer,
+`MINDIE_COMMUNITY_POLICY` to task processes. A task clone reuses that pointer,
 not a copied consent file. No receipt is inferred from cwd, GitHub identity,
 diagnostic correlation IDs or a recent task. Token-based `gh` authentication
 (`GH_TOKEN` / `GITHUB_TOKEN`) works independently of the consent decision, even
@@ -109,7 +109,7 @@ store a token in the receipt or a Git URL.
 For a process serving multiple workspaces, bind each request explicitly:
 
 ```python
-from vaws_diagnostics import bind_community_policy, read_policy
+from mindie_diagnostics import bind_community_policy, read_policy
 
 with bind_community_policy(project_policy_path):
     handle_request()
@@ -148,13 +148,13 @@ For continuous operation, install the package into a permanent, non-editable
 virtual environment, then explicitly enable its user service:
 
 ```sh
-/path/to/venv/bin/vaws-diagnostics service install --root /path/to/diagnostics --state /path/to/reporter-state
-/path/to/venv/bin/vaws-diagnostics service status
+/path/to/venv/bin/mindie-diagnostics service install --root /path/to/diagnostics --state /path/to/reporter-state
+/path/to/venv/bin/mindie-diagnostics service status
 ```
 
 Linux/WSL uses systemd, Windows uses a user Task Scheduler task running `pythonw`,
 and macOS uses a user launch agent. Native Windows/macOS installations can select
-an independent profile with `VAWS_DIAGNOSTICS_SERVICE_DIR`. The service runs in
+an independent profile with `MINDIE_DIAGNOSTICS_SERVICE_DIR`. The service runs in
 the background without opening a terminal window.
 
 The owned systemd unit restarts after failure, clears Python source overrides,
@@ -190,7 +190,7 @@ installations use the same `service install`, `service status` and
 `service remove` commands; a separate WSL helper is not required.
 
 ```sh
-vaws-diagnostics status --state /path/to/reporter-state
+mindie-diagnostics status --state /path/to/reporter-state
 ```
 
 The outbox keeps immutable sanitized evidence, occurrence counts, publication
@@ -229,9 +229,9 @@ will report an exhausted listing window instead of declaring a false absence.
 Create a dedicated profile and log in to it using the installed Grok CLI:
 
 ```sh
-vaws-diagnostics grok-profile --home /path/to/grok-bot-home
+mindie-diagnostics grok-profile --home /path/to/grok-bot-home
 GROK_HOME=/path/to/grok-bot-home grok login
-vaws-diagnostics worker --root /path/to/diagnostics --state /path/to/reporter-state \
+mindie-diagnostics worker --root /path/to/diagnostics --state /path/to/reporter-state \
   --grok grok --grok-home /path/to/grok-bot-home --grok-work /path/to/empty-bot-work
 ```
 
@@ -266,14 +266,14 @@ need a Grok account to receive diagnosis from a maintainer's central service.
 A maintainer can explicitly authorize a separate central worker:
 
 ```sh
-vaws-diagnostics worker --central-bot --state /path/to/central-state \
+mindie-diagnostics worker --central-bot --state /path/to/central-state \
   --repository mindie-agent/mindie-agent \
   --grok grok --grok-home /path/to/grok-bot-home --grok-work /path/to/empty-bot-work
 ```
 
 Use the same `--central-bot` option with `service install` for continuous
 operation. This mode requires Grok, rejects local `--root` inputs, and never
-ingests or uploads local logs. It reads only already-public open automatic VAWS
+ingests or uploads local logs. It reads only already-public open automatic MindIE
 issues with valid bounded evidence, using a separate `central-bot.sqlite3`
 queue. Repository text cannot switch an ordinary worker into this mode.
 

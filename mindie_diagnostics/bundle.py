@@ -147,7 +147,7 @@ def _project(record):
                 if not isinstance(module, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]{0,159}", module):
                     continue
                 package = module.split(".")[0]
-                if not (package.startswith("vaws_") or package == "remote_dev" or package in sys.stdlib_module_names):
+                if not (package.startswith("mindie_") or package == "remote_dev" or package in sys.stdlib_module_names):
                     continue
                 if not isinstance(function, str) or not re.fullmatch(r"(?:[A-Za-z_][A-Za-z0-9_]{0,99}|<module>|<lambda>)", function):
                     continue

@@ -3,15 +3,15 @@ from pathlib import Path
 
 import pytest
 
-from vaws_diagnostics import configure, collect_bundle
-from vaws_diagnostics.outbox import Outbox
-from vaws_diagnostics.reporter import ingest, issue_payload, render_issue
+from mindie_diagnostics import configure, collect_bundle
+from mindie_diagnostics.outbox import Outbox
+from mindie_diagnostics.reporter import ingest, issue_payload, render_issue
 
 pytestmark = pytest.mark.usefixtures('community_consent')
 
 
 def failure(root):
-    rec = configure('vaws-diagnostics', root=root, level='DEBUG')
+    rec = configure('mindie-diagnostics', root=root, level='DEBUG')
     with rec.operation('synthetic_failure') as op:
         with op.phase('connect'):
             pass
@@ -68,7 +68,7 @@ def test_unknown_issue_fields_are_dropped_before_model_input(tmp_path):
 
 
 def test_explicit_caller_error_is_recorded_without_automatic_issue(tmp_path):
-    rec = configure('vaws-diagnostics', root=tmp_path)
+    rec = configure('mindie-diagnostics', root=tmp_path)
     with rec.operation('invalid_argument') as op:
         op.fail('caller')
     rec.close()
@@ -94,7 +94,7 @@ def test_explicit_caller_error_is_recorded_without_automatic_issue(tmp_path):
 ])
 def test_owner_classification_survives_log_bundle_and_ingestion(tmp_path, category, classification, enqueued):
     # Existing owner wire shape: knowledge/top put classification in fail attrs.
-    rec = configure('vaws-knowledge', root=tmp_path, level='DEBUG')
+    rec = configure('mindie-knowledge', root=tmp_path, level='DEBUG')
     fields = {'classification': classification} if classification is not None else {}
     with rec.operation('knowledge.cli') as op:
         op.fail(category, exit_code=2, **fields)
@@ -122,7 +122,7 @@ def test_owner_classification_survives_log_bundle_and_ingestion(tmp_path, catego
 
 @pytest.mark.parametrize('code,failed', [(400, False), (503, True)])
 def test_http_response_keeps_numeric_code_and_owner_outcome(tmp_path, code, failed):
-    rec = configure('vaws-top', root=tmp_path, level='DEBUG')
+    rec = configure('npu-top', root=tmp_path, level='DEBUG')
     with rec.operation('top.http.get') as op:
         op.event('WARNING', 'http.response', error_code=code)
         if failed:
@@ -137,7 +137,7 @@ def test_http_response_keeps_numeric_code_and_owner_outcome(tmp_path, code, fail
 
 @pytest.mark.parametrize('code', [True, 4.0, 2**31, -(2**31)-1, '400 PRIVATE-CODE-TEXT'])
 def test_numeric_error_code_projection_rejects_unknown_shapes(tmp_path, code):
-    rec = configure('vaws-top', root=tmp_path)
+    rec = configure('npu-top', root=tmp_path)
     with rec.operation('top.http.get') as op:
         op.fail('http_response', error_code=code)
     rec.close()

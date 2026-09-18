@@ -4,12 +4,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from vaws_diagnostics import bind_community_policy, collect_bundle, configure
-from vaws_diagnostics.bot import diagnose_one, enqueue_public_issues
-from vaws_diagnostics.cli import main, run_cycle
-from vaws_diagnostics.health import Health
-from vaws_diagnostics.outbox import Outbox
-from vaws_diagnostics.reporter import issue_payload
+from mindie_diagnostics import bind_community_policy, collect_bundle, configure
+from mindie_diagnostics.bot import diagnose_one, enqueue_public_issues
+from mindie_diagnostics.cli import main, run_cycle
+from mindie_diagnostics.health import Health
+from mindie_diagnostics.outbox import Outbox
+from mindie_diagnostics.reporter import issue_payload
 
 
 def public_issue(tmp_path):
@@ -19,7 +19,7 @@ def public_issue(tmp_path):
             op.fail('transport')
         recorder.close()
     payload = issue_payload(collect_bundle(tmp_path / 'logs'))
-    return {'number': 1, 'body': '<!-- vaws-incident:' + 'a' * 64 + ' -->\n```json\n' + json.dumps(payload) + '\n```'}, payload
+    return {'number': 1, 'body': '<!-- mindie-incident:' + 'a' * 64 + ' -->\n```json\n' + json.dumps(payload) + '\n```'}, payload
 
 
 class Model:
@@ -64,7 +64,7 @@ def test_explicit_central_mode_diagnoses_public_evidence_without_local_consent(t
     assert enqueue_public_issues(github, queue) == 1
     assert diagnose_one(queue, github, model, public_repository=github.repository)['status'] == 'published'
     assert model.calls == 1 and len(github.comments) == 1
-    assert 'vaws-grok-evidence:' in github.comments[0]['body']
+    assert 'mindie-grok-evidence:' in github.comments[0]['body']
 
 
 def test_fresh_state_reconciles_published_comment_before_model_call(tmp_path):
@@ -84,7 +84,7 @@ def test_local_and_central_queues_share_evidence_marker(tmp_path):
     issue, payload = public_issue(tmp_path)
     github, model = Git(issue), Model()
     evidence_hash = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
-    github.comments.append({'body': f'<!-- vaws-grok-diagnosis:{"b" * 64} -->\n<!-- vaws-grok-evidence:{evidence_hash} -->',
+    github.comments.append({'body': f'<!-- mindie-grok-diagnosis:{"b" * 64} -->\n<!-- mindie-grok-evidence:{evidence_hash} -->',
                             'html_url': 'https://github.com/example/project/issues/1#issuecomment-1'})
     queue = Outbox(tmp_path / 'fresh-central.db')
     enqueue_public_issues(github, queue)
@@ -92,15 +92,15 @@ def test_local_and_central_queues_share_evidence_marker(tmp_path):
     assert model.calls == 0
 
 
-@pytest.mark.parametrize('body', ['not diagnostic', '<!-- vaws-incident:' + 'a'*64 + ' -->\n```json\n[]\n```',
-                                     '<!-- vaws-incident:fake -->\n```json\n{}\n```'])
+@pytest.mark.parametrize('body', ['not diagnostic', '<!-- mindie-incident:' + 'a'*64 + ' -->\n```json\n[]\n```',
+                                     '<!-- mindie-incident:fake -->\n```json\n{}\n```'])
 def test_central_skips_unstructured_or_malicious_issue(tmp_path, body):
     queue = Outbox(tmp_path / 'central.db')
     assert enqueue_public_issues(Git({'number': 1, 'body': body}), queue) == 0
 
 
 def test_central_cycle_never_touches_local_logs_or_report_queue(tmp_path, monkeypatch):
-    from vaws_diagnostics import cli
+    from mindie_diagnostics import cli
     issue, _ = public_issue(tmp_path)
     github, model = Git(issue), Model()
     queue = Outbox(tmp_path / 'central.db')

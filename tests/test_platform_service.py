@@ -12,7 +12,7 @@ from unittest import mock
 
 import pytest
 
-from vaws_diagnostics import platform_service as native, service
+from mindie_diagnostics import platform_service as native, service
 
 
 class Runner:
@@ -57,7 +57,7 @@ class Runner:
         else:
             assert argv[1:3] == ["-I", "-c"]
             output = json.dumps({"prefix": str(self.prefix), "base": str(self.prefix.parent / "base"),
-                                 "version": "0.2.0", "editable": False, "package": str(self.prefix / "lib/vaws_diagnostics")})
+                                 "version": "0.2.0", "editable": False, "package": str(self.prefix / "lib/mindie_diagnostics")})
         return subprocess.CompletedProcess(argv, code, output, error or ("private fixture must never appear in errors" if code else ""))
 
 
@@ -109,7 +109,7 @@ def test_install_reuse_status_start_and_remove_preserve_data(installation):
 
 @pytest.mark.parametrize('token_only', [False, True])
 def test_ensure_preserves_two_clones_roots_state_and_existing_authentication(installation, monkeypatch, token_only):
-    from vaws_diagnostics.service_config import worker_options
+    from mindie_diagnostics.service_config import worker_options
     values, runner = installation
     if token_only:
         monkeypatch.setenv('GH_TOKEN', 'initial-private-fixture')
@@ -144,7 +144,7 @@ def test_ensure_preserves_two_clones_roots_state_and_existing_authentication(ins
 
 
 def test_ensure_preserves_optional_grok_and_refuses_central_or_repository_replacement(installation):
-    from vaws_diagnostics.service_config import worker_options
+    from mindie_diagnostics.service_config import worker_options
     values, runner = installation
     profile = dict(grok=values['gh'], grok_home=values['state'] / 'grok', grok_work=values['state'] / 'work')
     first = service.install_service(**values, **profile)
@@ -167,7 +167,7 @@ def test_manager_configuration_is_hidden_bounded_and_shell_free(installation):
     values, runner = installation
     result = service.install_service(**values)
     config = json.loads(Path(result["manifest"]).read_text())
-    assert config["launch_args"][:4] == ["-I", "-m", "vaws_diagnostics.platform_service", "run"]
+    assert config["launch_args"][:4] == ["-I", "-m", "mindie_diagnostics.platform_service", "run"]
     assert config["environment_file"] is None
     if sys.platform == "win32":
         text = Path(result["unit"]).read_text()
@@ -300,7 +300,7 @@ def test_worker_loads_private_file_in_process_and_drops_inherited_token(installa
     monkeypatch.setenv("GH_TOKEN", "old-inherited-fixture")
     monkeypatch.setenv("GITHUB_TOKEN", "wrong-inherited-fixture")
     monkeypatch.setattr(native, "_private_environment", lambda value, run: Path(value))
-    from vaws_diagnostics import cli
+    from mindie_diagnostics import cli
     def worker(argv):
         assert argv[0] == "worker"
         assert os.environ["GH_TOKEN"] == "owned-service-fixture"

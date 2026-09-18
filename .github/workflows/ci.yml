@@ -39,5 +39,5 @@ jobs:
           uv venv /tmp/diagnostics-wheel
           uv pip install --python /tmp/diagnostics-wheel/bin/python --no-deps dist/*.whl
           cd /tmp
-          /tmp/diagnostics-wheel/bin/python -c "import importlib.metadata as m; assert not [x for x in m.requires('vaws-diagnostics') or [] if 'extra ==' not in x]"
-          /tmp/diagnostics-wheel/bin/vaws-diagnostics --help
+          /tmp/diagnostics-wheel/bin/python -c "import importlib.metadata as m; assert not [x for x in m.requires('mindie-diagnostics') or [] if 'extra ==' not in x]"
+          /tmp/diagnostics-wheel/bin/mindie-diagnostics --help

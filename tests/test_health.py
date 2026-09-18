@@ -1,7 +1,7 @@
 import json
 
-from vaws_diagnostics import configure
-from vaws_diagnostics.health import Health, read_health
+from mindie_diagnostics import configure
+from mindie_diagnostics.health import Health, read_health
 
 
 def test_health_distinguishes_liveness_progress_and_degradation(tmp_path):

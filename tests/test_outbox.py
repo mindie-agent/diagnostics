@@ -2,7 +2,7 @@ import concurrent.futures
 
 import pytest
 
-from vaws_diagnostics.outbox import Outbox, QueueFull
+from mindie_diagnostics.outbox import Outbox, QueueFull
 
 
 def test_dedup_capacity_and_claim(tmp_path):

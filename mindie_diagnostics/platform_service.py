@@ -23,8 +23,8 @@ from xml.etree import ElementTree as ET
 
 from . import service as common
 
-MARKER = "vaws-diagnostics.native-service.v1"
-MANIFEST = "vaws-diagnostics-service.json"
+MARKER = "mindie-diagnostics.native-service.v1"
+MANIFEST = "mindie-diagnostics-service.json"
 LIMIT = 32768
 ENV_KEYS = {"GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR", "XAI_API_KEY", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"}
 
@@ -62,17 +62,17 @@ def _physical(path):
 
 
 def _paths(unit_dir=None):
-    override = unit_dir or os.environ.get("VAWS_DIAGNOSTICS_SERVICE_DIR")
+    override = unit_dir or os.environ.get("MINDIE_DIAGNOSTICS_SERVICE_DIR")
     if override:
         root = common._absolute(override)
     elif sys.platform == "win32":
-        root = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData/Local") / "vaws/diagnostics-service"
+        root = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData/Local") / "mindie/diagnostics-service"
     else:
         root = Path.home() / "Library/LaunchAgents"
     root = _physical(root)
     digest = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:12]
-    label = ("VAWS Diagnostics " if sys.platform == "win32" else "org.vaws.diagnostics.") + digest
-    return root / MANIFEST, label, root / ("vaws-diagnostics-task.xml" if sys.platform == "win32" else label + ".plist")
+    label = ("MindIE Diagnostics " if sys.platform == "win32" else "org.mindie.diagnostics.") + digest
+    return root / MANIFEST, label, root / ("mindie-diagnostics-task.xml" if sys.platform == "win32" else label + ".plist")
 
 
 @contextmanager
@@ -131,7 +131,7 @@ def _read(path):
 def _write(path, data):
     if len(data) > LIMIT:
         raise common.ServiceError("unit_too_large")
-    fd, temporary = tempfile.mkstemp(prefix=".vaws-service-", dir=path.parent)
+    fd, temporary = tempfile.mkstemp(prefix=".mindie-service-", dir=path.parent)
     try:
         with os.fdopen(fd, "wb") as stream:
             stream.write(data)
@@ -267,7 +267,7 @@ def save_environment_token(state, runner=None):
     path = root / "credentials.env"
     if path.exists() or path.is_symlink():
         _private_environment(path, runner)
-    descriptor, temporary = tempfile.mkstemp(prefix=".vaws-credential-", dir=root)
+    descriptor, temporary = tempfile.mkstemp(prefix=".mindie-credential-", dir=root)
     temporary_path = _physical(temporary)
     try:
         if sys.platform == "win32":
@@ -401,7 +401,7 @@ def install_service(roots, state, repository, *, python=None, gh=None, grok=None
             argv += ["--grok", str(common._executable(grok)), "--grok-home", str(common._absolute(grok_home)),
                      "--grok-work", str(common._absolute(grok_work))]
         config = {"marker": MARKER, "platform": sys.platform, "since": fixed_since, "label": label,
-                  "launcher": str(launcher), "launch_args": ["-I", "-m", "vaws_diagnostics.platform_service", "run", "--config", str(manifest)],
+                  "launcher": str(launcher), "launch_args": ["-I", "-m", "mindie_diagnostics.platform_service", "run", "--config", str(manifest)],
                   "argv": argv, "environment_file": str(env_file) if env_file else None, "state": str(state)}
         if sys.platform == "win32":
             sid = _ps(runner, "[Security.Principal.WindowsIdentity]::GetCurrent().User.Value", action="task.identity").stdout.strip()

@@ -1,13 +1,13 @@
 from types import SimpleNamespace
 
-from vaws_diagnostics import configure
-from vaws_diagnostics import cli
-from vaws_diagnostics.health import Health, read_health
-from vaws_diagnostics.outbox import Outbox, QueueFull
+from mindie_diagnostics import configure
+from mindie_diagnostics import cli
+from mindie_diagnostics.health import Health, read_health
+from mindie_diagnostics.outbox import Outbox, QueueFull
 
 
 def test_service_ensure_uses_the_atomic_owner_api(tmp_path, monkeypatch, capsys):
-    from vaws_diagnostics import service
+    from mindie_diagnostics import service
     calls = []
     monkeypatch.setattr(service, 'ensure_reporter_service',
                         lambda *args, **kwargs: calls.append((args, kwargs)) or {'status': 'installed'})

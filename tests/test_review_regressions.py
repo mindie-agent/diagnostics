@@ -4,7 +4,7 @@ import os
 
 import pytest
 
-from vaws_diagnostics.outbox import Outbox, QueueFull
+from mindie_diagnostics.outbox import Outbox, QueueFull
 
 
 def test_published_queue_history_does_not_permanently_block_new_intake(tmp_path):
@@ -17,18 +17,18 @@ def test_published_queue_history_does_not_permanently_block_new_intake(tmp_path)
 
 @pytest.mark.parametrize("discard", [False, True])
 def test_rotation_between_candidate_stat_and_open_does_not_skip_new_head(tmp_path, monkeypatch, discard, community_consent):
-    from vaws_diagnostics import ingestion
+    from mindie_diagnostics import ingestion
 
     def event(identity):
         return (json.dumps({
             "schema": 1, "timestamp": "2026-09-13T00:00:00Z", "monotonic_ns": 1,
-            "pid": 1, "component": "vaws-diagnostics", "severity": "ERROR",
+            "pid": 1, "component": "mindie-diagnostics", "severity": "ERROR",
             "event": "operation.end", "operation": "operation." + identity,
             "operation_id": identity * 32, "trace_id": "c" * 32,
             "status": "error", "attributes": {"category": "transport"}, "community": community_consent,
         }) + "\n").encode()
 
-    folder = tmp_path / "events" / "vaws-diagnostics"
+    folder = tmp_path / "events" / "mindie-diagnostics"
     folder.mkdir(parents=True)
     path = folder / ("1-" + "d" * 32 + ".jsonl")
     path.write_bytes(event("a"))
@@ -75,7 +75,7 @@ def test_published_history_is_bounded_without_evicting_pending_evidence(tmp_path
 
 
 def test_bounded_seen_history_does_not_block_intake_and_marker_prevents_repost(tmp_path, monkeypatch, community_consent):
-    from vaws_diagnostics.reporter import publish_one
+    from mindie_diagnostics.reporter import publish_one
 
     now = [1000.0]
     queue = Outbox(tmp_path / "queue.sqlite3", capacity=1, clock=lambda: now[0])

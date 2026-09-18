@@ -4,13 +4,13 @@ from urllib.error import HTTPError, URLError
 
 import pytest
 
-from vaws_diagnostics.community import ConsentWithdrawn, guard_consent
-from vaws_diagnostics.reporter import GitHub, TransportError, _NoRedirect
+from mindie_diagnostics.community import ConsentWithdrawn, guard_consent
+from mindie_diagnostics.reporter import GitHub, TransportError, _NoRedirect
 
 
 @pytest.mark.parametrize('variable', ['GH_TOKEN', 'GITHUB_TOKEN'])
 def test_token_only_auth_uses_fixed_https_host_without_subprocess(monkeypatch, variable):
-    from vaws_diagnostics import reporter
+    from mindie_diagnostics import reporter
     monkeypatch.delenv('GH_TOKEN', raising=False)
     monkeypatch.delenv('GITHUB_TOKEN', raising=False)
     monkeypatch.setenv(variable, 'test-private-placeholder')
@@ -33,7 +33,7 @@ def test_token_only_auth_uses_fixed_https_host_without_subprocess(monkeypatch, v
 @pytest.mark.parametrize('method,code,uncertain,delay', [('POST', 403, False, 3600),
     ('POST', 429, False, 3600), ('POST', 502, True, 60), ('GET', 502, False, 60), ('POST', None, True, 60)])
 def test_token_failures_preserve_submission_state_without_credentials(monkeypatch, method, code, uncertain, delay):
-    from vaws_diagnostics import reporter
+    from mindie_diagnostics import reporter
     monkeypatch.setenv('GH_TOKEN', 'test-private-placeholder')
     monkeypatch.setattr(reporter.shutil, 'which', lambda _: None)
 
@@ -52,7 +52,7 @@ def test_token_failures_preserve_submission_state_without_credentials(monkeypatc
 
 
 def test_no_token_transport_can_bypass_revoked_policy(monkeypatch, community_consent):
-    from vaws_diagnostics import reporter
+    from mindie_diagnostics import reporter
     monkeypatch.setenv('GH_TOKEN', 'test-private-placeholder')
     monkeypatch.setattr(reporter, 'build_opener', lambda *a: pytest.fail('revoked request opened'))
     from pathlib import Path

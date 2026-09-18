@@ -7,15 +7,15 @@ from pathlib import Path
 
 import pytest
 
-from vaws_diagnostics import configure, collect_bundle, export_public_event
-from vaws_diagnostics.bundle import _canonical
+from mindie_diagnostics import configure, collect_bundle, export_public_event
+from mindie_diagnostics.bundle import _canonical
 
 
 @pytest.mark.skipif(not hasattr(os, 'mkfifo'), reason='POSIX FIFO race')
 def test_regular_input_replaced_by_fifo_cannot_block_open(tmp_path):
     script = '''import os,sys
 from pathlib import Path
-from vaws_diagnostics.bundle import _safe_open
+from mindie_diagnostics.bundle import _safe_open
 path=Path(sys.argv[1]);path.write_bytes(b'fixture')
 original=os.open
 def swap(value, flags, *args):
@@ -143,7 +143,7 @@ def test_selected_records_do_not_scan_logs(tmp_path, monkeypatch):
 
 
 def test_process_clock_domains_and_structured_frames():
-    frame = {"module": "vaws_diagnostics.bundle", "function": "collect_bundle", "line": 100}
+    frame = {"module": "mindie_diagnostics.bundle", "function": "collect_bundle", "line": 100}
     attributes = {"exception_chain": ["ValueError"], "stack_frames": [frame, {**frame, "module": "private_customer"}],
                   "stack_fingerprint": "a" * 64, "exception_message": "never publish free text"}
     first = export_public_event(example(process_instance_id="c" * 32, attributes=attributes))
@@ -151,6 +151,6 @@ def test_process_clock_domains_and_structured_frames():
     assert first["process_ref"] != second["process_ref"]
     assert "clock_domain_unknown" not in first
     assert len(first["attributes"]["stack_frames"]) == 1
-    assert first["attributes"]["stack_frames"][0]["package"] == "vaws_diagnostics"
+    assert first["attributes"]["stack_frames"][0]["package"] == "mindie_diagnostics"
     assert "exception_message" not in first["attributes"]
     assert export_public_event(first) == first

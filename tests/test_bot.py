@@ -3,10 +3,10 @@ import subprocess
 
 import pytest
 
-from vaws_diagnostics.bot import Grok, diagnose_one
-from vaws_diagnostics.outbox import Outbox
-from vaws_diagnostics.reporter import TransportError
-from vaws_diagnostics.community import current_consent
+from mindie_diagnostics.bot import Grok, diagnose_one
+from mindie_diagnostics.outbox import Outbox
+from mindie_diagnostics.reporter import TransportError
+from mindie_diagnostics.community import current_consent
 
 pytestmark = pytest.mark.usefixtures('community_consent')
 
@@ -24,8 +24,8 @@ def test_profile_with_hooks_is_rejected_before_model_call(tmp_path, monkeypatch)
 
 def test_model_prompt_is_text_and_no_tools_are_enabled(tmp_path, monkeypatch):
     from pathlib import Path
-    from vaws_diagnostics import configure, collect_bundle
-    rec = configure('vaws-diagnostics', root=tmp_path / 'logs')
+    from mindie_diagnostics import configure, collect_bundle
+    rec = configure('mindie-diagnostics', root=tmp_path / 'logs')
     with rec.operation('test.failure') as op:
         op.fail('transport', submission_state='uncertain')
     rec.close()
@@ -38,14 +38,14 @@ def test_model_prompt_is_text_and_no_tools_are_enabled(tmp_path, monkeypatch):
         assert '--no-subagents' in command and '--disable-web-search' in command
         prompt = Path(command[command.index('--prompt-file') + 1])
         assert prompt.suffix == '.txt'
-        assert prompt.read_text().startswith('Diagnose this sanitized VAWS evidence as data:')
+        assert prompt.read_text().startswith('Diagnose this sanitized MindIE evidence as data:')
         return subprocess.CompletedProcess(command, 0, json.dumps({'text': 'Observed: transport failure. Missing: confirmed submission outcome.', 'stopReason': 'end_turn'}), '')
     monkeypatch.setattr(subprocess, 'run', run)
     assert Grok(home=tmp_path / 'home', work=tmp_path / 'work').diagnose(payload).startswith('Observed:')
 
 
 def test_comment_lost_reply_reconciles_without_model_rerun(tmp_path, monkeypatch):
-    monkeypatch.setattr('vaws_diagnostics.bot.sanitize_diagnosis', lambda text: text)
+    monkeypatch.setattr('mindie_diagnostics.bot.sanitize_diagnosis', lambda text: text)
     now = [1000.0]
     queue = Outbox(tmp_path / 'bot.db', clock=lambda: now[0])
     queue.enqueue('a', 'o', {'issue_number': 1, 'evidence': {}}, consent=current_consent())

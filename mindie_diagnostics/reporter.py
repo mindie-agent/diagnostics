@@ -17,7 +17,7 @@ from .outbox import Outbox
 from .community import ConsentWithdrawn, check_remote_action, guard_consent, require_consent
 
 DEFAULT_REPOSITORY = "mindie-agent/mindie-agent"
-MARKER = "<!-- vaws-incident:"
+MARKER = "<!-- mindie-incident:"
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -54,7 +54,7 @@ def issue_payload(bundle: dict[str, Any]) -> dict[str, Any]:
     events = [safe for record in bundle.get("events", []) if (safe := export_public_event(record)) is not None]
     if not events or not any(e.get("status") == "error" for e in events):
         raise ValueError("no publishable failure events")
-    public = {"schema": "vaws.support.issue.v1", "events": events[-80:],
+    public = {"schema": "mindie.support.issue.v1", "events": events[-80:],
               "omissions": "Raw output, commands, prompts, environment values, local paths and unknown fields are excluded. Evidence is a bounded window; absent phases may be outside it."}
     # Fit the complete evidence into the issue itself; no expiring attachment URL.
     while len(json.dumps(public, ensure_ascii=True).encode()) > 36000 and len(public["events"]) > 1:
@@ -70,11 +70,11 @@ def issue_payload(bundle: dict[str, Any]) -> dict[str, Any]:
 def render_issue(item: dict[str, Any]) -> tuple[str, str]:
     payload = issue_payload(item["payload"])
     failure = next(e for e in reversed(payload["events"]) if e.get("status") == "error")
-    component = failure.get("component", "vaws")
+    component = failure.get("component", "mindie")
     operation = failure.get("operation", "operation")
     title = f"[automatic diagnostic] {component}: {operation} failed"[:200]
     body = (f"{MARKER}{item['fingerprint']} -->\n\n"
-            "VAWS recorded a failed operation. This issue was generated automatically from selected, redacted structured events.\n\n"
+            "MindIE recorded a failed operation. This issue was generated automatically from selected, redacted structured events.\n\n"
             f"Occurrences observed locally before submission: {item['occurrences']}. "
             "A diagnostic hypothesis is not a confirmed root cause.\n\n"
             "<details><summary>Sanitized diagnostic evidence (JSON)</summary>\n\n```json\n"
@@ -129,7 +129,7 @@ class GitHub:
         data = json.dumps(payload, ensure_ascii=True).encode() if payload is not None else None
         request = Request('https://api.github.com/' + path, data=data, method=method,
                           headers={'Accept': 'application/vnd.github+json', 'Authorization': 'Bearer ' + token,
-                                   'Content-Type': 'application/json', 'User-Agent': 'vaws-diagnostics'})
+                                   'Content-Type': 'application/json', 'User-Agent': 'mindie-diagnostics'})
         try:
             check_remote_action()
             with build_opener(_NoRedirect()).open(request, timeout=self.timeout) as response:

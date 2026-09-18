@@ -8,7 +8,7 @@ import sys
 
 import pytest
 
-from vaws_diagnostics import service
+from mindie_diagnostics import service
 
 
 class Runner:
@@ -35,7 +35,7 @@ class Runner:
         if argv[0] != "systemctl":
             assert argv[1:3] == ["-I", "-c"]
             facts = {"prefix": str(self.prefix), "base": "/base-python", "version": "0.1.0",
-                     "editable": self.editable, "package": str(self.prefix / "lib/vaws_diagnostics")}
+                     "editable": self.editable, "package": str(self.prefix / "lib/mindie_diagnostics")}
             return subprocess.CompletedProcess(argv, 0, json.dumps(facts), "")
         if argv[2] == self.timeout:
             raise subprocess.TimeoutExpired(argv, 30)
@@ -80,7 +80,7 @@ def test_install_uses_literal_arguments_immutable_python_and_bounded_journal(ins
     text = Path(result["unit"]).read_text()
     assert text.startswith(service.MARKER)
     assert '%%u' in text and '$$TOKEN' in text and '\\"quoted\\"' in text
-    assert '"-I" "-m" "vaws_diagnostics.cli" "worker"' in text
+    assert '"-I" "-m" "mindie_diagnostics.cli" "worker"' in text
     assert 'UnsetEnvironment=PYTHONPATH PYTHONHOME' in text
     assert 'LogRateLimitIntervalSec=30s' in text and 'LogRateLimitBurst=100' in text
     assert 'Restart=on-failure' in text and 'KillMode=control-group' in text
@@ -109,7 +109,7 @@ def test_reinstall_preserves_original_since_and_only_restarts_changed_config(ins
 
 
 def test_ensure_two_clones_retains_roots_state_auth_and_model_profile(install, monkeypatch):
-    from vaws_diagnostics.service_config import linux_worker_configuration, worker_options
+    from mindie_diagnostics.service_config import linux_worker_configuration, worker_options
     values, runner = install
     first = service.ensure_reporter_service(**values, grok=values['gh'],
                                             grok_home=values['state'] / 'grok', grok_work=values['state'] / 'work')
@@ -133,7 +133,7 @@ def test_ensure_two_clones_retains_roots_state_auth_and_model_profile(install, m
 
 @pytest.mark.skipif(os.name == 'nt', reason='POSIX private credential permissions')
 def test_ensure_token_only_then_new_token_and_no_environment_preserves_credentials(install, monkeypatch):
-    from vaws_diagnostics.service_config import linux_worker_configuration, worker_options
+    from mindie_diagnostics.service_config import linux_worker_configuration, worker_options
     values, runner = install
     monkeypatch.setenv('GH_TOKEN', 'initial-private-fixture')
     monkeypatch.setattr(shutil, 'which', lambda value: None)
@@ -322,9 +322,9 @@ def test_environment_file_requires_private_regular_owned_file_without_reading_co
 def test_install_lock_has_stable_inode_and_no_shared_state_deletion(tmp_path):
     path = tmp_path / service.UNIT
     with service._locked(path):
-        inode = (tmp_path / '.vaws-diagnostics-service.lock').stat().st_ino
+        inode = (tmp_path / '.mindie-diagnostics-service.lock').stat().st_ino
     with service._locked(path):
-        assert (tmp_path / '.vaws-diagnostics-service.lock').stat().st_ino == inode
+        assert (tmp_path / '.mindie-diagnostics-service.lock').stat().st_ino == inode
 
 
 def test_rejected_staging_unit_preserves_existing_unit_and_never_reloads(install, monkeypatch):
@@ -341,7 +341,7 @@ def test_rejected_staging_unit_preserves_existing_unit_and_never_reloads(install
     assert failure.value.action == 'unit.verify'
     assert Path(result['unit']).read_bytes() == previous
     assert [call[0][2] for call in runner.calls if call[0][0] == 'systemctl'] == ['show']
-    assert not list(values['unit_dir'].glob('.vaws-diagnostics-*.service'))
+    assert not list(values['unit_dir'].glob('.mindie-diagnostics-*.service'))
 
 
 def test_missing_optional_unit_analyzer_is_reported_without_installing_it(install, monkeypatch):
@@ -359,7 +359,7 @@ def test_zero_exit_parser_warning_does_not_publish_a_partially_ignored_unit(inst
     with pytest.raises(service.ServiceError, match='unit_verification_warning'):
         service.install_service(**values)
     assert not (values['unit_dir'] / service.UNIT).exists()
-    assert not list(values['unit_dir'].glob('.vaws-unit-*'))
+    assert not list(values['unit_dir'].glob('.mindie-unit-*'))
     assert not any(call[0][:3] == ['systemctl', '--user', 'daemon-reload'] for call in runner.calls)
 
 

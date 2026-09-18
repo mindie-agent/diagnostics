@@ -55,7 +55,7 @@ class Health:
 
     def __enter__(self):
         self.write()
-        self.thread = threading.Thread(target=self._heartbeat, name='vaws-worker-heartbeat', daemon=True)
+        self.thread = threading.Thread(target=self._heartbeat, name='mindie-worker-heartbeat', daemon=True)
         self.thread.start()
         return self
 

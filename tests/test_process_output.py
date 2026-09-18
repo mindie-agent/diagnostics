@@ -13,9 +13,9 @@ def records(root):
 
 def test_capture_setup_failure_preserves_result_and_original_error(tmp_path, monkeypatch):
     import pytest
-    from vaws_diagnostics import configure, capture_output
-    from vaws_diagnostics import process_output
-    rec = configure("vaws-output-fixture", root=tmp_path)
+    from mindie_diagnostics import configure, capture_output
+    from mindie_diagnostics import process_output
+    rec = configure("mindie-output-fixture", root=tmp_path)
     monkeypatch.setattr(process_output.os, "pipe", lambda: (_ for _ in ()).throw(OSError("pipe unavailable")))
     with rec.operation("output.fixture") as operation:
         with capture_output(operation):
@@ -35,8 +35,8 @@ def test_capture_setup_failure_preserves_result_and_original_error(tmp_path, mon
 
 def test_capture_setup_cancellation_releases_scope(tmp_path, monkeypatch):
     import pytest
-    from vaws_diagnostics import configure, capture_output, process_output
-    rec = configure("vaws-output-cancel", root=tmp_path)
+    from mindie_diagnostics import configure, capture_output, process_output
+    rec = configure("mindie-output-cancel", root=tmp_path)
     original_pipe = process_output.os.pipe
     def interrupted():
         raise KeyboardInterrupt()
@@ -58,7 +58,7 @@ def test_actual_unwritable_storage_does_not_recurse_or_hide_fallback(tmp_path):
     blocked.write_text("not a directory")
     program = '''
 import os, sys, time
-from vaws_diagnostics import configure, capture_output
+from mindie_diagnostics import configure, capture_output
 rec = configure("output-failure", root=sys.argv[1], level="INFO")
 with rec.operation("output.fixture", level="DEBUG") as op:
     with capture_output(op):
@@ -82,7 +82,7 @@ print("business complete")
 def test_second_fd_failure_retains_bounded_first_stream_and_restores(tmp_path):
     program = '''
 import os, sys
-from vaws_diagnostics import configure, capture_output, process_output
+from mindie_diagnostics import configure, capture_output, process_output
 rec = configure("output-partial", root=sys.argv[1])
 original_pipe = process_output.os.pipe
 calls = 0
@@ -113,10 +113,10 @@ assert op.summary()["status"] == "success"
 def test_actual_service_fd_output_is_bounded_and_redacted(tmp_path):
     program = '''
 import os, sys
-import vaws_diagnostics.logging as log
-from vaws_diagnostics import capture_output
+import mindie_diagnostics.logging as log
+from mindie_diagnostics import capture_output
 log.MAX_LOG_BYTES = 4096
-rec = log.configure("vaws-knowledge", root=sys.argv[1], level="DEBUG")
+rec = log.configure("mindie-knowledge", root=sys.argv[1], level="DEBUG")
 print("before capture")
 with rec.operation("knowledge.daemon.fixture") as op:
     with capture_output(op):
@@ -152,9 +152,9 @@ def test_service_output_survives_launcher_exit(tmp_path):
     child.write_text('''
 from pathlib import Path
 import os, sys, time
-from vaws_diagnostics import configure
-from vaws_diagnostics import capture_output
-rec = configure("vaws-knowledge", root=sys.argv[1])
+from mindie_diagnostics import configure
+from mindie_diagnostics import capture_output
+rec = configure("mindie-knowledge", root=sys.argv[1])
 with rec.operation("knowledge.daemon.fixture") as op:
     with capture_output(op):
         time.sleep(0.3)

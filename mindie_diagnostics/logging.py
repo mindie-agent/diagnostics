@@ -57,8 +57,8 @@ def _package(component):
     if component not in _VERSIONS:
         info = {"package_version": "unknown"}
         try:
-            distribution_name = 'vaws-remote-dev' if component == 'remote-dev' else component
-            module_name = 'remote_dev' if distribution_name == 'vaws-remote-dev' else distribution_name.replace('-', '_')
+            distribution_name = 'remote-dev' if component == 'remote-dev' else component
+            module_name = 'remote_dev' if distribution_name == 'remote-dev' else distribution_name.replace('-', '_')
             distribution = metadata.distribution(distribution_name)
             module = sys.modules.get(module_name)
             loaded = getattr(module, '__file__', None)
@@ -134,12 +134,12 @@ def _attributes(attributes):
 
 
 def default_root():
-    chosen = os.environ.get("VAWS_DIAGNOSTICS_ROOT")
+    chosen = os.environ.get("MINDIE_DIAGNOSTICS_ROOT")
     if chosen:
         return Path(chosen).expanduser()
     if os.name == "nt":
-        return Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "vaws" / "diagnostics"
-    return Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "vaws" / "diagnostics"
+        return Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "mindie" / "diagnostics"
+    return Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "mindie" / "diagnostics"
 
 
 class _Handler(RotatingFileHandler):
@@ -170,7 +170,7 @@ class Recorder:
     def __init__(self, component, root=None, level=None, version=None):
         self.component = component if isinstance(component, str) and _COMPONENT.fullmatch(component) else "unknown"
         self.root = root
-        self.level = _LEVELS.get(str(level or os.environ.get("VAWS_LOG_LEVEL", "INFO")).upper(), 20)
+        self.level = _LEVELS.get(str(level or os.environ.get("MINDIE_LOG_LEVEL", "INFO")).upper(), 20)
         self._pid = None
         self._process_id = uuid.uuid4().hex
         self._birth_pid = os.getpid()
@@ -192,7 +192,7 @@ class Recorder:
             return
         self._notified = True
         try:
-            sys.stderr.write("vaws-diagnostics: WARNING diagnostic storage unavailable; business outcome unchanged\n")
+            sys.stderr.write("mindie-diagnostics: WARNING diagnostic storage unavailable; business outcome unchanged\n")
             sys.stderr.flush()
         except Exception:
             pass
@@ -213,7 +213,7 @@ class Recorder:
         if os.name != "nt":
             folder.chmod(0o700)  # Only this component's diagnostic leaf, never its parents.
         path = folder / (str(pid) + "-" + self._process_id + ".jsonl")
-        logger = std_logging.Logger("vaws." + self.component, level=self.level)
+        logger = std_logging.Logger("mindie." + self.component, level=self.level)
         logger.propagate = False
         logger.addHandler(_Handler(path, self))
         # A fork does not reuse its parent's handler/file. Do not close parent state.
@@ -394,7 +394,7 @@ class Operation:
 def configure(component, *, root=None, level=None, version=None):
     with _LOCK:
         prior = _RECORDERS.get(component)
-        resolved_level = _LEVELS.get(str(level or os.environ.get("VAWS_LOG_LEVEL", "INFO")).upper(), 20)
+        resolved_level = _LEVELS.get(str(level or os.environ.get("MINDIE_LOG_LEVEL", "INFO")).upper(), 20)
         if prior is not None and prior.root == root and prior.level == resolved_level and (version is None or prior.package["package_version"] == version):
             return prior
         recorder = Recorder(component, root=root, level=level, version=version)

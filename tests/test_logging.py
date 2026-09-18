@@ -5,8 +5,8 @@ import sys
 
 import pytest
 
-from vaws_diagnostics import bind_context, configure, current_context
-from vaws_diagnostics import logging as module
+from mindie_diagnostics import bind_context, configure, current_context
+from mindie_diagnostics import logging as module
 
 
 def rows(root):
@@ -106,8 +106,8 @@ def test_attributes_are_bounded_and_sensitive_values_omitted(tmp_path):
 
 def test_two_real_processes_rotate_independently(tmp_path):
     program = """import sys
-from vaws_diagnostics import configure
-from vaws_diagnostics import logging as m
+from mindie_diagnostics import configure
+from mindie_diagnostics import logging as m
 m.MAX_LOG_BYTES=2048
 r=configure('tests',root=sys.argv[1])
 for i in range(24):
@@ -174,7 +174,7 @@ def test_posix_private_leaf_and_rotated_files(tmp_path, monkeypatch):
     import os
     import stat
     import pytest
-    import vaws_diagnostics.logging as log
+    import mindie_diagnostics.logging as log
     if os.name == "nt":
         pytest.skip("POSIX mode bits")
     before = stat.S_IMODE(tmp_path.stat().st_mode)
@@ -200,7 +200,7 @@ def test_fork_resets_locks_held_by_another_thread(tmp_path):
     import threading
     import time
     import pytest
-    import vaws_diagnostics.logging as log
+    import mindie_diagnostics.logging as log
     if not hasattr(os, "fork"):
         pytest.skip("requires fork")
     old = log.configure("fork-locks", root=tmp_path / "old")
@@ -245,7 +245,7 @@ def test_fork_resets_locks_held_by_another_thread(tmp_path):
 def test_import_override_does_not_claim_installed_revision(tmp_path, monkeypatch):
     import sys
     from types import SimpleNamespace
-    from vaws_diagnostics import logging as implementation
+    from mindie_diagnostics import logging as implementation
     class Distribution:
         version = '1.0.0'
         def locate_file(self, path):
@@ -253,9 +253,9 @@ def test_import_override_does_not_claim_installed_revision(tmp_path, monkeypatch
         def read_text(self, name):
             return '{"vcs_info":{"commit_id":"' + 'a' * 40 + '"}}'
     monkeypatch.setattr(implementation.metadata, 'distribution', lambda _: Distribution())
-    monkeypatch.setitem(sys.modules, 'vaws_test', SimpleNamespace(__file__=str(tmp_path / 'candidate' / 'vaws_test' / '__init__.py')))
+    monkeypatch.setitem(sys.modules, 'mindie_test', SimpleNamespace(__file__=str(tmp_path / 'candidate' / 'mindie_test' / '__init__.py')))
     monkeypatch.setattr(implementation, '_VERSIONS', {})
-    assert implementation._package('vaws-test') == {'package_version': 'unknown'}
-    monkeypatch.setitem(sys.modules, 'vaws_test', SimpleNamespace(__file__=str(tmp_path / 'installed' / 'vaws_test' / '__init__.py')))
+    assert implementation._package('mindie-test') == {'package_version': 'unknown'}
+    monkeypatch.setitem(sys.modules, 'mindie_test', SimpleNamespace(__file__=str(tmp_path / 'installed' / 'mindie_test' / '__init__.py')))
     monkeypatch.setattr(implementation, '_VERSIONS', {})
-    assert implementation._package('vaws-test')['package_revision'] == 'a' * 40
+    assert implementation._package('mindie-test')['package_revision'] == 'a' * 40

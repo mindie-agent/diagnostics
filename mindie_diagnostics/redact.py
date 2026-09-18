@@ -1,4 +1,4 @@
-"""Pure scanner migrated from vaws-knowledge r2 without changing rule behavior.
+"""Pure scanner migrated from mindie-knowledge r2 without changing rule behavior.
 
 File/CLI parsing remains with callers. This module has no knowledge dependency.
 """

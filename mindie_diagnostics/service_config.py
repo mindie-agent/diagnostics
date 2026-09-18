@@ -68,6 +68,6 @@ def linux_worker_configuration(text):
     encoded = commands[0]
     tokens = re.findall(r'"((?:[^"\\]|\\.)*)"', encoded)
     argv = [re.sub(r'\\([\\"])', r'\1', token).replace('%%', '%').replace('$$', '$') for token in tokens]
-    if ' '.join(map(_quoted, argv)) != encoded or argv[1:5] != ['-I', '-m', 'vaws_diagnostics.cli', 'worker']:
+    if ' '.join(map(_quoted, argv)) != encoded or argv[1:5] != ['-I', '-m', 'mindie_diagnostics.cli', 'worker']:
         raise ServiceError('invalid_reporter_configuration')
     return argv[4:], environments[0].replace('%%', '%') if environments else None

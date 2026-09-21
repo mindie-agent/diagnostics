@@ -1,10 +1,10 @@
 """Standard-library logging with independent process files and bounded records."""
 from __future__ import annotations
 
+from collections import OrderedDict
 from datetime import datetime, timezone
 import hashlib
 from importlib import metadata
-from logging.handlers import RotatingFileHandler
 import logging as std_logging
 import json
 import math
@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import stat
 import threading
 import time
 import uuid
@@ -20,6 +21,7 @@ import weakref
 from .context import bind_context, current_context
 from .community import current_consent
 from .redact import redact_text
+from .reader_registry import reader_guard, cursor_snapshot, fully_consumed, pressure_blocked
 
 SCHEMA = 1
 MAX_RECORD_BYTES = 16_384
@@ -32,19 +34,22 @@ _RECORDERS = {}
 _VERSIONS = {}
 _LOCK = threading.RLock()
 _LIVE_RECORDERS = weakref.WeakSet()
+_FAILURE_RECORDERS = OrderedDict()
 
 
 def _after_fork():
     # Python resets stdlib logging locks, but it cannot reset our own locks.
     # Include recorders replaced by configure while an older operation lives.
-    global _LOCK
+    global _LOCK, _FAILURE_RECORDERS
     _LOCK = threading.RLock()
+    _FAILURE_RECORDERS = OrderedDict()
     for recorder in list(_LIVE_RECORDERS):
         recorder._mutex = threading.RLock()
         recorder._logger = None
         recorder._path = None
         recorder._pid = None
         recorder._retry_at = 0.0
+        recorder.dropped_records = 0
         recorder._process_id = uuid.uuid4().hex
         recorder._birth_pid = os.getpid()
 
@@ -142,29 +147,143 @@ def default_root():
     return Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "mindie" / "diagnostics"
 
 
-class _Handler(RotatingFileHandler):
+class _Handler(std_logging.Handler):
+    """Stable bounded segments; only this writer's consumed closed slots recycle."""
     def __init__(self, filename, recorder):
-        super().__init__(filename, maxBytes=MAX_LOG_BYTES, backupCount=BACKUP_COUNT, encoding="utf-8")
+        super().__init__()
         self.recorder = recorder
-        self.setFormatter(std_logging.Formatter("%(message)s"))
+        self.root = Path(filename).parent.parent.parent
+        base = Path(filename)
+        self.paths = [base] + [base.with_name(base.name + '.' + str(i))
+                              for i in range(1, BACKUP_COUNT + 1)]
+        self.stream = None
+        self.current = None
+        self.owned = {}
+        self.credit = None
+        self.setFormatter(std_logging.Formatter('%(message)s'))
 
-    def _open(self):
-        # Called again after every rollover. Do not rely on the caller's umask
-        # or create a briefly world-readable file and chmod it afterwards.
-        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(self.baseFilename, flags, 0o600)
-        try:
-            if os.name != "nt":
-                os.fchmod(descriptor, 0o600)
-            return os.fdopen(descriptor, self.mode, encoding=self.encoding, errors=self.errors)
-        except BaseException:
-            os.close(descriptor)
-            raise
-
-    def handleError(self, record):
-        # logging.raiseExceptions must never turn this into payload/traceback output.
+    def _drop(self):
+        self.recorder.dropped_records += 1
         self.recorder._unavailable()
 
+    def _select(self, size, blocked):
+        deadline = time.monotonic() + .1
+        with reader_guard(self.root, timeout=.05) as state:
+            if state['status'] != 'ok':
+                return False
+            snapshot = None
+            start = (self.paths.index(self.current) + 1) % len(self.paths) if self.current else 0
+            ordered = self.paths[start:] + self.paths[:start]
+            # Fill the bounded window before recycling; then cycle all slots.
+            ordered.sort(key=lambda path: path.exists())
+            for path in ordered:
+                if path == self.current:
+                    continue
+                if time.monotonic() >= deadline:
+                    return False
+                try:
+                    old = path.lstat()
+                except FileNotFoundError:
+                    if blocked:
+                        continue
+                    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                                         | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+                    credit = None
+                else:
+                    if (not stat.S_ISREG(old.st_mode) or old.st_nlink != 1
+                            or self.owned.get(path) != (old.st_dev, old.st_ino)):
+                        continue
+                    if snapshot is None:
+                        snapshot = cursor_snapshot(state['readers'],
+                                                   timeout=max(0, deadline - time.monotonic()))
+                    if (not fully_consumed(snapshot, path, old.st_ino, old.st_size)
+                            or (blocked and size > old.st_size)):
+                        continue
+                    temporary = path.with_name('.segment-' + uuid.uuid4().hex)
+                    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                                         | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+                    try:
+                        new = os.fstat(descriptor)
+                        current = path.lstat()
+                        if ((new.st_dev, new.st_ino) == (old.st_dev, old.st_ino)
+                                or (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)
+                                != (old.st_dev, old.st_ino, old.st_size, old.st_mtime_ns)):
+                            os.close(descriptor)
+                            descriptor = None
+                            continue
+                        if os.name == 'nt':
+                            # Windows rejects replacement while this temporary
+                            # file is open without delete-sharing. The current
+                            # writer remains open until the new slot is ready.
+                            os.close(descriptor)
+                            descriptor = None
+                        os.replace(temporary, path)
+                        if descriptor is None:
+                            descriptor = os.open(path, os.O_WRONLY | os.O_APPEND
+                                                 | getattr(os, 'O_NOFOLLOW', 0)
+                                                 | getattr(os, 'O_NONBLOCK', 0))
+                            reopened = os.fstat(descriptor)
+                            selected = path.lstat()
+                            expected = (new.st_dev, new.st_ino)
+                            if (not stat.S_ISREG(reopened.st_mode)
+                                    or reopened.st_nlink != 1
+                                    or not stat.S_ISREG(selected.st_mode)
+                                    or (reopened.st_dev, reopened.st_ino) != expected
+                                    or (selected.st_dev, selected.st_ino) != expected):
+                                raise OSError('diagnostic segment identity changed')
+                    except BaseException:
+                        if descriptor is not None:
+                            os.close(descriptor)
+                        raise
+                    finally:
+                        temporary.unlink(missing_ok=True)
+                    credit = old.st_size if blocked else None
+                try:
+                    info = os.fstat(descriptor)
+                    stream = os.fdopen(descriptor, 'wb', buffering=0)
+                except BaseException:
+                    os.close(descriptor)
+                    raise
+                previous = self.stream
+                self.stream = stream
+                self.current = path
+                self.owned[path] = (info.st_dev, info.st_ino)
+                self.credit = credit
+                self.recorder._path = path
+                if previous is not None:
+                    previous.close()
+                return True
+        return False
+
+    def emit(self, record):
+        try:
+            raw = (self.format(record) + '\n').encode('utf-8')
+            if len(raw) > MAX_LOG_BYTES:
+                self._drop()
+                return
+            blocked = pressure_blocked(self.root)
+            present = os.fstat(self.stream.fileno()).st_size if self.stream is not None else 0
+            cap = MAX_LOG_BYTES
+            if blocked:
+                cap = min(cap, self.credit if self.credit is not None else present)
+            if self.stream is None or present + len(raw) > cap:
+                if not self._select(len(raw), blocked):
+                    self._drop()
+                    return
+            self.stream.write(raw)
+        except Exception:
+            self.handleError(record)
+
+    def handleError(self, record):
+        self._drop()
+
+    def close(self):
+        try:
+            if self.stream is not None:
+                self.stream.close()
+                self.stream = None
+        finally:
+            super().close()
 
 class Recorder:
     def __init__(self, component, root=None, level=None, version=None):
@@ -181,6 +300,7 @@ class Recorder:
         self._logger = None
         self._mutex = threading.RLock()
         self.logging_failed = False
+        self.dropped_records = 0
         self._notified = False
         self._retry_at = 0.0
         with _LOCK:
@@ -192,8 +312,11 @@ class Recorder:
             return
         self._notified = True
         try:
-            sys.stderr.write("mindie-diagnostics: WARNING diagnostic storage unavailable; business outcome unchanged\n")
-            sys.stderr.flush()
+            descriptor = sys.stderr.fileno()
+            # Never change a host-owned descriptor's flags. An optional warning
+            # is safe only if the descriptor is already nonblocking.
+            if os.name == "posix" and not os.get_blocking(descriptor):
+                os.write(descriptor, b"mindie-diagnostics: WARNING diagnostic storage unavailable; business outcome unchanged\n")
         except Exception:
             pass
 
@@ -228,21 +351,28 @@ class Recorder:
         severity = _LEVELS.get(event.get("severity", "INFO"), 20)
         if severity < self.level:
             return
+        if not self._mutex.acquire(blocking=False):
+            self.dropped_records += 1
+            self._unavailable()
+            return
         try:
-            with self._mutex:
-                logger = self._get_logger()
-                if logger is None:
-                    return
-                event = {"community": current_consent() if "community" not in event else event["community"],
-                         **event, **self.package, "process_instance_id": self._process_id}
+            logger = self._get_logger()
+            if logger is None:
+                self.dropped_records += 1
+                return
+            event = {"community": current_consent() if "community" not in event else event["community"],
+                     **event, **self.package, "process_instance_id": self._process_id}
+            encoded = json.dumps(event, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+            if len(encoded.encode("utf-8")) > MAX_RECORD_BYTES:
+                event = {**event, "attributes": {"attributes_omitted": True}}
                 encoded = json.dumps(event, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-                if len(encoded.encode("utf-8")) > MAX_RECORD_BYTES:
-                    event = {**event, "attributes": {"attributes_omitted": True}}
-                    encoded = json.dumps(event, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-                logger.log(severity, encoded)
+            logger.log(severity, encoded)
         except Exception:
             self._retry_at = time.monotonic() + 1
+            self.dropped_records += 1
             self._unavailable()
+        finally:
+            self._mutex.release()
 
     def operation(self, name, *, level="INFO", **attributes):
         return Operation(self, name, attributes, level=level)
@@ -387,6 +517,7 @@ class Operation:
                 "status": self.status, "duration_ms": round(self._duration(), 3),
                 "started_at": self.started_at, "finished_at": self.finished_at,
                 "record_ref": self.recorder.record_ref, "logging_failed": self.recorder.logging_failed,
+                "dropped_records": self.recorder.dropped_records,
                 "phases": list(self._phases),
                 **({"phase_id": self.phase_id, "phase": self.name} if self.phase_id else {})}
 
@@ -407,3 +538,70 @@ def get_recorder(component):
         if component not in _RECORDERS:
             _RECORDERS[component] = Recorder(component)
         return _RECORDERS[component]
+
+
+def append_failure_event(component, root, event) -> bool:
+    """Append a validated failure with exact build/consent and no lock backlog.
+
+    Integration owns the event schema. Contention returns False for its visible
+    logging_failed result; ordinary business work never waits behind a writer.
+    """
+    recorder = None
+    acquired = False
+    try:
+        if not isinstance(component, str) or not _COMPONENT.fullmatch(component):
+            return False
+        encoded = json.dumps(event, ensure_ascii=False, separators=(",", ":"),
+                             allow_nan=False)
+        if len(encoded.encode('utf-8')) > MAX_RECORD_BYTES:
+            return False
+        selected_root = Path(root).absolute()
+        key = (component, str(selected_root))
+        if not _LOCK.acquire(blocking=False):
+            return False
+        try:
+            recorder = _FAILURE_RECORDERS.get(key)
+            if recorder is None:
+                if len(_FAILURE_RECORDERS) >= 32:
+                    prior_key, prior = next(iter(_FAILURE_RECORDERS.items()))
+                    if not prior._mutex.acquire(blocking=False):
+                        return False
+                    try:
+                        _FAILURE_RECORDERS.pop(prior_key)
+                        prior.close()
+                    finally:
+                        prior._mutex.release()
+                recorder = Recorder(component, root=selected_root, level='ERROR')
+                _FAILURE_RECORDERS[key] = recorder
+            else:
+                _FAILURE_RECORDERS.move_to_end(key)
+            acquired = recorder._mutex.acquire(blocking=False)
+            if not acquired:
+                recorder.dropped_records += 1
+                recorder.logging_failed = True
+                return False
+        finally:
+            _LOCK.release()
+        before = recorder.dropped_records
+        logger = recorder._get_logger()
+        if logger is None:
+            recorder.dropped_records += 1
+            return False
+        # Process identity belongs to this writer; build and consent stay exact.
+        payload = dict(event, process_instance_id=recorder._process_id)
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"),
+                             allow_nan=False)
+        if len(encoded.encode('utf-8')) > MAX_RECORD_BYTES:
+            recorder.dropped_records += 1
+            recorder.logging_failed = True
+            return False
+        logger.error(encoded)
+        return recorder.dropped_records == before
+    except Exception:
+        if recorder is not None:
+            recorder.logging_failed = True
+            recorder.dropped_records += 1
+        return False
+    finally:
+        if acquired:
+            recorder._mutex.release()

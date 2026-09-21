@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mindie-diagnostics"
-version = "0.2.1"
+version = "0.3.0"
 description = "Bounded structured diagnostics and safe support bundles for MindIE owners"
 readme = "README.md"
 requires-python = ">=3.11"

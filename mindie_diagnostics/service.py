@@ -178,16 +178,26 @@ def _environment_file(value):
 
 
 def _reporter_executable(value, environment_file):
-    if environment_file is None and any(os.environ.get(key) for key in ("GH_TOKEN", "GITHUB_TOKEN")):
-        raise ServiceError("persistent_credentials_required")
+    # The transport is exclusively gh. Native services use the existing gh
+    # login (or an explicitly configured legacy private environment file).
+    # Installation never copies transient credentials from the calling host.
     try:
         return str(_executable(value or "gh"))
     except ServiceError:
-        if environment_file is not None:
-            # The worker's HTTPS adapter can use a private token when no CLI is
-            # installed. The service manager stores the file path, never its value.
-            return str(value or "gh")
-        raise ServiceError("github_authentication_required") from None
+        raise ServiceError("gh_unavailable") from None
+
+
+def _check_reporter_binding(argv, environment_file, state, repository, config):
+    """Do not repurpose a paid bot or another reporting authorization."""
+    if '--central-bot' in argv or any(flag in argv for flag in ('--grok', '--grok-home', '--grok-work')):
+        raise ServiceError('legacy_model_worker_requires_explicit_removal')
+    if config is None:
+        return
+    from .service_config import worker_options
+    old = worker_options(argv, environment_file)
+    if (old.get('reporting_config') != str(config)
+            or old['state'] != str(state) or old['repository'] != repository):
+        raise ServiceError('reporter_authorization_mismatch')
 
 
 @contextmanager
@@ -243,7 +253,7 @@ def _publish(path, text, runner):
 def install_service(roots, state, repository, *, python=None, gh=None, grok=None,
                     grok_home=None, grok_work=None, interval=60, since=None,
                     environment_file=None, unit_dir=None, runner=None, start=True, save_token=False, central_bot=False,
-                    ensure=False):
+                    ensure=False, reporting_config=None):
     """Install/update the owned unit, preserving the first installation's since.
 
     ``start=False`` writes/enables it without starting or restarting a process.
@@ -254,12 +264,18 @@ def install_service(roots, state, repository, *, python=None, gh=None, grok=None
         return install_native(roots, state, repository, python=python, gh=gh, grok=grok,
                               grok_home=grok_home, grok_work=grok_work, interval=interval, since=since,
                               environment_file=environment_file, unit_dir=unit_dir, runner=runner, start=start,
-                              save_token=save_token, central_bot=central_bot, ensure=ensure)
+                              save_token=save_token, central_bot=central_bot, ensure=ensure,
+                              reporting_config=reporting_config)
     _linux()
     runner = runner or subprocess.run
     path = _unit_path(unit_dir)
     if ensure and central_bot:
         raise ServiceError('central_bot_is_not_a_local_reporter')
+    if ensure and (grok or grok_home or grok_work):
+        raise ServiceError('legacy_model_worker_requires_explicit_removal')
+    reporting_config = _absolute(reporting_config) if reporting_config is not None else None
+    if reporting_config is not None and (grok or grok_home or grok_work or central_bot or save_token):
+        raise ServiceError('reporter_configuration_conflict')
     roots = [_absolute(root) for root in roots]
     if central_bot and roots:
         raise ServiceError("central_bot_does_not_watch_local_logs")
@@ -281,12 +297,13 @@ def install_service(roots, state, repository, *, python=None, gh=None, grok=None
         if ensure and existing:
             from .service_config import linux_worker_configuration, merged_reporter_options
             old_argv, old_environment = linux_worker_configuration(existing[0])
-            retained = merged_reporter_options(old_argv, old_environment, roots, repository)
-            roots, state, gh = retained['roots'], Path(retained['state']), retained['gh']
-            environment_file = retained['environment_file']
-            save_token = False  # Onboarding never rotates another clone's authentication.
-            grok, grok_home, grok_work = (retained[key] for key in ('grok', 'grok_home', 'grok_work'))
-            interval = retained['interval']
+            _check_reporter_binding(old_argv, old_environment, state, repository, reporting_config)
+            if reporting_config is None:
+                retained = merged_reporter_options(old_argv, old_environment, roots, repository)
+                roots, state, gh = retained['roots'], Path(retained['state']), retained['gh']
+                environment_file = retained['environment_file']
+                interval = retained['interval']
+            save_token = False
         fixed_since = existing[1]["since"] if existing else _since(since)
         interpreter, version = _interpreter(runner, python)
         _check_loaded_owner(runner, path, allow_missing=True, creating=existing is None,
@@ -300,6 +317,8 @@ def install_service(roots, state, repository, *, python=None, gh=None, grok=None
         argv = [str(interpreter), "-I", "-m", "mindie_diagnostics.cli", "worker"]
         if central_bot:
             argv.append("--central-bot")
+        if reporting_config is not None:
+            argv += ["--reporting-config", str(reporting_config)]
         for root in dict.fromkeys(roots):
             argv += ["--root", str(root)]
         argv += ["--state", str(state), "--repository", repository, "--gh", gh_path,
@@ -313,7 +332,7 @@ def install_service(roots, state, repository, *, python=None, gh=None, grok=None
                 "\n[Service]\nType=exec\nExecStart=" + " ".join(map(_quoted, argv)) + "\n"
                 "WorkingDirectory=/\n"
                 + ("EnvironmentFile=" + str(environment_file).replace('%', '%%') + "\n" if environment_file else "") +
-                "UnsetEnvironment=PYTHONPATH PYTHONHOME\nRestart=on-failure\nRestartSec=10\n"
+                "UnsetEnvironment=PYTHONPATH PYTHONHOME\nRestart=no\n"
                 "TimeoutStopSec=20\nKillMode=control-group\nUMask=0077\n"
                 "StandardOutput=journal\nStandardError=journal\nSyslogIdentifier=mindie-diagnostics\n"
                 "LogRateLimitIntervalSec=30s\nLogRateLimitBurst=100\n"
@@ -334,9 +353,9 @@ def install_service(roots, state, repository, *, python=None, gh=None, grok=None
 def ensure_reporter_service(roots, state, repository, **options):
     """Add log roots to the owned local reporter, preserving its durable setup.
 
-    Existing roots, state, credential file and optional model profile survive a
-    new clone's onboarding. The explicit runtime may change. Repository changes
-    and central-bot replacement are refused. Merge and update share one lock.
+    An independent reporting policy selects its own roots and queue. Rebinding
+    another authorization or starting a legacy model worker is refused. No OS
+    crash restart is configured; an explicit ensure may recover a stopped worker.
     """
     return install_service(roots, state, repository, **options, ensure=True)
 

@@ -7,19 +7,18 @@ from mindie_diagnostics import configure, collect_bundle
 from mindie_diagnostics.outbox import Outbox
 from mindie_diagnostics.reporter import ingest, issue_payload, render_issue
 
-pytestmark = pytest.mark.usefixtures('community_consent')
+pytestmark = pytest.mark.usefixtures('reporting_consent')
 
 
 def failure(root):
-    rec = configure('mindie-diagnostics', root=root, level='DEBUG')
-    with rec.operation('synthetic_failure') as op:
-        with op.phase('connect'):
-            pass
-        op.event('DEBUG', 'private.details', password='secret-do-not-upload', stdout='PRIVATE-OUTPUT-SENTINEL')
-        op.fail('transport', submission_state='uncertain', error_type='TimeoutError')
-    ref = rec.record_ref
-    rec.close()
-    return ref, op
+    from types import SimpleNamespace
+    from mindie_diagnostics.integration import record_failure
+    ref = record_failure('mindie-diagnostics', 'synthetic_failure', stage='connect',
+                         category='internal', exception=RuntimeError('secret-do-not-upload'), root=root)
+    assert ref['recorded']
+    files = list((root / 'events' / 'mindie-diagnostics').glob('*.jsonl'))
+    assert len(files) == 1
+    return str(files[0]), SimpleNamespace(operation_id=ref['incident_id'])
 
 
 def test_real_failure_ingestion_redaction_and_incremental_resume(tmp_path):
@@ -74,7 +73,7 @@ def test_explicit_caller_error_is_recorded_without_automatic_issue(tmp_path):
     rec.close()
     queue = Outbox(tmp_path / 'queue.db')
     result = ingest(tmp_path, queue)
-    assert result['caller_errors'] == 1 and result['enqueued'] == 0
+    assert result['enqueued'] == 0
     assert collect_bundle(tmp_path)['summary']['error_count'] > 0
 
 
@@ -114,9 +113,9 @@ def test_owner_classification_survives_log_bundle_and_ingestion(tmp_path, catego
     assert projected['attributes'] == end['attributes']
     queue = Outbox(tmp_path / 'queue.db')
     result = ingest(tmp_path, queue)
-    assert result['enqueued'] == enqueued
-    assert result['caller_errors'] == 1 - enqueued
-    assert bool(queue.claim()) == bool(enqueued)
+    # Old generic telemetry never grants owner-confirmed fault authority.
+    assert result['enqueued'] == 0
+    assert queue.claim() is None
     assert ingest(tmp_path, queue)['enqueued'] == 0
 
 
@@ -132,7 +131,7 @@ def test_http_response_keeps_numeric_code_and_owner_outcome(tmp_path, code, fail
     assert any(event['attributes'].get('error_code') == code for event in bundle['events'])
     assert bool(bundle['summary']['error_count']) == failed
     queue = Outbox(tmp_path / 'queue.db')
-    assert ingest(tmp_path, queue)['enqueued'] == int(failed)
+    assert ingest(tmp_path, queue)['enqueued'] == 0
 
 
 @pytest.mark.parametrize('code', [True, 4.0, 2**31, -(2**31)-1, '400 PRIVATE-CODE-TEXT'])
@@ -145,3 +144,19 @@ def test_numeric_error_code_projection_rejects_unknown_shapes(tmp_path, code):
     assert all('error_code' not in event['attributes'] for event in bundle['events'])
     assert all(event['status'] == 'error' for event in bundle['events'] if event['event'] == 'operation.end')
     assert 'PRIVATE-CODE-TEXT' not in json.dumps(bundle)
+
+
+def test_repeated_owner_fault_keeps_incident_links_without_reset(tmp_path):
+    from mindie_diagnostics.integration import record_failure
+    queue=Outbox(tmp_path / 'queue.db')
+    first=record_failure('mindie-knowledge','same_fault',stage='read',category='internal',root=tmp_path)
+    assert ingest(tmp_path,queue)['enqueued']==1
+    claimed=queue.claim();queue.update(claimed,state='published',issue_number=1,issue_url='https://github.com/mindie-agent/mindie-agent/issues/1')
+    second=record_failure('mindie-knowledge','same_fault',stage='read',category='internal',root=tmp_path)
+    assert ingest(tmp_path,queue)['enqueued']==1
+    row=queue.rows()[0]
+    assert row['state']=='published' and row['attempts']==1
+    with queue.connect() as db:
+        payload=json.loads(db.execute('SELECT payload FROM incidents').fetchone()[0])
+    assert {first['incident_id'],second['incident_id']} <= set(payload['incident_ids'])
+    assert queue.claim() is None

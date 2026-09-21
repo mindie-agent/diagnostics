@@ -10,7 +10,8 @@ import re
 
 from .bundle import _safe_open, collect_bundle, export_public_event
 from .outbox import Outbox
-from .community import consent_allowed, scope_key
+from .reporting import consent_allowed, scope_key
+from .reader_registry import register_reader
 
 _FILE = re.compile(r"\d+-[0-9a-f]{32}\.jsonl(?:\.[1-3])?\Z")
 
@@ -50,6 +51,7 @@ def ingest(root, queue: Outbox, *, max_files=256, max_bytes=8 * 1024 * 1024, sin
     root = Path(root).absolute()
     if any(path.is_symlink() for path in (root, *root.parents)):
         raise ValueError('diagnostic root must not traverse symlinks')
+    register_reader(root, queue.path)
     counts = {'enqueued': 0, 'invalid': 0, 'scanned_bytes': 0, 'limited': 0, 'files': 0, 'caller_errors': 0, 'before_start': 0, 'consent_skipped': 0}
     with queue.connect() as db:
         db.execute('CREATE TABLE IF NOT EXISTS cursors (path TEXT PRIMARY KEY, inode TEXT, offset INTEGER, touched REAL, discard INTEGER DEFAULT 0)')
@@ -108,11 +110,11 @@ def ingest(root, queue: Outbox, *, max_files=256, max_bytes=8 * 1024 * 1024, sin
                     if since is not None and datetime.fromisoformat(event['timestamp'].replace('Z', '+00:00')).timestamp() < since:
                         counts['before_start'] += 1
                         continue
-                    consent = raw.get('community')
+                    consent = raw.get('reporting')
                     # Older unscoped logs stay local. Enabling a workspace later
                     # must never backfill logs produced without that consent.
                     recent.append((event, consent))
-                    if event.get('event') != 'operation.end' or event.get('status') != 'error':
+                    if raw.get('reportable') is not True or event.get('event') != 'operation.end' or event.get('status') != 'error':
                         continue
                     attributes = event.get('attributes', {})
                     if (attributes.get('category') in {'caller', 'cancelled'}
@@ -127,7 +129,7 @@ def ingest(root, queue: Outbox, *, max_files=256, max_bytes=8 * 1024 * 1024, sin
                                             include_logs=False, max_bytes=36000)
                     payload = issue_payload(bundle)
                     counts['enqueued'] += int(queue.enqueue(scope_key(fingerprint(payload), consent),
-                                                            scope_key(event['operation_id'], consent),
+                                                            event['operation_id'],
                                                             payload, consent=consent))
                 except (ValueError, KeyError, TypeError):
                     counts['invalid'] += 1

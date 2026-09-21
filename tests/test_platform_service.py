@@ -107,60 +107,36 @@ def test_install_reuse_status_start_and_remove_preserve_data(installation):
     assert service.service_status(unit_dir=values["unit_dir"], runner=runner)["status"] == "absent"
 
 
-@pytest.mark.parametrize('token_only', [False, True])
-def test_ensure_preserves_two_clones_roots_state_and_existing_authentication(installation, monkeypatch, token_only):
+def test_reporter_policy_roundtrip_and_binding_protection(installation):
     from mindie_diagnostics.service_config import worker_options
     values, runner = installation
-    if token_only:
-        monkeypatch.setenv('GH_TOKEN', 'initial-private-fixture')
-        monkeypatch.setattr(service.shutil, 'which', lambda value: None)
-        values = {**values, 'gh': None}
-    first = service.ensure_reporter_service(**values, save_token=token_only)
-    config = json.loads(Path(first['manifest']).read_text())
-    credential = Path(config['environment_file']) if token_only else None
-    before = credential.read_bytes() if credential else None
-    state_file = values['state'] / 'pending.sqlite3'
-    state_file.write_bytes(b'existing queue must survive')
-    second_root = values['state'].parent / 'another clone logs'
-    unused_state = values['state'].parent / 'unneeded clone state'
-    monkeypatch.setenv('GH_TOKEN', 'different-clone-private-fixture')
-    second_values = {**values, 'roots': [second_root], 'state': unused_state, 'save_token': True}
-    second = service.ensure_reporter_service(**second_values)
-    current = json.loads(Path(second['manifest']).read_text())
+    config = values['state'].parent / 'reporting.json'
+    first = service.ensure_reporter_service(**values, reporting_config=config)
+    same = service.ensure_reporter_service(**values, reporting_config=config)
+    assert not same['changed']
+    manifest = Path(first['manifest'])
+    current = json.loads(manifest.read_text())
     options = worker_options(current['argv'], current['environment_file'])
-    assert options['roots'] == [str(values['roots'][0]), str(second_root)]
-    assert options['state'] == str(values['state'])
-    assert options['environment_file'] == config['environment_file'] and current['since'] == config['since']
-    assert options['gh'] == ('gh' if token_only else str(values['gh']))
-    assert not unused_state.exists() and state_file.read_bytes() == b'existing queue must survive'
-    if credential:
-        assert credential.read_bytes() == before
-    monkeypatch.delenv('GH_TOKEN')
-    runner.calls.clear()
-    third = service.ensure_reporter_service(**{**second_values, 'save_token': False})
-    assert not third['changed']
-    assert not any('Stop-ScheduledTask' in script or 'Register-ScheduledTask' in script for script in scripts(runner))
-    assert not any(argv[:2] == ['launchctl', 'bootout'] for argv, _ in runner.calls)
+    assert options['reporting_config'] == str(config)
+    assert current['environment_file'] is None
+    before = manifest.read_bytes()
+    with pytest.raises(service.ServiceError, match='reporter_authorization_mismatch'):
+        service.ensure_reporter_service(**values, reporting_config=config.with_name('other.json'))
+    assert manifest.read_bytes() == before
 
 
-def test_ensure_preserves_optional_grok_and_refuses_central_or_repository_replacement(installation):
-    from mindie_diagnostics.service_config import worker_options
+def test_reporter_refuses_legacy_model_worker(installation):
     values, runner = installation
     profile = dict(grok=values['gh'], grok_home=values['state'] / 'grok', grok_work=values['state'] / 'work')
     first = service.install_service(**values, **profile)
-    second = service.ensure_reporter_service(**values)
-    assert not second['changed']
     manifest = Path(first['manifest'])
     before = manifest.read_bytes()
-    with pytest.raises(service.ServiceError, match='reporter_repository_mismatch'):
-        service.ensure_reporter_service(**{**values, 'repository': 'different/project'})
-    assert manifest.read_bytes() == before
-    service.install_service(**{**values, 'roots': [], 'central_bot': True}, **profile)
-    before = manifest.read_bytes()
     runner.calls.clear()
-    with pytest.raises(service.ServiceError, match='central_bot_is_not_a_local_reporter'):
+    with pytest.raises(service.ServiceError, match='legacy_model_worker'):
         service.ensure_reporter_service(**values)
     assert manifest.read_bytes() == before and runner.calls == []
+    with pytest.raises(service.ServiceError, match='legacy_model_worker'):
+        service.ensure_reporter_service(**values, **profile)
 
 
 def test_manager_configuration_is_hidden_bounded_and_shell_free(installation):
@@ -176,11 +152,11 @@ def test_manager_configuration_is_hidden_bounded_and_shell_free(installation):
         assert "<LogonType>InteractiveToken</LogonType>" in text
         assert "<RunLevel>LeastPrivilege</RunLevel>" in text
         assert "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>" in text
-        assert "<RestartOnFailure>" in text and "<MultipleInstancesPolicy>IgnoreNew" in text
+        assert "<RestartOnFailure>" not in text and "<MultipleInstancesPolicy>IgnoreNew" in text
         assert all("-WindowStyle" in argv for argv, _ in runner.calls if argv[0] == "powershell.exe")
     else:
         plist = plistlib.loads(Path(result["unit"]).read_bytes())
-        assert plist["KeepAlive"] == {"SuccessfulExit": False} and plist["ThrottleInterval"] == 10
+        assert "KeepAlive" not in plist
         assert plist["StandardOutPath"] == plist["StandardErrorPath"] == "/dev/null"
         assert "EnvironmentVariables" not in plist
 
@@ -251,12 +227,14 @@ def test_changed_configuration_preserves_since_and_updates_manager(installation)
     assert config["argv"][-2:] == ["--interval", "120"]
 
 
-def test_temporary_token_requires_explicit_persistent_action(installation, monkeypatch):
+def test_service_uses_gh_login_without_copying_temporary_token(installation, monkeypatch):
     values, runner = installation
     monkeypatch.setenv("GH_TOKEN", "private-temporary-fixture")
-    with pytest.raises(service.ServiceError, match="persistent_credentials_required"):
-        service.install_service(**values)
-    assert not any("Register-ScheduledTask" in script for script in scripts(runner))
+    result = service.install_service(**values)
+    manifest = json.loads(Path(result['manifest']).read_text())
+    assert manifest['environment_file'] is None
+    assert 'private-temporary-fixture' not in Path(result['manifest']).read_text()
+    assert not (values['state'] / 'credentials.env').exists()
 
 
 def test_explicit_save_token_never_enters_manager_configuration_or_result(installation, monkeypatch):

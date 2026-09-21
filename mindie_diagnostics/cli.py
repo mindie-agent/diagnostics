@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 import json
+import os
 import signal
 import threading
 from pathlib import Path
@@ -21,7 +22,7 @@ def run_cycle(args, queue, github, recorder, health, grok=None, bot_queue=None, 
             try:
                 with operation.phase(stage):
                     value = function()
-                if value.get('status') in {'retry', 'uncertain', 'blocked', 'rate_limited'} or value.get('limited'):
+                if value.get('status') in {'retry', 'uncertain', 'blocked', 'rate_limited', 'exhausted', 'permanent-failed'} or value.get('limited'):
                     result['status'] = 'degraded'
                     operation.event('WARNING', 'worker.stage_degraded', stage=stage,
                                     error_code=value.get('error'))
@@ -37,6 +38,7 @@ def run_cycle(args, queue, github, recorder, health, grok=None, bot_queue=None, 
             result['bot'] = attempt('diagnose', lambda: diagnose_one(bot_queue, github, grok, public_repository=github.repository))
         else:
             from .maintenance import prune
+            queue.maintain()
             result['consent'] = attempt('consent', lambda: {'withdrawn': queue.withdraw_unconsented()})
             if bot_queue is not None:
                 result['bot_consent'] = attempt('bot.consent', lambda: {'withdrawn': bot_queue.withdraw_unconsented()})
@@ -97,11 +99,40 @@ def parser() -> argparse.ArgumentParser:
     worker.add_argument("--interval", type=float, default=60)
     worker.add_argument("--since", help="optional fixed UTC start timestamp; older logs remain local")
     worker.add_argument('--central-bot', action='store_true', help='explicit maintainer authorization to diagnose public issues in a separate state directory')
+    worker.add_argument('--reporting-config', help='independent reporting policy; pure reporter only')
+    reporting = sub.add_parser('reporting', help='independent local fault logging and optional public reporting')
+    actions = reporting.add_subparsers(dest='action', required=True)
+    for name in ('status', 'configure', 'ensure', 'maintain'):
+        command = actions.add_parser(name)
+        command.add_argument('--config')
+        if name == 'ensure':
+            command.add_argument('--unit-dir', help='explicit owned service directory for isolated installation')
+        if name == 'configure':
+            command.add_argument('--enabled', choices=('true', 'false'), required=True)
+            command.add_argument('--repository', default=DEFAULT_REPOSITORY)
+            command.add_argument('--root', action='append')
     return result
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    if args.command == 'reporting':
+        from .integration import reporting_status, configure_reporting
+        from .reporting_commands import ensure, maintain
+        try:
+            if args.action == 'status':
+                result = reporting_status(config=args.config)
+            elif args.action == 'configure':
+                result = configure_reporting(args.enabled == 'true', repository=args.repository,
+                                             config=args.config, roots=args.root)
+            elif args.action == 'ensure':
+                result = ensure(args.config, unit_dir=args.unit_dir)
+            else:
+                result = maintain(args.config)
+        except Exception as exc:
+            result = {'status': 'degraded', 'category': 'reporting_operation_failed', 'error_type': type(exc).__name__}
+        print(json.dumps(result, ensure_ascii=True))
+        return int(result.get('status') in {'error', 'degraded', 'configuration_unavailable'})
     if args.command == 'service':
         from .service import install_service, ensure_reporter_service, service_status, remove_service, ServiceError
         try:
@@ -156,11 +187,21 @@ def main(argv: list[str] | None = None) -> int:
         parser().error('--central-bot requires --grok and does not accept local --root inputs')
     if not args.central_bot and not args.root:
         parser().error('a local reporting worker requires --root')
+    if args.reporting_config:
+        from . import fallback as f
+        if args.grok or args.central_bot:
+            parser().error('independent reporting refuses model or central-bot options')
+        policy = f.read_policy(args.reporting_config)
+        if policy is None or policy['repository'] != args.repository or Path(args.state).absolute() != f.state_path(args.reporting_config):
+            print(json.dumps({'status': 'configuration_unavailable', 'category': 'reporting_policy_mismatch'}))
+            return 1
+        os.environ['MINDIE_DIAGNOSTICS_CONFIG'] = str(f.policy_path(args.reporting_config))
+        args.root = policy['roots']
     from . import configure, __version__
     recorder = configure("mindie-diagnostics", root=state / "diagnostics", version=__version__)
     queue = None if args.central_bot else Outbox(state / "reporter.sqlite3")
-    github = GitHub(args.repository, executable=args.gh)
     stop = threading.Event()
+    github = GitHub(args.repository, executable=args.gh, cancel=stop)
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, lambda *_: stop.set())
     grok = bot_queue = None
@@ -170,6 +211,12 @@ def main(argv: list[str] | None = None) -> int:
     from .health import Health
     with Health(state, recorder, interval=args.interval) as health:
         while not stop.is_set():
+            if args.reporting_config:
+                policy = f.read_policy(args.reporting_config)
+                if policy is None or policy['decision'] != 'enabled' or policy['repository'] != args.repository:
+                    queue.withdraw_unconsented()
+                    return 0
+                args.root = policy['roots']
             result = run_cycle(args, queue, github, recorder, health, grok, bot_queue, since=since)
             print(json.dumps(result, ensure_ascii=True), flush=True)
             if args.once:

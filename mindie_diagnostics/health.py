@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import threading
+import sys
 import time
 
 from .bundle import _write_output
@@ -34,6 +35,18 @@ class Health:
         self.lock, self.stop = threading.RLock(), threading.Event()
         self.data = {'schema': 1, 'pid': os.getpid(), 'started_at': clock(), 'interval': interval,
                      'heartbeat_at': clock(), 'progress_at': clock(), 'status': 'running', 'stage': 'starting'}
+        from .integration import _component_meta
+        from . import fallback as f
+        version, revision = _component_meta('mindie-diagnostics')
+        self.data.update(package_version=version, package_revision=revision)
+        raw = f._read_regular_bounded(Path(sys.prefix).parent / 'source.json', 4096)
+        try:
+            source = json.loads(raw) if raw is not None else {}
+            digest = source.get('source_hash')
+            if isinstance(digest, str) and len(digest) == 64 and all(c in '0123456789abcdef' for c in digest):
+                self.data['runtime_source'] = digest
+        except (ValueError, TypeError, AttributeError):
+            pass
         self.thread = None
 
     def update(self, **fields):

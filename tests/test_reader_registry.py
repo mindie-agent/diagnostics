@@ -1,3 +1,4 @@
+from contextlib import closing
 import json
 import os
 from pathlib import Path
@@ -12,7 +13,7 @@ from mindie_diagnostics.reader_registry import (
 
 
 def queue(path):
-    with sqlite3.connect(path) as db:
+    with closing(sqlite3.connect(path)) as db, db:
         db.execute('CREATE TABLE cursors (path TEXT PRIMARY KEY,inode TEXT,offset INTEGER)')
     path.chmod(0o600)
     return path
@@ -22,13 +23,13 @@ def test_all_registered_readers_must_consume(tmp_path):
     a, b = queue(tmp_path / 'a.db'), queue(tmp_path / 'b.db')
     for path in (a, b):
         register_reader(tmp_path, path)
-    with sqlite3.connect(a) as db:
+    with closing(sqlite3.connect(a)) as db, db:
         db.execute('INSERT INTO cursors VALUES (?,?,?)', ('/log', '123', 42))
     with reader_guard(tmp_path) as state:
         assert state['status'] == 'ok'
         cursors = cursor_snapshot(state['readers'])
         assert not fully_consumed(cursors, '/log', 123, 42)
-    with sqlite3.connect(b) as db:
+    with closing(sqlite3.connect(b)) as db, db:
         db.execute('INSERT INTO cursors VALUES (?,?,?)', ('/log', '123', 42))
     with reader_guard(tmp_path) as state:
         assert fully_consumed(cursor_snapshot(state['readers']), '/log', 123, 42)
@@ -81,7 +82,7 @@ def test_symlink_registry_rejected(tmp_path):
 
 def test_missing_cursor_table_is_unread(tmp_path):
     path = tmp_path / 'reader.db'
-    with sqlite3.connect(path) as db:
+    with closing(sqlite3.connect(path)) as db, db:
         db.execute('CREATE TABLE harmless (id INTEGER)')
     path.chmod(0o600)
     register_reader(tmp_path, path)

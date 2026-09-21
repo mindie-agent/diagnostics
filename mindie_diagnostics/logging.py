@@ -211,21 +211,47 @@ class _Handler(std_logging.Handler):
                             os.close(descriptor)
                             descriptor = None
                             continue
+                        if os.name == 'nt':
+                            # Windows rejects replacement while this temporary
+                            # file is open without delete-sharing. The current
+                            # writer remains open until the new slot is ready.
+                            os.close(descriptor)
+                            descriptor = None
                         os.replace(temporary, path)
+                        if descriptor is None:
+                            descriptor = os.open(path, os.O_WRONLY | os.O_APPEND
+                                                 | getattr(os, 'O_NOFOLLOW', 0)
+                                                 | getattr(os, 'O_NONBLOCK', 0))
+                            reopened = os.fstat(descriptor)
+                            selected = path.lstat()
+                            expected = (new.st_dev, new.st_ino)
+                            if (not stat.S_ISREG(reopened.st_mode)
+                                    or reopened.st_nlink != 1
+                                    or not stat.S_ISREG(selected.st_mode)
+                                    or (reopened.st_dev, reopened.st_ino) != expected
+                                    or (selected.st_dev, selected.st_ino) != expected):
+                                raise OSError('diagnostic segment identity changed')
                     except BaseException:
-                        os.close(descriptor)
+                        if descriptor is not None:
+                            os.close(descriptor)
                         raise
                     finally:
                         temporary.unlink(missing_ok=True)
                     credit = old.st_size if blocked else None
-                info = os.fstat(descriptor)
-                if self.stream is not None:
-                    self.stream.close()
-                self.stream = os.fdopen(descriptor, 'wb', buffering=0)
+                try:
+                    info = os.fstat(descriptor)
+                    stream = os.fdopen(descriptor, 'wb', buffering=0)
+                except BaseException:
+                    os.close(descriptor)
+                    raise
+                previous = self.stream
+                self.stream = stream
                 self.current = path
                 self.owned[path] = (info.st_dev, info.st_ino)
                 self.credit = credit
                 self.recorder._path = path
+                if previous is not None:
+                    previous.close()
                 return True
         return False
 

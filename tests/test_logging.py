@@ -332,3 +332,84 @@ def test_warning_only_uses_already_nonblocking_descriptor(tmp_path, monkeypatch)
     finally:
         os.close(read_fd)
         os.close(write_fd)
+
+
+def test_windows_slot_replacement_closes_temp_before_rename(tmp_path, monkeypatch):
+    import os
+
+    class WindowsCalls:
+        name = 'nt'
+
+        def __init__(self):
+            self.temporary = {}
+            self.replacements = 0
+
+        def __getattr__(self, name):
+            return getattr(os, name)
+
+        def open(self, path, flags, *args):
+            descriptor = os.open(path, flags, *args)
+            if Path(path).name.startswith('.segment-'):
+                self.temporary[descriptor] = Path(path)
+            return descriptor
+
+        def close(self, descriptor):
+            os.close(descriptor)
+            self.temporary.pop(descriptor, None)
+
+        def replace(self, source, destination):
+            assert Path(source) not in self.temporary.values()
+            self.replacements += 1
+            return os.replace(source, destination)
+
+    calls = WindowsCalls()
+    monkeypatch.setattr(module, 'os', calls)
+    monkeypatch.setattr(module, 'MAX_LOG_BYTES', 1024)
+    recorder = module.Recorder('windows-slot', root=tmp_path)
+    try:
+        for _ in range(24):
+            recorder.event('INFO', 'sample', detail='x' * 400)
+        assert calls.replacements > 0
+        assert not calls.temporary
+        assert not recorder.logging_failed and recorder.dropped_records == 0
+        assert len(list(tmp_path.glob('events/windows-slot/*.jsonl*'))) == 4
+        assert rows(tmp_path)
+    finally:
+        recorder.close()
+
+
+def test_windows_reopen_identity_change_keeps_current_writer(tmp_path, monkeypatch):
+    import os
+
+    class WindowsCalls:
+        name = 'nt'
+
+        def __getattr__(self, name):
+            return getattr(os, name)
+
+        def replace(self, source, destination):
+            os.replace(source, destination)
+            # A real different inode replaces the just-selected slot before
+            # reopen. No event may be written to this unverified file.
+            unexpected = Path(destination).with_name('.unexpected')
+            unexpected.write_bytes(b'preserve')
+            os.replace(unexpected, destination)
+
+    monkeypatch.setattr(module, 'os', WindowsCalls())
+    monkeypatch.setattr(module, 'MAX_LOG_BYTES', 1024)
+    recorder = module.Recorder('windows-reopen', root=tmp_path)
+    try:
+        for _ in range(4):
+            recorder.event('INFO', 'sample', detail='x' * 400)
+        handler = recorder._logger.handlers[0]
+        previous = handler.stream
+        previous_ref = recorder.record_ref
+        assert len(list(tmp_path.glob('events/windows-reopen/*.jsonl*'))) == 4
+        recorder.event('INFO', 'sample', detail='x' * 400)
+        assert recorder.logging_failed and recorder.dropped_records == 1
+        assert handler.stream is previous and not previous.closed
+        assert recorder.record_ref == previous_ref
+        assert any(path.read_bytes() == b'preserve'
+                   for path in tmp_path.glob('events/windows-reopen/*.jsonl*'))
+    finally:
+        recorder.close()

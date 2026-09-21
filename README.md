@@ -209,8 +209,16 @@ the oldest published history and occurrence IDs can expire earlier at capacity.
 An expired local marker still goes through GitHub reconciliation before any POST.
 Worker retention removes settled log segments beyond seven
 days, 128 MiB or 512 files, preserving files modified in the last five minutes;
-unread segments remain until ingestion catches up. `limited` and `unread_files`
-report when writers or intake backpressure prevent meeting the retention target.
+unread segments remain until ingestion catches up. A file's writer PID must also
+be confirmed exited before removal. Live processes, reused PIDs and uncertain or
+permission-denied probes retain their files, including rotated segments.
+`limited`, `unread_files` and `active_or_unknown_files` report when writers or
+intake backpressure prevent meeting the retention target. Windows currently
+retains files because no safe native PID probe is implemented; it never uses
+`os.kill(pid, 0)` as a Windows liveness check. These are soft retention targets,
+not a guarantee of a hard disk quota. Total-log retention runs only with the
+explicit reporter worker; normal logging still rotates each writer's files but
+does not itself invoke this cross-process cleanup.
 An intake failure does not stop already queued issues or diagnoses from draining.
 
 `status` also reads the worker's atomic heartbeat, current stage, last cycle and

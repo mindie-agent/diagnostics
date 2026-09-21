@@ -16,7 +16,7 @@ def test_published_queue_history_does_not_permanently_block_new_intake(tmp_path)
 
 
 @pytest.mark.parametrize("discard", [False, True])
-def test_rotation_between_candidate_stat_and_open_does_not_skip_new_head(tmp_path, monkeypatch, discard, community_consent):
+def test_rotation_between_candidate_stat_and_open_does_not_skip_new_head(tmp_path, monkeypatch, discard, reporting_consent):
     from mindie_diagnostics import ingestion
 
     def event(identity):
@@ -25,7 +25,7 @@ def test_rotation_between_candidate_stat_and_open_does_not_skip_new_head(tmp_pat
             "pid": 1, "component": "mindie-diagnostics", "severity": "ERROR",
             "event": "operation.end", "operation": "operation." + identity,
             "operation_id": identity * 32, "trace_id": "c" * 32,
-            "status": "error", "attributes": {"category": "transport"}, "community": community_consent,
+            "status": "error", "attributes": {"category": "transport"}, "reporting": reporting_consent, "reportable": True,
         }) + "\n").encode()
 
     folder = tmp_path / "events" / "mindie-diagnostics"
@@ -55,7 +55,8 @@ def test_rotation_between_candidate_stat_and_open_does_not_skip_new_head(tmp_pat
     assert len(queue.rows()) == 2
 
 
-def test_published_history_is_bounded_without_evicting_pending_evidence(tmp_path):
+def test_published_history_is_bounded_without_evicting_pending_evidence(tmp_path, monkeypatch):
+    monkeypatch.setattr("mindie_diagnostics.outbox.TERMINAL_HISTORY_LIMIT", 2)
     now = [1000.0]
     queue = Outbox(tmp_path / "queue.sqlite3", capacity=2, clock=lambda: now[0])
     for index in range(8):
@@ -74,8 +75,9 @@ def test_published_history_is_bounded_without_evicting_pending_evidence(tmp_path
     assert {row["fingerprint"] for row in rows[2:]} == {"6", "7"}
 
 
-def test_bounded_seen_history_does_not_block_intake_and_marker_prevents_repost(tmp_path, monkeypatch, community_consent):
-    from mindie_diagnostics.reporter import publish_one
+def test_bounded_seen_history_does_not_block_intake_and_marker_prevents_repost(tmp_path, monkeypatch, reporting_consent):
+    from mindie_diagnostics.reporter import publish_one, GitHub
+    monkeypatch.setattr("mindie_diagnostics.outbox.TERMINAL_HISTORY_LIMIT", 1)
 
     now = [1000.0]
     queue = Outbox(tmp_path / "queue.sqlite3", capacity=1, clock=lambda: now[0])
@@ -88,12 +90,12 @@ def test_bounded_seen_history_does_not_block_intake_and_marker_prevents_repost(t
         assert db.execute("SELECT COUNT(*) FROM seen").fetchone()[0] == 20
         assert db.execute("SELECT COUNT(*) FROM incidents").fetchone()[0] == 1
     assert not queue.enqueue("24", "24", {})
-    assert queue.enqueue("0", "0", {}, consent=community_consent)  # Outside the bounded local lookback.
+    assert queue.enqueue("0", "0", {}, consent=reporting_consent)  # Outside the bounded local lookback.
 
-    class ExistingIssue:
+    class ExistingIssue(GitHub):
         def find_issue(self, item):
             assert item["fingerprint"] == "0"
-            return {"number": 1, "html_url": "https://github.com/example/project/issues/1"}
+            return {"number": 1, "html_url": "https://github.com/mindie-agent/mindie-agent/issues/1"}
 
         def create_issue(self, *args):
             pytest.fail("evicted local history must still reconcile before publication")

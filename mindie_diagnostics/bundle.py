@@ -30,7 +30,7 @@ _NUMERIC = frozenset({"duration_ms", "elapsed_ms", "input_bytes", "output_bytes"
 _BOOLEAN = frozenset({"retryable", "quiet", "resources_released", "cache_hit", "ready", "timed_out",
                       "attributes_omitted"})
 _LABELS = frozenset({"category", "submission_state", "error_type", "error_code", "tool", "stage", "status", "reason"})
-_HASHES = frozenset({"execution_id", "job_id", "source_sha256", "content_sha256"})
+_HASHES = frozenset({"source_sha256", "content_sha256"})
 _TOP = frozenset({"schema", "timestamp", "monotonic_ns", "pid", "component", "severity", "event",
                   "operation_id", "trace_id", "parent_operation_id", "operation", "status",
                   "duration_ms", "attributes", "phase_id", "phase", "parent_phase_id", "process_ref",

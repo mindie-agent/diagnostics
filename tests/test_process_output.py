@@ -75,7 +75,7 @@ print("business complete")
                             capture_output=True, timeout=10)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == b"business complete"
-    assert result.stderr.count(b"diagnostic storage unavailable") == 1
+    assert result.stderr == b""  # Blocking stderr is optional; logging_failed above is authoritative.
     assert len(result.stderr) < 200
 
 
@@ -125,7 +125,9 @@ with rec.operation("knowledge.daemon.fixture") as op:
     with capture_output(op):
         os.write(2, b"password=")
         os.write(2, ("split" + "credential\\n").encode())
+    with capture_output(op):
         os.write(1, b"y" * 40000 + b"\\n")
+    with capture_output(op):
         os.write(2, b"partial secret without newline")
 rec.close()
 print("after capture")

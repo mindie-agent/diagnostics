@@ -12,6 +12,7 @@ def worker_options(argv, environment_file):
         raise ServiceError('central_bot_is_not_a_local_reporter')
     names = {'--state': 'state', '--repository': 'repository', '--gh': 'gh',
              '--since': 'since', '--interval': 'interval', '--grok': 'grok',
+             '--reporting-config': 'reporting_config',
              '--grok-home': 'grok_home', '--grok-work': 'grok_work'}
     result = {'roots': [], 'environment_file': environment_file}
     for index in range(1, len(argv), 2):

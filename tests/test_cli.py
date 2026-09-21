@@ -31,3 +31,14 @@ def test_full_intake_queue_does_not_prevent_publication(tmp_path, monkeypatch):
         assert calls == ['published'] and result['status'] == 'degraded'
         assert result['ingestion'][0] == {'status': 'degraded', 'error_type': 'QueueFull'}
         assert not read_health(tmp_path / 'state')['healthy']
+
+
+def test_failed_publication_terminal_is_visible_in_health(tmp_path, monkeypatch):
+    recorder = configure('terminal-cycle', root=tmp_path/'logs')
+    queue = Outbox(tmp_path/'state'/'queue.db')
+    for terminal in ('exhausted', 'permanent-failed'):
+        monkeypatch.setattr(cli, 'publish_one', lambda *args: {'status': terminal})
+        with Health(tmp_path/'state', recorder) as health:
+            result = cli.run_cycle(SimpleNamespace(root=[]), queue, object(), recorder, health)
+            assert result['status'] == 'degraded'
+            assert not read_health(tmp_path/'state')['healthy']

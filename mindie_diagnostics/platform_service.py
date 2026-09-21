@@ -215,9 +215,6 @@ def _windows_xml(config, manifest, sid):
                         ("StopIfGoingOnBatteries", "false"), ("StartWhenAvailable", "true"),
                         ("Enabled", "true"), ("Hidden", "true"), ("ExecutionTimeLimit", "PT0S")):
         element(settings, name, value)
-    restart = element(settings, "RestartOnFailure")
-    element(restart, "Interval", "PT1M")
-    element(restart, "Count", "999")
     action = element(element(task, "Actions", Context="Author"), "Exec")
     element(action, "Command", config["launcher"])
     element(action, "Arguments", subprocess.list2cmdline(config["launch_args"]))
@@ -325,12 +322,17 @@ def _verify_unit(unit, config):
 def install_service(roots, state, repository, *, python=None, gh=None, grok=None,
                     grok_home=None, grok_work=None, interval=60, since=None,
                     environment_file=None, unit_dir=None, runner=None, start=True, save_token=False, central_bot=False,
-                    ensure=False):
+                    ensure=False, reporting_config=None):
     runner = runner or subprocess.run
     manifest, label, unit = _paths(unit_dir)
+    reporting_config = common._absolute(reporting_config) if reporting_config is not None else None
+    if reporting_config is not None and (grok or grok_home or grok_work or central_bot or save_token):
+        raise common.ServiceError('reporter_configuration_conflict')
     roots = list(dict.fromkeys(str(common._absolute(root)) for root in roots))
     if ensure and central_bot:
         raise common.ServiceError('central_bot_is_not_a_local_reporter')
+    if ensure and (grok or grok_home or grok_work):
+        raise common.ServiceError('legacy_model_worker_requires_explicit_removal')
     if central_bot and roots:
         raise common.ServiceError("central_bot_does_not_watch_local_logs")
     if not (0 if central_bot else 1) <= len(roots) <= 32:
@@ -352,12 +354,13 @@ def install_service(roots, state, repository, *, python=None, gh=None, grok=None
         existing = _read(manifest)
         if ensure and existing:
             from .service_config import merged_reporter_options
-            retained = merged_reporter_options(existing['argv'], existing['environment_file'], roots, repository)
-            roots, state, gh = retained['roots'], Path(retained['state']), retained['gh']
-            environment_file = retained['environment_file']
+            common._check_reporter_binding(existing['argv'], existing['environment_file'], state, repository, reporting_config)
+            if reporting_config is None:
+                retained = merged_reporter_options(existing['argv'], existing['environment_file'], roots, repository)
+                roots, state, gh = retained['roots'], Path(retained['state']), retained['gh']
+                environment_file = retained['environment_file']
+                interval = retained['interval']
             save_token = False
-            grok, grok_home, grok_work = (retained[key] for key in ('grok', 'grok_home', 'grok_work'))
-            interval = retained['interval']
         fixed_since = existing["since"] if existing else common._since(since)
         interpreter, version = common._interpreter(runner, python)
         launcher = _physical(interpreter)
@@ -393,6 +396,8 @@ def install_service(roots, state, repository, *, python=None, gh=None, grok=None
         argv = ["worker"]
         if central_bot:
             argv.append("--central-bot")
+        if reporting_config is not None:
+            argv += ["--reporting-config", str(reporting_config)]
         for root in roots:
             argv += ["--root", root]
         argv += ["--state", str(state), "--repository", repository, "--gh", gh_path,
@@ -410,7 +415,7 @@ def install_service(roots, state, repository, *, python=None, gh=None, grok=None
             payload = _windows_xml(config, manifest, sid)
         else:
             payload = plistlib.dumps({"Label": label, "ProgramArguments": [str(launcher), *config["launch_args"]],
-                                      "RunAtLoad": True, "KeepAlive": {"SuccessfulExit": False}, "ThrottleInterval": 10,
+                                      "RunAtLoad": True,
                                       "WorkingDirectory": str(manifest.parent), "Umask": 0o077,
                                       "StandardOutPath": "/dev/null", "StandardErrorPath": "/dev/null"})
         config["unit_sha256"] = hashlib.sha256(payload).hexdigest()

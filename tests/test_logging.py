@@ -49,7 +49,7 @@ def test_original_exception_and_failure_outcome(tmp_path):
     assert rows(tmp_path)[-1]["attributes"]["submission_state"] == "unknown"
 
 
-def test_disk_failure_never_masks_business_and_warns_once(tmp_path, monkeypatch, capsys):
+def test_disk_failure_never_masks_business_or_writes_blocking_stderr(tmp_path, monkeypatch, capsys):
     def fail(*args, **kwargs):
         raise OSError("private error detail")
     monkeypatch.setattr(module._Handler, "emit", fail)
@@ -61,7 +61,7 @@ def test_disk_failure_never_masks_business_and_warns_once(tmp_path, monkeypatch,
             raise ValueError("original")
     assert op.summary()["status"] == "success" and op.summary()["logging_failed"]
     captured = capsys.readouterr()
-    assert captured.out == "" and captured.err.count("storage unavailable") == 1
+    assert captured.out == "" and captured.err == ""
     assert "private error" not in captured.err
     recorder.close()
 
@@ -74,7 +74,7 @@ def test_unwritable_root_is_nonblocking(tmp_path, capsys):
         pass
     assert op.summary()["status"] == "success" and op.summary()["logging_failed"]
     assert path.read_text() == "original"
-    assert "storage unavailable" in capsys.readouterr().err
+    assert capsys.readouterr().err == ""
 
 
 def test_debug_scopes_do_not_write_but_error_does(tmp_path):
@@ -259,3 +259,76 @@ def test_import_override_does_not_claim_installed_revision(tmp_path, monkeypatch
     monkeypatch.setitem(sys.modules, 'mindie_test', SimpleNamespace(__file__=str(tmp_path / 'installed' / 'mindie_test' / '__init__.py')))
     monkeypatch.setattr(implementation, '_VERSIONS', {})
     assert implementation._package('mindie-test')['package_revision'] == 'a' * 40
+
+
+def test_failure_events_roll_with_exact_metadata_and_bounded_cache(tmp_path, monkeypatch):
+    monkeypatch.setattr(module, 'MAX_LOG_BYTES', 1024)
+    event = {'schema': 1, 'event': 'operation.end', 'status': 'error',
+             'package_revision': 'a' * 40, 'package_version': 'selected-native',
+             'reporting': None, 'reportable': False, 'attributes': {'stage': 'protocol'}}
+    for _ in range(100):
+        assert module.append_failure_event('failure-stream', tmp_path, event)
+    paths = list(tmp_path.glob('events/failure-stream/*.jsonl*'))
+    assert len(paths) == 4
+    assert all({k: v for k, v in row.items() if k != "process_instance_id"} == event
+               and len(row["process_instance_id"]) == 32
+               and row["process_instance_id"] != "0" * 32 for row in rows(tmp_path))
+    for i in range(40):
+        assert module.append_failure_event('cache-' + str(i), tmp_path, event)
+    assert len(module._FAILURE_RECORDERS) <= 32
+
+
+def test_failure_writer_lock_contention_does_not_queue(tmp_path):
+    import threading
+    import time
+    event = {'event': 'operation.end', 'status': 'error'}
+    assert module.append_failure_event('contention', tmp_path, event)
+    recorder = module._FAILURE_RECORDERS[('contention', str(tmp_path.absolute()))]
+    for lock in (module._LOCK, recorder._mutex):
+        ready, release = threading.Event(), threading.Event()
+        def hold():
+            with lock:
+                ready.set()
+                release.wait(3)
+        thread = threading.Thread(target=hold)
+        thread.start()
+        try:
+            assert ready.wait(1)
+            start = time.monotonic()
+            assert not module.append_failure_event('contention', tmp_path, event)
+            assert time.monotonic() - start < .1
+        finally:
+            release.set()
+            thread.join(timeout=1)
+        assert not thread.is_alive()
+
+
+def test_warning_only_uses_already_nonblocking_descriptor(tmp_path, monkeypatch):
+    import os
+    from types import SimpleNamespace
+    if os.name != 'posix':
+        pytest.skip('POSIX descriptor semantics')
+    read_fd, write_fd = os.pipe()
+    try:
+        os.set_blocking(write_fd, False)
+        os.set_blocking(read_fd, False)
+        monkeypatch.setattr(module.sys, 'stderr', SimpleNamespace(fileno=lambda: write_fd))
+        recorder = module.Recorder('warning-pipe', root=tmp_path)
+        recorder._unavailable()
+        recorder._unavailable()
+        assert os.read(read_fd, 4096).count(b'storage unavailable') == 1
+        while True:
+            try:
+                os.write(write_fd, b'x' * 4096)
+            except BlockingIOError:
+                break
+        second = module.Recorder('full-warning-pipe', root=tmp_path)
+        second._unavailable()
+        assert second.logging_failed
+        os.set_blocking(write_fd, True)
+        third = module.Recorder('blocking-warning-pipe', root=tmp_path)
+        third._unavailable()  # A full blocking pipe must not be written at all.
+        assert third.logging_failed and os.get_blocking(write_fd)
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)

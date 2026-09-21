@@ -24,7 +24,7 @@ def test_retention_preserves_fresh_and_unrelated_files(tmp_path, monkeypatch):
     assert result['removed_files'] == 1 and result['limited']
 
 
-def test_worker_retention_preserves_unread_old_evidence(tmp_path, community_consent, monkeypatch):
+def test_worker_retention_preserves_unread_old_evidence(tmp_path, monkeypatch):
     # This test exercises cursor protection after the writer has exited.
     monkeypatch.setattr(maintenance, '_writer_exited', lambda pid: True)
     from mindie_diagnostics import configure
@@ -41,7 +41,9 @@ def test_worker_retention_preserves_unread_old_evidence(tmp_path, community_cons
     queue = Outbox(tmp_path / 'outbox.db')
     result = prune(tmp_path, max_bytes=1, queue=queue)
     assert path.exists() and result['unread_files'] == 1 and result['limited']
-    assert ingest(tmp_path, queue)['enqueued'] == 1
+    consumed = ingest(tmp_path, queue)
+    assert consumed['scanned_bytes'] > 0 and consumed['enqueued'] == 0
+    # Retention consumes local-only records without authorizing an Issue.
     assert prune(tmp_path, max_bytes=1, queue=queue)['removed_files'] == 1
     assert not path.exists()
 
@@ -63,8 +65,10 @@ def test_retention_keeps_actual_live_writer_and_rotated_family(tmp_path):
         assert result['active_or_unknown_files'] == 2 and result['limited']
         with recorder.operation('after'):
             pass
-        assert path.stat().st_size > before and rotated.exists()
-        assert not recorder.logging_failed
+        assert path.stat().st_size == before and rotated.exists()
+        assert recorder.logging_failed and recorder.dropped_records == 2
+        # A live file remains open, but maintenance pressure forbids growth.
+        assert recorder.operation("still-available").summary()["status"] == "pending"
     finally:
         recorder.close()
 

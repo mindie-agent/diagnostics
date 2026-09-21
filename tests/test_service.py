@@ -83,7 +83,7 @@ def test_install_uses_literal_arguments_immutable_python_and_bounded_journal(ins
     assert '"-I" "-m" "mindie_diagnostics.cli" "worker"' in text
     assert 'UnsetEnvironment=PYTHONPATH PYTHONHOME' in text
     assert 'LogRateLimitIntervalSec=30s' in text and 'LogRateLimitBurst=100' in text
-    assert 'Restart=on-failure' in text and 'KillMode=control-group' in text
+    assert 'Restart=no' in text and 'KillMode=control-group' in text
     assert '\nWorkingDirectory=/\n' in text
     assert all(call[0][0] in {str(values['python']), 'systemctl'} or Path(call[0][0]).name == 'systemd-analyze' for call in runner.calls)
     assert [call[0][2] for call in runner.calls if call[0][0] == 'systemctl'] == ['show', 'daemon-reload', 'enable', 'show', 'start']
@@ -108,46 +108,29 @@ def test_reinstall_preserves_original_since_and_only_restarts_changed_config(ins
     assert started['since'] == first['since'] and path.read_bytes() == previous
 
 
-def test_ensure_two_clones_retains_roots_state_auth_and_model_profile(install, monkeypatch):
+def test_ensure_uses_only_current_authorized_roots_and_rejects_rebinding(install):
     from mindie_diagnostics.service_config import linux_worker_configuration, worker_options
     values, runner = install
-    first = service.ensure_reporter_service(**values, grok=values['gh'],
-                                            grok_home=values['state'] / 'grok', grok_work=values['state'] / 'work')
-    old_state = values['state'] / 'queue.sqlite3'
-    old_state.write_bytes(b'pending private state')
-    monkeypatch.setenv('GH_TOKEN', 'new-clone-token-must-not-replace-existing-login')
-    second_root = values['state'].parent / 'second clone logs'
-    second_values = {**values, 'roots': [second_root], 'state': values['state'].parent / 'unused state',
-                     'gh': '/unused/github', 'save_token': True}
-    second = service.ensure_reporter_service(**second_values)
+    config = values['state'].parent / 'reporting.json'
+    first = service.ensure_reporter_service(**values, reporting_config=config)
+    new_root = values['state'].parent / 'other logs'
+    second = service.ensure_reporter_service(**{**values, 'roots': [new_root]}, reporting_config=config)
     options = worker_options(*linux_worker_configuration(Path(second['unit']).read_text()))
-    assert options['roots'] == [str(values['roots'][0]), str(second_root)]
-    assert options['state'] == str(values['state']) and options['gh'] == str(values['gh'])
-    assert options['grok_home'] == str(values['state'] / 'grok') and options['environment_file'] is None
-    assert old_state.read_bytes() == b'pending private state'
-    assert not second_values['state'].exists()
-    monkeypatch.delenv('GH_TOKEN')
-    third = service.ensure_reporter_service(**{**second_values, 'save_token': False})
-    assert third['changed'] is False and third['since'] == first['since']
+    assert options['roots'] == [str(new_root)]
+    assert options['reporting_config'] == str(config)
+    before = Path(second['unit']).read_bytes()
+    with pytest.raises(service.ServiceError, match='reporter_authorization_mismatch'):
+        service.ensure_reporter_service(**values, reporting_config=config.with_name('other.json'))
+    assert Path(second['unit']).read_bytes() == before
+    with pytest.raises(service.ServiceError, match='legacy_model_worker'):
+        service.ensure_reporter_service(**values, grok=values['gh'])
 
 
-@pytest.mark.skipif(os.name == 'nt', reason='POSIX private credential permissions')
-def test_ensure_token_only_then_new_token_and_no_environment_preserves_credentials(install, monkeypatch):
-    from mindie_diagnostics.service_config import linux_worker_configuration, worker_options
-    values, runner = install
-    monkeypatch.setenv('GH_TOKEN', 'initial-private-fixture')
+def test_reporter_requires_gh_even_when_environment_file_exists(install, monkeypatch):
+    values, _ = install
     monkeypatch.setattr(shutil, 'which', lambda value: None)
-    values = {**values, 'gh': None}
-    first = service.ensure_reporter_service(**values, save_token=True)
-    options = worker_options(*linux_worker_configuration(Path(first['unit']).read_text()))
-    credential = Path(options['environment_file'])
-    before = credential.read_bytes()
-    assert options['gh'] == 'gh'
-    monkeypatch.setenv('GH_TOKEN', 'different-private-fixture')
-    assert service.ensure_reporter_service(**values, save_token=True)['changed'] is False
-    monkeypatch.delenv('GH_TOKEN')
-    assert service.ensure_reporter_service(**values)['changed'] is False
-    assert credential.read_bytes() == before
+    with pytest.raises(service.ServiceError, match='gh_unavailable'):
+        service._reporter_executable('absent-gh', values['state'] / 'credentials.env')
 
 
 def test_ensure_rejects_central_and_repository_changes_before_mutation(install):
@@ -157,7 +140,7 @@ def test_ensure_rejects_central_and_repository_changes_before_mutation(install):
     path = Path(central['unit'])
     before = path.read_bytes()
     runner.calls.clear()
-    with pytest.raises(service.ServiceError, match='central_bot_is_not_a_local_reporter'):
+    with pytest.raises(service.ServiceError, match='legacy_model_worker_requires_explicit_removal'):
         service.ensure_reporter_service(**values)
     assert path.read_bytes() == before and runner.calls == []
     service.install_service(**values)

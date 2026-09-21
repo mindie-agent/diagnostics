@@ -6,7 +6,25 @@ from pathlib import Path
 import re
 import time
 
-_FILE = re.compile(r"\d+-[0-9a-f]{32}\.jsonl(?:\.[1-3])?\Z")
+_FILE = re.compile(r"(\d+)-[0-9a-f]{32}\.jsonl(?:\.[1-3])?\Z")
+
+
+def _writer_exited(pid: int) -> bool:
+    """Only positive POSIX PIDs with a definitive ESRCH are safe to prune.
+
+    An idle writer can still hold an append handle. PID reuse, permission
+    failures and platforms without this probe all retain the file. In
+    particular, Windows os.kill(pid, 0) is not a POSIX liveness check.
+    """
+    if os.name != "posix" or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except (OSError, ValueError, OverflowError):
+        return False
+    return False
 
 
 def prune(root: str | Path, *, max_bytes: int = 128 * 1024 * 1024,
@@ -16,7 +34,7 @@ def prune(root: str | Path, *, max_bytes: int = 128 * 1024 * 1024,
         raise ValueError("retention root must not traverse symlinks")
     events = root / 'events'
     result = {"removed_files": 0, "removed_bytes": 0, "remaining_bytes": 0, "limited": False,
-              "unread_files": 0}
+              "unread_files": 0, "active_or_unknown_files": 0}
     cursors = None
     if queue is not None:
         with queue.connect() as db:
@@ -49,6 +67,7 @@ def prune(root: str | Path, *, max_bytes: int = 128 * 1024 * 1024,
             if result['limited']:
                 break
     total, remaining, now = sum(row[1] for row in files), len(files), clock()
+    exited = {}
     for modified, size, path, inode in sorted(files):
         if cursors is not None:
             cursor = cursors.get(str(path), {})
@@ -58,6 +77,12 @@ def prune(root: str | Path, *, max_bytes: int = 128 * 1024 * 1024,
         if now - modified < 300:
             continue  # Allow current writers and just-generated evidence to settle.
         if now - modified <= max_age_days * 86400 and total <= max_bytes and remaining <= max_files:
+            continue
+        pid = int(_FILE.fullmatch(path.name).group(1))
+        if pid not in exited:
+            exited[pid] = _writer_exited(pid)
+        if not exited[pid]:
+            result['active_or_unknown_files'] += 1
             continue
         # Check the absolute target again immediately before a nonrecursive removal.
         if not path.resolve().is_relative_to(events.resolve()) or path.is_symlink():

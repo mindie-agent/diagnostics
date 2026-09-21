@@ -45,3 +45,55 @@ def test_rate_limit_and_unwritable_database(tmp_path):
     file.write_text('not a directory')
     with pytest.raises(OSError):
         Outbox(file / 'queue.db')
+
+
+def test_three_crashed_leases_exhaust_and_new_occurrence_does_not_reset(tmp_path):
+    now = [1000.0]
+    queue = Outbox(tmp_path / 'queue.db', clock=lambda: now[0])
+    queue.enqueue('a', 'a' * 32, {})
+    for expected in (1, 2, 3):
+        assert queue.claim(lease_seconds=1)['attempts'] == expected
+        now[0] += 2
+    assert queue.claim() is None
+    queue.enqueue('a', 'b' * 32, {})
+    assert queue.claim() is None
+    row = queue.rows()[0]
+    assert row['state'] == 'exhausted' and row['attempts'] == 3
+    assert row['incident_ids'] == ['a' * 32, 'b' * 32]
+
+
+def test_expired_uncertain_receipt_does_not_occupy_active_capacity(tmp_path):
+    from mindie_diagnostics.outbox import UNSENT_TTL_SECONDS
+    now = [1000.0]
+    queue = Outbox(tmp_path / 'queue.db', capacity=1, clock=lambda: now[0])
+    queue.enqueue('a', 'a' * 32, {'events': []})
+    item = queue.claim(lease_seconds=1)
+    queue.begin_post(item)
+    now[0] += UNSENT_TTL_SECONDS + 1
+    queue.maintain()
+    assert queue.rows()[0]['state'] == 'expired'
+    assert 'uncertain' in queue.rows()[0]['last_error']
+    queue.enqueue('b', 'b' * 32, {})
+    assert queue.claim()['fingerprint'] == 'b'
+
+
+def test_valid_lease_protects_evidence_from_expiry(tmp_path):
+    from mindie_diagnostics.outbox import UNSENT_TTL_SECONDS
+    now = [1000.0]
+    queue = Outbox(tmp_path / 'queue.db', clock=lambda: now[0])
+    queue.enqueue('a', 'a' * 32, {'evidence': True})
+    queue.claim(lease_seconds=2 * UNSENT_TTL_SECONDS)
+    now[0] += UNSENT_TTL_SECONDS + 1
+    queue.maintain()
+    assert queue.rows()[0]['state'] == 'pending'
+
+
+def test_withdrawal_preserves_unknown_submission_fact(tmp_path):
+    queue = Outbox(tmp_path / 'queue.db')
+    queue.enqueue('a', 'a' * 32, {})
+    item = queue.claim()
+    queue.begin_post(item)
+    queue.update(item, state='uncertain', last_error='github_timeout')
+    assert queue.withdraw_unconsented() == 1
+    row = queue.rows()[0]
+    assert row['state'] == 'withdrawn' and row['last_error'] == 'submission_uncertain_reporting_consent_withdrawn'

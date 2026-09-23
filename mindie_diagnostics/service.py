@@ -190,7 +190,7 @@ def _reporter_executable(value, environment_file):
 def _check_reporter_binding(argv, environment_file, state, repository, config):
     """Do not repurpose a paid bot or another reporting authorization."""
     if '--central-bot' in argv or any(flag in argv for flag in ('--grok', '--grok-home', '--grok-work')):
-        raise ServiceError('legacy_model_worker_requires_explicit_removal')
+        raise ServiceError('legacy_worker_requires_explicit_removal')
     if config is None:
         return
     from .service_config import worker_options
@@ -200,20 +200,39 @@ def _check_reporter_binding(argv, environment_file, state, repository, config):
         raise ServiceError('reporter_authorization_mismatch')
 
 
+def _check_reporting_consent(reporting_config, expected_consent_revision):
+    """Refuse owned native mutation across a consent withdraw or regrant.
+
+    Read-only: when the caller captured an enabled policy revision, that exact
+    revision must still be enabled immediately before the mutation. Low-level
+    callers without an expected revision keep prior semantics.
+    """
+    if expected_consent_revision is None:
+        return
+    from . import fallback as f
+    policy = f.read_policy(reporting_config)
+    if policy is None or policy['decision'] != 'enabled' or policy.get('revision') != expected_consent_revision:
+        raise ServiceError('reporting_authorization_changed')
+
+
 @contextmanager
-def _locked(path):
+def _locked(path, deadline=None):
     import fcntl
     path.parent.mkdir(parents=True, exist_ok=True)
     lock = path.parent / ".mindie-diagnostics-service.lock"
     descriptor = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     try:
-        deadline = time.monotonic() + 10
+        stop = time.monotonic() + 10
+        if deadline is not None:
+            stop = min(stop, deadline)
         while True:
+            if time.monotonic() >= stop:
+                raise ServiceError("installation_busy")
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
             except BlockingIOError:
-                if time.monotonic() >= deadline:
+                if time.monotonic() >= stop:
                     raise ServiceError("installation_busy")
                 time.sleep(.05)
         yield
@@ -250,82 +269,56 @@ def _publish(path, text, runner):
         staging.rmdir()
 
 
-def install_service(roots, state, repository, *, python=None, gh=None, grok=None,
-                    grok_home=None, grok_work=None, interval=60, since=None,
-                    environment_file=None, unit_dir=None, runner=None, start=True, save_token=False, central_bot=False,
-                    ensure=False, reporting_config=None):
+def install_service(roots, state, repository, *, python=None, gh=None, interval=60, since=None,
+                    environment_file=None, unit_dir=None, runner=None, start=True,
+                    ensure=False, reporting_config=None, expected_consent_revision=None):
     """Install/update the owned unit, preserving the first installation's since.
 
+    The owned unit runs exactly the pure local reporter; an independent
+    ``reporting_config`` policy file is required before any mutation.
     ``start=False`` writes/enables it without starting or restarting a process.
     State and source logs are never removed, including during uninstall.
     """
+    if reporting_config is None:
+        raise ServiceError('reporting_config_required')
     if sys.platform in {"win32", "darwin"}:
         from .platform_service import install_service as install_native
-        return install_native(roots, state, repository, python=python, gh=gh, grok=grok,
-                              grok_home=grok_home, grok_work=grok_work, interval=interval, since=since,
+        return install_native(roots, state, repository, python=python, gh=gh, interval=interval, since=since,
                               environment_file=environment_file, unit_dir=unit_dir, runner=runner, start=start,
-                              save_token=save_token, central_bot=central_bot, ensure=ensure,
-                              reporting_config=reporting_config)
+                              ensure=ensure, reporting_config=reporting_config,
+                              expected_consent_revision=expected_consent_revision)
     _linux()
     runner = runner or subprocess.run
     path = _unit_path(unit_dir)
-    if ensure and central_bot:
-        raise ServiceError('central_bot_is_not_a_local_reporter')
-    if ensure and (grok or grok_home or grok_work):
-        raise ServiceError('legacy_model_worker_requires_explicit_removal')
-    reporting_config = _absolute(reporting_config) if reporting_config is not None else None
-    if reporting_config is not None and (grok or grok_home or grok_work or central_bot or save_token):
-        raise ServiceError('reporter_configuration_conflict')
+    reporting_config = _absolute(reporting_config)
     roots = [_absolute(root) for root in roots]
-    if central_bot and roots:
-        raise ServiceError("central_bot_does_not_watch_local_logs")
-    if not (0 if central_bot else 1) <= len(roots) <= 32:
+    if not 1 <= len(roots) <= 32:
         raise ServiceError("diagnostic_roots_required")
-    if central_bot and not grok:
-        raise ServiceError("central_bot_requires_grok")
     state = _absolute(state)
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
         raise ServiceError("invalid_repository")
     if type(interval) not in (int, float) or not 5 <= interval <= 86400:
         raise ServiceError("invalid_interval")
-    if bool(grok) != bool(grok_home and grok_work) or ((grok_home or grok_work) and not grok):
-        raise ServiceError("grok_profile_required")
-    if save_token and environment_file is not None:
-        raise ServiceError("choose_existing_file_or_save_token")
-    with _locked(path):
+    with _locked(path, deadline=getattr(runner, 'deadline', None)):
+        _check_reporting_consent(reporting_config, expected_consent_revision)
         existing = _read_owned(path)
         if ensure and existing:
-            from .service_config import linux_worker_configuration, merged_reporter_options
+            from .service_config import linux_worker_configuration
             old_argv, old_environment = linux_worker_configuration(existing[0])
             _check_reporter_binding(old_argv, old_environment, state, repository, reporting_config)
-            if reporting_config is None:
-                retained = merged_reporter_options(old_argv, old_environment, roots, repository)
-                roots, state, gh = retained['roots'], Path(retained['state']), retained['gh']
-                environment_file = retained['environment_file']
-                interval = retained['interval']
-            save_token = False
         fixed_since = existing[1]["since"] if existing else _since(since)
         interpreter, version = _interpreter(runner, python)
         _check_loaded_owner(runner, path, allow_missing=True, creating=existing is None,
                             repair=existing is not None)
-        if save_token:
-            from .platform_service import save_environment_token
-            environment_file = save_environment_token(state, runner)
         environment_file = _environment_file(environment_file) if environment_file is not None else None
         gh_path = (str(_executable(gh)) if ensure and existing and environment_file is None
                    else _reporter_executable(gh, environment_file))
-        argv = [str(interpreter), "-I", "-m", "mindie_diagnostics.cli", "worker"]
-        if central_bot:
-            argv.append("--central-bot")
-        if reporting_config is not None:
-            argv += ["--reporting-config", str(reporting_config)]
+        argv = [str(interpreter), "-I", "-m", "mindie_diagnostics.cli", "worker",
+                "--reporting-config", str(reporting_config)]
         for root in dict.fromkeys(roots):
             argv += ["--root", str(root)]
         argv += ["--state", str(state), "--repository", repository, "--gh", gh_path,
                  "--since", fixed_since, "--interval", str(interval)]
-        if grok:
-            argv += ["--grok", str(_executable(grok)), "--grok-home", str(_absolute(grok_home)),
-                     "--grok-work", str(_absolute(grok_work))]
         metadata = {"schema": 1, "since": fixed_since}
         text = (MARKER + METADATA + json.dumps(metadata, separators=(",", ":")) + "\n"
                 "[Unit]\nDescription=MindIE local diagnostics reporter\nAfter=network-online.target\n"
@@ -339,12 +332,19 @@ def install_service(roots, state, repository, *, python=None, gh=None, grok=None
                 "\n[Install]\nWantedBy=default.target\n")
         changed = existing is None or existing[0] != text
         state.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Consent recheck after the native lock and blocking verifies, before
+        # writing/enabling changed owned descriptions.
+        _check_reporting_consent(reporting_config, expected_consent_revision)
         verification = _publish(path, text, runner) if changed else "unchanged"
+        # Recheck after the blocking publish verification, before enablement.
+        _check_reporting_consent(reporting_config, expected_consent_revision)
         _systemctl(runner, "daemon-reload")
         _systemctl(runner, "enable", str(path))
         _check_loaded_owner(runner, path)
         if start:
-            _systemctl(runner, "restart" if existing and (changed or save_token) else "start", UNIT)
+            # Recheck immediately before the owned stop/start mutation.
+            _check_reporting_consent(reporting_config, expected_consent_revision)
+            _systemctl(runner, "restart" if existing and changed else "start", UNIT)
         return {"status": "installed", "unit": str(path), "since": fixed_since,
                 "changed": changed, "start_requested": start, "python": str(interpreter),
                 "package_version": version, "state": str(state), "unit_verification": verification}

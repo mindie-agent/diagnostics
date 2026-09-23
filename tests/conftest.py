@@ -1,6 +1,3 @@
-import json
-import uuid
-
 import pytest
 
 
@@ -17,17 +14,6 @@ def isolated_runtime(tmp_path, monkeypatch):
     def unexpected_network(*args, **kwargs):
         pytest.fail('unit tests must explicitly mock the HTTPS transport')
     monkeypatch.setattr(reporter.GitHub, 'request', unexpected_network)
-
-
-@pytest.fixture
-def community_consent(tmp_path, monkeypatch, isolated_runtime):
-    """Explicit isolated opt-in for tests that exercise automatic publication."""
-    path = tmp_path.resolve() / 'community.json'
-    path.write_text(json.dumps({'schema': 'mindie.community.v1', 'workspace_id': uuid.uuid4().hex,
-                                'revision': uuid.uuid4().hex, 'decision': 'enabled'}), encoding='utf-8')
-    monkeypatch.setenv('MINDIE_COMMUNITY_POLICY', str(path))
-    from mindie_diagnostics.community import current_consent
-    return current_consent()
 
 
 @pytest.fixture

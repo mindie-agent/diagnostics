@@ -7,8 +7,9 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 import uuid
-import venv
+from contextlib import contextmanager
 from pathlib import Path
 
 _PKG = "mindie_diagnostics"
@@ -22,10 +23,21 @@ _VERIFY = (
     "import importlib.metadata as m,json,mindie_diagnostics as p;"
     "print(json.dumps({'v':m.version('mindie-diagnostics'),'p':p.__file__}))"
 )
+_LOCK_WAIT = 12.0  # Bounded seconds to acquire the runtime transaction lock.
 
 
 def _fail(category):
     raise RuntimeError(category)
+
+
+def _remaining(deadline):
+    """Seconds left of an absolute monotonic budget; fail closed when spent."""
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        _fail("runtime_deadline_exceeded")
+    return remaining
 
 
 def _triple(version):
@@ -39,6 +51,14 @@ def _triple(version):
             return None
         out.append(int(bit))
     return tuple(out)
+
+
+def _is_source_hash(value):
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(c in "0123456789abcdef" for c in value)
+    )
 
 
 def _revision(dist):
@@ -201,9 +221,10 @@ def _mkdirs(base, dest):
             os.chmod(cur, _DIR)
 
 
-def _place(site, files):
+def _place(site, files, deadline=None):
     base = site.resolve()
     for key, data in files:
+        _remaining(deadline)
         dest = site.joinpath(*key.split("/"))
         if base not in dest.resolve().parents:
             _fail("source_rejected")
@@ -239,7 +260,7 @@ def _load_json(path, read_bounded, limit):
     return doc
 
 
-def _verify(py, version, site, work):
+def _verify(py, version, site, work, deadline=None):
     out, err = work / f".vout-{uuid.uuid4().hex}", work / f".verr-{uuid.uuid4().hex}"
     env = os.environ.copy()
     env.pop("PYTHONPATH", None)
@@ -247,12 +268,13 @@ def _verify(py, version, site, work):
     try:
         _write(out, b"")
         _write(err, b"")
+        remaining = _remaining(deadline)
         with open(out, "wb") as fout, open(err, "wb") as ferr:
             proc = subprocess.run(
                 [str(py), "-I", "-c", _VERIFY],
                 stdout=fout,
                 stderr=ferr,
-                timeout=10,
+                timeout=10 if remaining is None else min(10, remaining),
                 env=env,
                 cwd=str(work),
             )
@@ -285,87 +307,255 @@ def _marker(gen, source_hash, version, revision, read_bounded):
         _fail("verify_failed")
 
 
-def _publish(root, payload):
-    tmp = root / f".current-{uuid.uuid4().hex}"
+def _publish_json(root, name, payload):
+    tmp = root / f".{name}-{uuid.uuid4().hex}"
     _write(tmp, json.dumps(payload, separators=(",", ":")).encode() + b"\n")
-    os.replace(tmp, root / "current.json")
+    os.replace(tmp, root / name)
 
 
-def _prepare(config):
+def _publish(root, payload):
+    _publish_json(root, "current.json", payload)
+
+
+def _root_path(config):
+    from mindie_diagnostics.fallback import _as_local_absolute, policy_path
+
+    base = _as_local_absolute(policy_path(config))
+    if base is None:
+        _fail("runtime_unavailable")
+    return Path(base).with_suffix(".runtime")
+
+
+def _collect_source():
     import importlib.metadata as metadata
 
+    from mindie_diagnostics.fallback import _as_local_absolute, _read_regular_bounded
+
+    dist = metadata.distribution(_DIST)
+    _installed(dist, _as_local_absolute)
+    return _collect(dist, _read_regular_bounded)
+
+
+def _read_current(root):
+    from mindie_diagnostics.fallback import _read_regular_bounded
+
+    pointer = root / "current.json"
+    if not pointer.exists() and not pointer.is_symlink():
+        return None
+    current = _load_json(pointer, _read_regular_bounded, _OUT_CAP)
+    if (
+        current.get("schema") != 1
+        or not isinstance(current.get("version"), str)
+        or _triple(current["version"]) is None
+        or not _is_source_hash(current.get("source_hash"))
+    ):
+        _fail("runtime_untrusted")
+    return current
+
+
+def _source_order(current, version, source_hash):
+    """Strict release x.y.z ordering of installed source against the committed runtime."""
+    if current["source_hash"] == source_hash:
+        return "identical"
+    old, new = _triple(current["version"]), _triple(version)
+    if old is None or new is None:
+        # Unknown or incomparable versions fail closed.
+        return "incomparable"
+    if new < old:
+        return "older"
+    if new == old:
+        # Same release carrying different source: an explicit ensure chooses.
+        return "conflict"
+    return "newer"
+
+
+def _generation_python(root, source_hash):
+    from mindie_diagnostics.fallback import _owned
+
+    dest = root / "generations" / source_hash
+    _require_dir(dest, _owned)
+    return str(_python(dest, _owned))
+
+
+def _update_record_name(source_hash):
+    return f"update-{source_hash}.json"
+
+
+def _read_update_record(root, source_hash):
+    from mindie_diagnostics.fallback import _read_regular_bounded
+
+    path = root / _update_record_name(source_hash)
+    if not path.exists() and not path.is_symlink():
+        return None
+    doc = _load_json(path, _read_regular_bounded, _OUT_CAP)
+    target = doc.get("target")
+    if (
+        doc.get("schema") != 1
+        or doc.get("status") not in {"attempting", "failed", "rolled_back", "updated", "aborted"}
+        or not isinstance(target, dict)
+        or target.get("source_hash") != source_hash
+    ):
+        _fail("runtime_untrusted")
+    return doc
+
+
+def _write_update_record(root, source_hash, payload):
+    """Atomically persist the durable automatic-handoff intent/result."""
+    _publish_json(root, _update_record_name(source_hash), payload)
+
+
+@contextmanager
+def _transaction_lock(root, timeout):
+    """Bounded exclusive OS advisory lock at the historical .prepare.lock path.
+
+    The file persists between transactions; a stale leftover can no longer
+    block or be stolen by a later preparer the way the old O_EXCL marker could.
+    """
+    path = root / ".prepare.lock"
+    if path.is_symlink():
+        _fail("runtime_untrusted")
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), _FILE)
+    except OSError:
+        _fail("runtime_untrusted")
+    try:
+        if os.name != "nt":
+            os.fchmod(fd, _FILE)
+        if os.fstat(fd).st_size == 0:
+            os.write(fd, b"0")
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except (BlockingIOError, OSError):
+                if time.monotonic() >= deadline:
+                    _fail("runtime_busy")
+                time.sleep(0.05)
+        try:
+            yield root
+        finally:
+            if os.name == "nt":
+                try:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def runtime_transaction(config=None, *, create=True, timeout=None):
+    """One bounded exclusive transaction over the user runtime root.
+
+    The lock covers source selection, runtime preparation, service replacement,
+    readback and any rollback. Explicit ensure and the automatic handoff share
+    this lock. With ``create=False`` a missing root yields None instead of
+    performing a first installation.
+    """
+    from mindie_diagnostics.fallback import _ancestors_are_real_dirs, _as_local_absolute, _owned
+
+    root = _root_path(config)
+    if create:
+        root = _ensure_dir(root, _ancestors_are_real_dirs, _as_local_absolute, _owned)
+    else:
+        if root.is_symlink() or not root.is_dir():
+            yield None
+            return
+        _require_dir(root, _owned)
+    with _transaction_lock(root, _LOCK_WAIT if timeout is None else timeout):
+        yield root
+
+
+def _create_venv(target, deadline=None):
+    """Build the generation venv in a bounded owned stdlib subprocess."""
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    env.pop("PYTHONHOME", None)
+    remaining = _remaining(deadline)
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-I", "-m", "venv", "--without-pip", str(target)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30 if remaining is None else min(30, remaining),
+            env=env,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        _fail("runtime_deadline_exceeded")
+    except OSError:
+        _fail("verify_failed")
+    if proc.returncode != 0:
+        _fail("verify_failed")
+
+
+def _prepare_locked(config, *, publish=True, source=None, deadline=None):
+    """Prepare the committed-source runtime under the caller's transaction lock.
+
+    With ``publish=False`` the immutable generation is materialized and
+    verified but the current.json pointer is left untouched; the caller
+    publishes it only after the owned service is confirmed on the new runtime.
+    ``deadline`` is an absolute monotonic budget shared with the caller; every
+    subprocess and copy step fails closed with runtime_deadline_exceeded.
+    """
     from mindie_diagnostics.fallback import (
         _ancestors_are_real_dirs,
         _as_local_absolute,
         _owned,
         _read_regular_bounded,
-        policy_path,
     )
 
-    dist = metadata.distribution(_DIST)
-    _installed(dist, _as_local_absolute)
-    version, revision, files, source_hash = _collect(dist, _read_regular_bounded)
-    root = _ensure_dir(
-        Path(policy_path(config)).with_suffix(".runtime"),
-        _ancestors_are_real_dirs,
-        _as_local_absolute,
-        _owned,
-    )
+    _remaining(deadline)
+    version, revision, files, source_hash = source if source is not None else _collect_source()
+    root = _ensure_dir(_root_path(config), _ancestors_are_real_dirs, _as_local_absolute, _owned)
     generations = _ensure_dir(root / "generations", _ancestors_are_real_dirs, _as_local_absolute, _owned)
-    lock = root / ".prepare.lock"
-    created = False
+    current = _read_current(root)
+    if current is not None:
+        old, new = _triple(current["version"]), _triple(version)
+        if old and new and new < old:
+            _fail("downgrade_rejected")
     staging = None
     promoted = False
     try:
-        try:
-            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, _FILE)
-            created = True
-            os.write(fd, str(os.getpid()).encode())
-            os.close(fd)
-        except FileExistsError:
-            _fail("runtime_busy")
-        except RuntimeError:
-            raise
-        except Exception:
-            _fail("runtime_unavailable")
-        current = None
-        pointer = root / "current.json"
-        if pointer.exists() or pointer.is_symlink():
-            current = _load_json(pointer, _read_regular_bounded, _OUT_CAP)
-            if current.get("schema") != 1 or not isinstance(current.get("version"), str):
-                _fail("runtime_untrusted")
-            old, new = _triple(current["version"]), _triple(version)
-            if old and new and new < old:
-                _fail("downgrade_rejected")
         dest = generations / source_hash
         if dest.exists() or dest.is_symlink():
             _require_dir(dest, _owned)
             _marker(dest, source_hash, version, revision, _read_regular_bounded)
             py = _python(dest, _owned)
             site = dest / "venv" / ("Lib/site-packages" if os.name == "nt" else f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages")
-            _verify(py, version, site, dest)
+            _verify(py, version, site, dest, deadline)
         else:
             staging = generations / f".staging-{uuid.uuid4().hex}"
             os.mkdir(staging, _DIR)
             if os.name != "nt":
                 os.chmod(staging, _DIR)
-            venv.EnvBuilder(with_pip=False, symlinks=os.name == "posix").create(str(staging / "venv"))
+            _create_venv(staging / "venv", deadline)
             site = staging / "venv" / ("Lib/site-packages" if os.name == "nt" else f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages")
             if not site.is_dir():
                 _fail("verify_failed")
-            _place(site, files)
+            _place(site, files, deadline)
             body = {"schema": 1, "source_hash": source_hash, "version": version, "revision": revision}
             _write(staging / "source.json", json.dumps(body, separators=(",", ":")).encode() + b"\n")
-            _verify(_python(staging, _owned), version, site, staging)
+            _verify(_python(staging, _owned), version, site, staging, deadline)
             os.replace(staging, dest)
             promoted = True
             staging = None
             py = _python(dest, _owned)
             final_site = dest / "venv" / ("Lib/site-packages" if os.name == "nt" else f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages")
-            _verify(py, version, final_site, dest)
+            _verify(py, version, final_site, dest, deadline)
         changed = current is None or current.get("source_hash") != source_hash
         previous = None if current is None else current.get("revision")
-        if changed:
+        if changed and publish:
             _publish(root, {"schema": 1, "source_hash": source_hash, "version": version, "revision": revision})
         return {
             "status": "ready",
@@ -375,20 +565,17 @@ def _prepare(config):
             "source_hash": source_hash,
             "previous_revision": previous,
             "changed": changed,
+            "published": bool(changed and publish),
         }
     finally:
         if staging is not None and not promoted:
             shutil.rmtree(staging, ignore_errors=True)
-        if created:
-            try:
-                os.unlink(lock)
-            except OSError:
-                pass
 
 
 def prepare_runtime(config=None):
     try:
-        return _prepare(config)
+        with runtime_transaction(config):
+            return _prepare_locked(config)
     except RuntimeError:
         raise
     except Exception:

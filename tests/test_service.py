@@ -55,7 +55,7 @@ def install(tmp_path, monkeypatch):
     monkeypatch.setattr(service.sys, "platform", "linux")
     monkeypatch.delenv("GH_TOKEN", raising=False)
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-    monkeypatch.setattr(service, "_locked", lambda path: (path.parent.mkdir(parents=True, exist_ok=True), nullcontext())[1])
+    monkeypatch.setattr(service, "_locked", lambda path, **kwargs: (path.parent.mkdir(parents=True, exist_ok=True), nullcontext())[1])
     prefix = tmp_path / 'immutable env % $HOME;not-a-shell'
     python = prefix / "bin/python"
     python.parent.mkdir(parents=True)
@@ -69,7 +69,7 @@ def install(tmp_path, monkeypatch):
     values = {"roots": [tmp_path / 'logs %u "quoted" $TOKEN; echo secret'],
               "state": tmp_path / 'state %u $HOME', "repository": "example/repository",
               "python": python, "gh": gh, "unit_dir": tmp_path / "user units", "runner": runner,
-              "since": "2026-09-13T01:02:03Z"}
+              "since": "2026-09-13T01:02:03Z", "reporting_config": tmp_path / "reporting.json"}
     runner.fragment = str(values['unit_dir'] / service.UNIT)
     return values, runner
 
@@ -111,19 +111,17 @@ def test_reinstall_preserves_original_since_and_only_restarts_changed_config(ins
 def test_ensure_uses_only_current_authorized_roots_and_rejects_rebinding(install):
     from mindie_diagnostics.service_config import linux_worker_configuration, worker_options
     values, runner = install
-    config = values['state'].parent / 'reporting.json'
-    first = service.ensure_reporter_service(**values, reporting_config=config)
+    config = values['reporting_config']
+    first = service.ensure_reporter_service(**values)
     new_root = values['state'].parent / 'other logs'
-    second = service.ensure_reporter_service(**{**values, 'roots': [new_root]}, reporting_config=config)
+    second = service.ensure_reporter_service(**{**values, 'roots': [new_root]})
     options = worker_options(*linux_worker_configuration(Path(second['unit']).read_text()))
     assert options['roots'] == [str(new_root)]
     assert options['reporting_config'] == str(config)
     before = Path(second['unit']).read_bytes()
     with pytest.raises(service.ServiceError, match='reporter_authorization_mismatch'):
-        service.ensure_reporter_service(**values, reporting_config=config.with_name('other.json'))
+        service.ensure_reporter_service(**{**values, 'reporting_config': config.with_name('other.json')})
     assert Path(second['unit']).read_bytes() == before
-    with pytest.raises(service.ServiceError, match='legacy_model_worker'):
-        service.ensure_reporter_service(**values, grok=values['gh'])
 
 
 def test_reporter_requires_gh_even_when_environment_file_exists(install, monkeypatch):
@@ -133,22 +131,23 @@ def test_reporter_requires_gh_even_when_environment_file_exists(install, monkeyp
         service._reporter_executable('absent-gh', values['state'] / 'credentials.env')
 
 
-def test_ensure_rejects_central_and_repository_changes_before_mutation(install):
+def test_ensure_rejects_legacy_and_repository_rebinding_before_mutation(install):
     values, runner = install
-    central = service.install_service(**{**values, 'roots': [], 'central_bot': True,
-        'grok': values['gh'], 'grok_home': values['state'] / 'grok', 'grok_work': values['state'] / 'work'})
-    path = Path(central['unit'])
+    installed = service.install_service(**values)
+    path = Path(installed['unit'])
+    original = path.read_text()
+    # Existing old-generation file, not a newly supported legacy install path.
+    path.write_text(original.replace('"worker"', '"worker" "--central-bot"'))
     before = path.read_bytes()
     runner.calls.clear()
-    with pytest.raises(service.ServiceError, match='legacy_model_worker_requires_explicit_removal'):
+    with pytest.raises(service.ServiceError, match='legacy_worker_requires_explicit_removal'):
         service.ensure_reporter_service(**values)
     assert path.read_bytes() == before and runner.calls == []
-    service.install_service(**values)
-    before = path.read_bytes()
+    path.write_text(original)
     runner.calls.clear()
-    with pytest.raises(service.ServiceError, match='reporter_repository_mismatch'):
+    with pytest.raises(service.ServiceError, match='reporter_authorization_mismatch'):
         service.ensure_reporter_service(**{**values, 'repository': 'another/repository'})
-    assert path.read_bytes() == before and runner.calls == []
+    assert path.read_text() == original and runner.calls == []
 
 
 def test_reinstall_repairs_own_invalid_unit_but_never_foreign_overrides(install):
@@ -234,18 +233,12 @@ def test_status_reports_observed_state_and_no_cleanup(install):
     assert runner.calls[0][0][2] == 'show'
 
 
-def test_grok_profile_is_explicit_and_personal_files_remain_untouched(install, tmp_path):
+def test_missing_policy_is_rejected_before_any_manager_call(install):
     values, runner = install
-    with pytest.raises(service.ServiceError, match='grok_profile_required'):
-        service.install_service(**values, grok=values['gh'])
-    profile = tmp_path / 'grok home'
-    profile.mkdir()
-    config = profile / 'config.json'
-    config.write_text('personal credentials unchanged')
-    result = service.install_service(**values, grok=values['gh'], grok_home=profile,
-                                     grok_work=tmp_path / 'grok work')
-    assert config.read_text() == 'personal credentials unchanged'
-    assert '"--grok-home"' in Path(result['unit']).read_text()
+    with pytest.raises(service.ServiceError, match='reporting_config_required'):
+        service.install_service(**{**values, 'reporting_config': None})
+    assert runner.calls == []
+    assert not values['unit_dir'].exists()
 
 
 @pytest.mark.parametrize('change', [{'roots': []}, {'roots': ['relative']}, {'state': 'relative'},
@@ -260,7 +253,7 @@ def test_invalid_configuration_does_not_call_systemctl(install, change):
 
 def test_unsupported_platform_is_explicit(monkeypatch):
     monkeypatch.setattr(service.sys, 'platform', 'freebsd')
-    for action in (lambda: service.install_service([], '/state', 'example/repository'),
+    for action in (lambda: service.install_service([], '/state', 'example/repository', reporting_config='/reporting.json'),
                    service.service_status, service.remove_service):
         with pytest.raises(service.ServiceError, match='unsupported_platform'):
             action()

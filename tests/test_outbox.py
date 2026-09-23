@@ -39,8 +39,6 @@ def test_rate_limit_and_unwritable_database(tmp_path):
     queue.enqueue('a', 'o', {})
     item = queue.claim()
     assert not queue.begin_post(item, hourly_limit=0)
-    assert queue.begin_generation(item, hourly_limit=1)
-    assert not queue.begin_generation(item, hourly_limit=1)
     file = tmp_path / 'file'
     file.write_text('not a directory')
     with pytest.raises(OSError):
@@ -97,3 +95,70 @@ def test_withdrawal_preserves_unknown_submission_fact(tmp_path):
     assert queue.withdraw_unconsented() == 1
     row = queue.rows()[0]
     assert row['state'] == 'withdrawn' and row['last_error'] == 'submission_uncertain_reporting_consent_withdrawn'
+
+
+def test_published_receipt_survives_consent_disable_and_pending_withdraws(tmp_path):
+    import sqlite3
+    from mindie_diagnostics.integration import configure_reporting
+    from mindie_diagnostics.reporting import current_consent
+    path = tmp_path / 'reporting.json'
+    roots = [str(tmp_path)]
+    assert configure_reporting(True, config=path, repository='example/project', roots=roots)['status'] == 'configured'
+    consent = current_consent(path)
+    now = [1000.0]
+    queue = Outbox(tmp_path / 'queue.db', clock=lambda: now[0])
+    with queue.connect() as db:
+        columns = {row[1] for row in db.execute('PRAGMA table_info(incidents)')}
+        tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert 'diagnosis' not in columns and 'diagnosis_state' not in columns and 'generations' not in tables
+    assert not hasattr(Outbox, 'begin_generation') and not hasattr(Outbox, 'published')
+    queue.enqueue('pub', 'a' * 32, {'component': 'reporter'}, consent=consent)
+    now[0] += 1
+    queue.enqueue('unc', 'b' * 32, {'component': 'reporter'}, consent=consent)
+    now[0] += 1
+    queue.enqueue('pen', 'c' * 32, {'component': 'reporter'}, consent=consent)
+    published = queue.claim()
+    queue.update(published, state='published', issue_number=7, issue_url='https://github.com/example/project/issues/7')
+    uncertain = queue.claim()
+    assert queue.begin_post(uncertain)
+    assert queue.claim()['fingerprint'] == 'pen'
+    configure_reporting(False, config=path, repository='example/project', roots=roots)
+    assert queue.withdraw_unconsented() == 2
+    rows = {row['fingerprint']: row for row in queue.rows()}
+    assert rows['pub']['state'] == 'published'
+    assert rows['pub']['issue_number'] == 7
+    assert rows['pub']['issue_url'] == 'https://github.com/example/project/issues/7'
+    assert rows['pub']['attempts'] == 1
+    assert 'diagnosis_state' not in rows['pub']
+    assert rows['pen']['state'] == 'withdrawn'
+    assert rows['unc']['state'] == 'withdrawn'
+    assert rows['unc']['last_error'] == 'submission_uncertain_reporting_consent_withdrawn'
+    legacy = tmp_path / 'legacy.db'
+    raw = sqlite3.connect(legacy)
+    raw.executescript("""
+        CREATE TABLE incidents (
+            fingerprint TEXT PRIMARY KEY, payload TEXT NOT NULL,
+            first_seen REAL NOT NULL, last_seen REAL NOT NULL,
+            occurrences INTEGER NOT NULL DEFAULT 1,
+            state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt REAL NOT NULL DEFAULT 0, lease_until REAL NOT NULL DEFAULT 0,
+            lease_token TEXT, issue_number INTEGER, issue_url TEXT, last_error TEXT,
+            diagnosis TEXT, diagnosis_state TEXT NOT NULL DEFAULT 'pending', consent TEXT);
+        CREATE TABLE seen (operation_id TEXT PRIMARY KEY, observed REAL NOT NULL);
+        CREATE TABLE publications (at REAL NOT NULL);
+        CREATE TABLE generations (at REAL NOT NULL);
+    """)
+    raw.execute(
+        "INSERT INTO incidents (fingerprint,payload,first_seen,last_seen,state,attempts,issue_number,issue_url,diagnosis,diagnosis_state) "
+        "VALUES ('legacy','{}',1,1,'published',2,9,'https://github.com/example/project/issues/9','old','pending')"
+    )
+    raw.commit()
+    raw.close()
+    opened = Outbox(legacy)
+    kept = opened.rows()[0]
+    assert kept['state'] == 'published' and kept['attempts'] == 2 and kept['issue_number'] == 9
+    assert kept['issue_url'] == 'https://github.com/example/project/issues/9'
+    with opened.connect() as db:
+        stored = dict(db.execute("SELECT diagnosis,diagnosis_state,attempts,issue_number,issue_url FROM incidents").fetchone())
+    assert stored == {'diagnosis': 'old', 'diagnosis_state': 'pending', 'attempts': 2,
+                      'issue_number': 9, 'issue_url': 'https://github.com/example/project/issues/9'}

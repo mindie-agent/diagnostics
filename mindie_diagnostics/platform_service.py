@@ -26,7 +26,7 @@ from . import service as common
 MARKER = "mindie-diagnostics.native-service.v1"
 MANIFEST = "mindie-diagnostics-service.json"
 LIMIT = 32768
-ENV_KEYS = {"GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR", "XAI_API_KEY", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"}
+ENV_KEYS = {"GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"}
 
 
 def _physical(path):
@@ -76,7 +76,7 @@ def _paths(unit_dir=None):
 
 
 @contextmanager
-def _locked(path):
+def _locked(path, deadline=None):
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     lock = path.with_suffix(".lock")
     if lock.is_symlink():
@@ -86,8 +86,12 @@ def _locked(path):
         if stream.read(1) == b"":
             stream.write(b"0")
             stream.flush()
-        deadline = time.monotonic() + 10
+        stop = time.monotonic() + 10
+        if deadline is not None:
+            stop = min(stop, deadline)
         while True:
+            if time.monotonic() >= stop:
+                raise common.ServiceError("installation_busy")
             try:
                 stream.seek(0)
                 if os.name == "nt":
@@ -98,7 +102,7 @@ def _locked(path):
                     fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
             except (BlockingIOError, OSError):
-                if time.monotonic() >= deadline:
+                if time.monotonic() >= stop:
                     raise common.ServiceError("installation_busy") from None
                 time.sleep(.05)
         try:
@@ -247,52 +251,6 @@ def _private_environment(value, runner):
     return path
 
 
-def save_environment_token(state, runner=None):
-    """Persist an explicitly authorized environment PAT with private permissions."""
-    runner = runner or subprocess.run
-    name = next((key for key in ("GH_TOKEN", "GITHUB_TOKEN") if os.environ.get(key)), None)
-    if name is None:
-        raise common.ServiceError("environment_token_required")
-    token = os.environ[name]
-    if len(token) > 8192 or any(character.isspace() or ord(character) < 32 for character in token):
-        raise common.ServiceError("invalid_environment_token")
-    root = common._absolute(state)
-    if any(item.is_symlink() for item in (root, *root.parents)):
-        raise common.ServiceError("unsafe_environment_file")
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    root = _physical(root)
-    path = root / "credentials.env"
-    if path.exists() or path.is_symlink():
-        _private_environment(path, runner)
-    descriptor, temporary = tempfile.mkstemp(prefix=".mindie-credential-", dir=root)
-    temporary_path = _physical(temporary)
-    try:
-        if sys.platform == "win32":
-            # Restrict the empty file before writing the credential. No secret
-            # enters a PowerShell argument, script, scheduler XML or receipt.
-            script = ("$p=" + _ps_quote(temporary_path) + ";$id=[Security.Principal.WindowsIdentity]::GetCurrent().User;"
-                      "$owner=[IO.File]::GetAccessControl($p).GetOwner([Security.Principal.SecurityIdentifier]).Value;"
-                      "if($owner -ne $id.Value){throw 'credential_file_owner_mismatch'};"
-                      "$a=New-Object Security.AccessControl.FileSecurity;"
-                      "$a.SetAccessRuleProtection($true,$false);"
-                      "$a.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($id,'FullControl','Allow')));"
-                      "$system=New-Object Security.Principal.SecurityIdentifier('S-1-5-18');"
-                      "$a.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($system,'FullControl','Allow')));"
-                      "[IO.File]::SetAccessControl($p,$a)")
-            _ps(runner, script, action="credentials.protect")
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
-            descriptor = None
-            stream.write(name + "=" + token + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary_path, path)
-        return _private_environment(path, runner)
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-        temporary_path.unlink(missing_ok=True)
-
-
 def _launchctl(runner, *args, check=True):
     return _run(runner, ["launchctl", *args], action="launchctl." + args[0], check=check)
 
@@ -319,48 +277,65 @@ def _verify_unit(unit, config):
         raise common.ServiceError("unowned_unit")
 
 
-def install_service(roots, state, repository, *, python=None, gh=None, grok=None,
-                    grok_home=None, grok_work=None, interval=60, since=None,
-                    environment_file=None, unit_dir=None, runner=None, start=True, save_token=False, central_bot=False,
-                    ensure=False, reporting_config=None):
+def _await_bootout(runner, label):
+    """Confirm one bootout removed the label before one bootstrap; read-only.
+
+    launchctl exits 113 for an absent service. A still-present label is
+    re-probed every 50ms within a 3s bound capped by the runner's absolute
+    deadline; any other exit, command error or timeout is unknown and fails
+    closed. Bootout/bootstrap are never repeated.
+    """
+    stop = time.monotonic() + 3
+    outer = getattr(runner, 'deadline', None)
+    if outer is not None:
+        stop = min(stop, outer)
+
+    def probe(command, **kwargs):
+        remaining = stop - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(command, 0)
+        timeout = kwargs.get('timeout')
+        kwargs['timeout'] = remaining if timeout is None else min(timeout, remaining)
+        return runner(command, **kwargs)
+
+    while True:
+        reply = _launchctl(probe, "print", _domain(label), check=False)
+        if reply.returncode == 113:
+            return
+        if reply.returncode != 0:
+            raise common.ServiceError("service_manager_unavailable",
+                                      action="launchctl.print", returncode=reply.returncode)
+        if time.monotonic() >= stop:
+            raise common.ServiceError("service_removal_unconfirmed",
+                                      action="launchctl.print", returncode=reply.returncode)
+        time.sleep(.05)
+
+
+def install_service(roots, state, repository, *, python=None, gh=None, interval=60, since=None,
+                    environment_file=None, unit_dir=None, runner=None, start=True,
+                    ensure=False, reporting_config=None, expected_consent_revision=None):
+    if reporting_config is None:
+        raise common.ServiceError('reporting_config_required')
     runner = runner or subprocess.run
     manifest, label, unit = _paths(unit_dir)
-    reporting_config = common._absolute(reporting_config) if reporting_config is not None else None
-    if reporting_config is not None and (grok or grok_home or grok_work or central_bot or save_token):
-        raise common.ServiceError('reporter_configuration_conflict')
+    reporting_config = common._absolute(reporting_config)
     roots = list(dict.fromkeys(str(common._absolute(root)) for root in roots))
-    if ensure and central_bot:
-        raise common.ServiceError('central_bot_is_not_a_local_reporter')
-    if ensure and (grok or grok_home or grok_work):
-        raise common.ServiceError('legacy_model_worker_requires_explicit_removal')
-    if central_bot and roots:
-        raise common.ServiceError("central_bot_does_not_watch_local_logs")
-    if not (0 if central_bot else 1) <= len(roots) <= 32:
+    if not 1 <= len(roots) <= 32:
         raise common.ServiceError("diagnostic_roots_required")
-    if central_bot and not grok:
-        raise common.ServiceError("central_bot_requires_grok")
     state = common._absolute(state)
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
         raise common.ServiceError("invalid_repository")
     if type(interval) not in (int, float) or not 5 <= interval <= 86400:
         raise common.ServiceError("invalid_interval")
-    if bool(grok) != bool(grok_home and grok_work) or ((grok_home or grok_work) and not grok):
-        raise common.ServiceError("grok_profile_required")
-    if save_token and environment_file is not None:
-        raise common.ServiceError("choose_existing_file_or_save_token")
-    with _locked(manifest):
+    with _locked(manifest, deadline=getattr(runner, 'deadline', None)):
+        common._check_reporting_consent(reporting_config, expected_consent_revision)
         # Resolve again after creation, accounting for Windows package redirection.
         manifest, label, unit = _paths(manifest.parent)
         existing = _read(manifest)
         if ensure and existing:
-            from .service_config import merged_reporter_options
-            common._check_reporter_binding(existing['argv'], existing['environment_file'], state, repository, reporting_config)
-            if reporting_config is None:
-                retained = merged_reporter_options(existing['argv'], existing['environment_file'], roots, repository)
-                roots, state, gh = retained['roots'], Path(retained['state']), retained['gh']
-                environment_file = retained['environment_file']
-                interval = retained['interval']
-            save_token = False
+            # The stored manifest serialized the physical state path; compare
+            # against the same physical mapping of the incoming directory.
+            common._check_reporter_binding(existing['argv'], existing['environment_file'], _physical(state), repository, reporting_config)
         fixed_since = existing["since"] if existing else common._since(since)
         interpreter, version = common._interpreter(runner, python)
         launcher = _physical(interpreter)
@@ -388,23 +363,14 @@ def install_service(roots, state, repository, *, python=None, gh=None, grok=None
             raise common.ServiceError('unsafe_state_directory')
         state.mkdir(parents=True, exist_ok=True, mode=0o700)
         state = _physical(state)
-        if save_token:
-            environment_file = save_environment_token(state, runner)
         env_file = _private_environment(environment_file, runner)
         gh_path = (str(common._executable(gh)) if ensure and existing and env_file is None
                    else common._reporter_executable(gh, env_file))
-        argv = ["worker"]
-        if central_bot:
-            argv.append("--central-bot")
-        if reporting_config is not None:
-            argv += ["--reporting-config", str(reporting_config)]
+        argv = ["worker", "--reporting-config", str(reporting_config)]
         for root in roots:
             argv += ["--root", root]
         argv += ["--state", str(state), "--repository", repository, "--gh", gh_path,
                  "--since", fixed_since, "--interval", str(interval)]
-        if grok:
-            argv += ["--grok", str(common._executable(grok)), "--grok-home", str(common._absolute(grok_home)),
-                     "--grok-work", str(common._absolute(grok_work))]
         config = {"marker": MARKER, "platform": sys.platform, "since": fixed_since, "label": label,
                   "launcher": str(launcher), "launch_args": ["-I", "-m", "mindie_diagnostics.platform_service", "run", "--config", str(manifest)],
                   "argv": argv, "environment_file": str(env_file) if env_file else None, "state": str(state)}
@@ -421,23 +387,62 @@ def install_service(roots, state, repository, *, python=None, gh=None, grok=None
         config["unit_sha256"] = hashlib.sha256(payload).hexdigest()
         changed = existing != config
         state.mkdir(parents=True, exist_ok=True, mode=0o700)
-        if changed:
-            _write(unit, payload)
-            _write(manifest, (json.dumps(config, ensure_ascii=True, indent=2) + "\n").encode("utf-8"))
+        manifest_bytes = (json.dumps(config, ensure_ascii=True, indent=2) + "\n").encode("utf-8")
         if sys.platform == "win32":
+            # Consent recheck after the native lock, before writing/registering.
+            common._check_reporting_consent(reporting_config, expected_consent_revision)
+            if changed:
+                _write(unit, payload)
+                _write(manifest, manifest_bytes)
+            common._check_reporting_consent(reporting_config, expected_consent_revision)
             if changed or loaded is None:
                 _ps(runner, "Register-ScheduledTask -TaskName " + _ps_quote(label) + " -TaskPath '\\' -Xml "
                     "([IO.File]::ReadAllText(" + _ps_quote(unit) + ")) -Force|Out-Null", action="task.register")
             if start:
-                if existing and (changed or save_token):
+                # Recheck immediately before the owned stop/start mutation.
+                common._check_reporting_consent(reporting_config, expected_consent_revision)
+                if existing and changed:
                     _ps(runner, "Stop-ScheduledTask -TaskName " + _ps_quote(label), action="task.stop")
+                common._check_reporting_consent(reporting_config, expected_consent_revision)
                 _ps(runner, "Start-ScheduledTask -TaskName " + _ps_quote(label), action="task.start")
         else:
-            if loaded["returncode"] == 0 and (changed or save_token):
+            if loaded["returncode"] == 0 and changed:
+                # Consent recheck immediately before the owned stop mutation.
+                common._check_reporting_consent(reporting_config, expected_consent_revision)
                 _launchctl(runner, "bootout", _domain(label))
+                _await_bootout(runner, label)
+            if changed:
+                # Bootout ran while the old validated descriptions were still on
+                # disk; retain their exact bytes for write-phase recovery.
+                prior_unit = unit.read_bytes() if unit.is_file() and not unit.is_symlink() else None
+                prior_manifest = manifest.read_bytes() if manifest.is_file() and not manifest.is_symlink() else None
+                # Recheck after the blocking bootout wait, before writing the
+                # changed owned descriptions.
+                common._check_reporting_consent(reporting_config, expected_consent_revision)
+                try:
+                    _write(unit, payload)
+                    _write(manifest, manifest_bytes)
+                except (OSError, common.ServiceError):
+                    # Before any bootstrap, restore only this transaction's
+                    # changed files; never start the service in this recovery.
+                    try:
+                        if prior_unit is None:
+                            unit.unlink(missing_ok=True)
+                        else:
+                            _write(unit, prior_unit)
+                        if prior_manifest is None:
+                            manifest.unlink(missing_ok=True)
+                        else:
+                            _write(manifest, prior_manifest)
+                    except (OSError, common.ServiceError) as exc:
+                        raise common.ServiceError('unit_restore_failed', action='unit.restore') from exc
+                    raise
             if start:
-                if changed or save_token or loaded["returncode"]:
+                # Recheck immediately before bootstrap/kickstart.
+                common._check_reporting_consent(reporting_config, expected_consent_revision)
+                if changed or loaded["returncode"]:
                     _launchctl(runner, "bootstrap", _domain(label).rsplit("/", 1)[0], str(unit))
+                common._check_reporting_consent(reporting_config, expected_consent_revision)
                 _launchctl(runner, "kickstart", _domain(label))
         return {"status": "installed", "unit": str(unit), "manifest": str(manifest), "task_name": label,
                 "since": fixed_since, "changed": changed, "start_requested": start, "python": str(interpreter),

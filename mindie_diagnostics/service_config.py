@@ -3,17 +3,23 @@ from __future__ import annotations
 
 import re
 
+_LEGACY_FLAGS = ('--central-bot', '--grok', '--grok-home', '--grok-work')
+
 
 def worker_options(argv, environment_file):
+    """Parse exactly the owned pure local reporter's arguments.
+
+    A preexisting legacy paid-model worker is refused explicitly, never
+    silently adopted; an independent reporting policy file is required.
+    """
     from .service import ServiceError, _absolute, _since
     if not isinstance(argv, list) or not argv or argv[0] != 'worker':
         raise ServiceError('invalid_reporter_configuration')
-    if '--central-bot' in argv:
-        raise ServiceError('central_bot_is_not_a_local_reporter')
+    if any(flag in argv for flag in _LEGACY_FLAGS):
+        raise ServiceError('legacy_worker_requires_explicit_removal')
     names = {'--state': 'state', '--repository': 'repository', '--gh': 'gh',
-             '--since': 'since', '--interval': 'interval', '--grok': 'grok',
-             '--reporting-config': 'reporting_config',
-             '--grok-home': 'grok_home', '--grok-work': 'grok_work'}
+             '--since': 'since', '--interval': 'interval',
+             '--reporting-config': 'reporting_config'}
     result = {'roots': [], 'environment_file': environment_file}
     for index in range(1, len(argv), 2):
         if index + 1 >= len(argv) or not isinstance(argv[index + 1], str):
@@ -25,9 +31,10 @@ def worker_options(argv, environment_file):
             result[names[flag]] = value
         else:
             raise ServiceError('invalid_reporter_configuration')
-    if not {'state', 'repository', 'gh', 'since', 'interval'} <= result.keys() or not result['roots']:
+    if not {'state', 'repository', 'gh', 'since', 'interval', 'reporting_config'} <= result.keys() or not result['roots']:
         raise ServiceError('invalid_reporter_configuration')
     result['state'] = str(_absolute(result['state']))
+    result['reporting_config'] = str(_absolute(result['reporting_config']))
     result['since'] = _since(result['since'])
     if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', result['repository']):
         raise ServiceError('invalid_reporter_configuration')
@@ -37,25 +44,7 @@ def worker_options(argv, environment_file):
         raise ServiceError('invalid_reporter_configuration') from None
     if not 5 <= interval <= 86400:
         raise ServiceError('invalid_reporter_configuration')
-    for key in ('gh', 'grok', 'grok_home', 'grok_work'):
-        if result.get(key):
-            result[key] = 'gh' if key == 'gh' and result[key] == 'gh' else str(_absolute(result[key]))
-        else:
-            result[key] = None
-    if (bool(result['grok']) != bool(result['grok_home'] and result['grok_work'])
-            or (result['grok_home'] or result['grok_work']) and not result['grok']):
-        raise ServiceError('invalid_reporter_configuration')
-    return result
-
-
-def merged_reporter_options(argv, environment_file, roots, repository):
-    from .service import ServiceError, _absolute
-    result = worker_options(argv, environment_file)
-    if result['repository'] != repository:
-        raise ServiceError('reporter_repository_mismatch')
-    result['roots'] = list(dict.fromkeys([*result['roots'], *(str(_absolute(root)) for root in roots)]))
-    if len(result['roots']) > 32:
-        raise ServiceError('diagnostic_roots_required')
+    result['gh'] = 'gh' if result['gh'] == 'gh' else str(_absolute(result['gh']))
     return result
 
 

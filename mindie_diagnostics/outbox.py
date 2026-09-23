@@ -50,11 +50,10 @@ class Outbox:
                     state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
                     next_attempt REAL NOT NULL DEFAULT 0, lease_until REAL NOT NULL DEFAULT 0,
                     lease_token TEXT, issue_number INTEGER, issue_url TEXT, last_error TEXT,
-                    diagnosis TEXT, diagnosis_state TEXT NOT NULL DEFAULT 'pending', consent TEXT);
+                    consent TEXT);
                 CREATE TABLE IF NOT EXISTS seen (
                     operation_id TEXT PRIMARY KEY, observed REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS publications (at REAL NOT NULL);
-                CREATE TABLE IF NOT EXISTS generations (at REAL NOT NULL);
             """)
             if 'consent' not in {row[1] for row in db.execute('PRAGMA table_info(incidents)')}:
                 raise ValueError('unsupported diagnostic queue schema; use a fresh state directory')
@@ -138,7 +137,6 @@ class Outbox:
             db.execute("BEGIN IMMEDIATE")
             db.execute("DELETE FROM seen WHERE observed < ?", (now - 30 * 86400,))
             db.execute("DELETE FROM publications WHERE at < ?", (now - 86400,))
-            db.execute("DELETE FROM generations WHERE at < ?", (now - 86400,))
             self._terminalize(db, now)
             self._prune_published(db, now)
             if db.execute("SELECT 1 FROM seen WHERE operation_id=?", (operation_id,)).fetchone():
@@ -264,7 +262,7 @@ class Outbox:
         for row in rows:
             receipt = self._receipt(row["fingerprint"], row["payload"], row["issue_url"])
             if receipt != row["payload"]:
-                db.execute("UPDATE incidents SET payload=?,diagnosis=NULL WHERE fingerprint=?", (receipt, row["fingerprint"]))
+                db.execute("UPDATE incidents SET payload=? WHERE fingerprint=?", (receipt, row["fingerprint"]))
 
     def _prune_published(self, db, now):
         # Terminal markers only. Active unpublished evidence is never evicted.
@@ -315,11 +313,13 @@ class Outbox:
         """Revoke queued work before intake; retain bounded local history.
 
         This includes entries with no explicit scope. Leases are fenced so an
-        overlapping worker cannot publish a revoked item after generation.
+        overlapping worker cannot publish a revoked item.
         """
         from .reporting import consent_allowed
         with self.connect() as db:
-            rows = db.execute("SELECT fingerprint,consent,state FROM incidents WHERE state!='withdrawn'").fetchall()
+            rows = db.execute(
+                "SELECT fingerprint,consent,state FROM incidents WHERE state NOT IN ('withdrawn','published')"
+            ).fetchall()
         checked, withdrawn = {}, 0
         for row in rows:
             raw = row["consent"]
@@ -328,15 +328,14 @@ class Outbox:
             if checked[raw]:
                 continue
             with self.connect() as db:
-                if row["state"] == "published":
-                    changed = db.execute("UPDATE incidents SET diagnosis_state='withdrawn',lease_until=0,lease_token=NULL "
-                                         "WHERE fingerprint=? AND diagnosis_state!='withdrawn'", (row["fingerprint"],))
-                else:
-                    changed = db.execute("UPDATE incidents SET state='withdrawn',diagnosis_state='withdrawn',"
-                                         "last_error=CASE WHEN state='uncertain' OR last_error LIKE 'submission_uncertain%' "
-                                         "THEN 'submission_uncertain_reporting_consent_withdrawn' "
-                                         "ELSE 'reporting_consent_unavailable_or_withdrawn' END,lease_until=0,lease_token=NULL "
-                                         "WHERE fingerprint=? AND state!='withdrawn'", (row["fingerprint"],))
+                changed = db.execute(
+                    "UPDATE incidents SET state='withdrawn',"
+                    "last_error=CASE WHEN state='uncertain' OR last_error LIKE 'submission_uncertain%' "
+                    "THEN 'submission_uncertain_reporting_consent_withdrawn' "
+                    "ELSE 'reporting_consent_unavailable_or_withdrawn' END,lease_until=0,lease_token=NULL "
+                    "WHERE fingerprint=? AND state NOT IN ('withdrawn','published')",
+                    (row["fingerprint"],),
+                )
                 withdrawn += changed.rowcount
                 if changed.rowcount:
                     self._compact_one(db, row["fingerprint"])
@@ -353,10 +352,10 @@ class Outbox:
             return
         receipt = self._receipt(row["fingerprint"], row["payload"], row["issue_url"])
         if receipt != row["payload"]:
-            db.execute("UPDATE incidents SET payload=?,diagnosis=NULL WHERE fingerprint=?", (receipt, fingerprint))
+            db.execute("UPDATE incidents SET payload=? WHERE fingerprint=?", (receipt, fingerprint))
 
     def update(self, item: dict[str, Any], **fields: Any) -> None:
-        allowed = {"state", "next_attempt", "issue_number", "issue_url", "last_error", "diagnosis", "diagnosis_state"}
+        allowed = {"state", "next_attempt", "issue_number", "issue_url", "last_error"}
         if not fields or set(fields) - allowed:
             raise ValueError("invalid outbox update")
         if "state" in fields and fields["state"] not in _ACTIVE_STATES + _TERMINAL_STATES:
@@ -393,32 +392,10 @@ class Outbox:
                 db.execute("INSERT INTO publications VALUES (?)", (now,))
         return True
 
-    def begin_generation(self, item: dict[str, Any], *, hourly_limit: int = 10) -> bool:
-        """Bound paid model requests independently of comment publication."""
-        now = self.clock()
-        with self.connect() as db:
-            db.execute('BEGIN IMMEDIATE')
-            if not db.execute(
-                "SELECT 1 FROM incidents WHERE fingerprint=? AND lease_token=? AND lease_until>? "
-                "AND attempts BETWEEN 1 AND ?",
-                (item['fingerprint'], item['lease_token'], now, MAX_AUTOMATIC_CYCLES),
-            ).fetchone():
-                raise RuntimeError('bot lease expired before generation')
-            db.execute('DELETE FROM generations WHERE at < ?', (now - 86400,))
-            if db.execute('SELECT COUNT(*) FROM generations WHERE at >= ?', (now - 3600,)).fetchone()[0] >= hourly_limit:
-                return False
-            db.execute('INSERT INTO generations VALUES (?)', (now,))
-        return True
-
     def rows(self) -> list[dict[str, Any]]:
         with self.connect() as db:
-            rows = [dict(row) for row in db.execute("SELECT fingerprint,first_seen,last_seen,occurrences,state,attempts,next_attempt,issue_number,issue_url,last_error,diagnosis_state,json_extract(payload,'$.incident_ids') AS incident_ids FROM incidents ORDER BY (state='published'),last_seen DESC LIMIT ?", (self.capacity * 2,))]
+            rows = [dict(row) for row in db.execute("SELECT fingerprint,first_seen,last_seen,occurrences,state,attempts,next_attempt,issue_number,issue_url,last_error,json_extract(payload,'$.incident_ids') AS incident_ids FROM incidents ORDER BY (state='published'),last_seen DESC LIMIT ?", (self.capacity * 2,))]
         for row in rows:
             value = self._consent(row.get("incident_ids"))
             row["incident_ids"] = [ident for ident in value[-80:] if self._incident_id(ident)] if isinstance(value, list) else []
         return rows
-
-    def published(self, *, limit: int = 10) -> list[dict[str, Any]]:
-        with self.connect() as db:
-            return [{**dict(row), 'consent': self._consent(row['consent'])}
-                    for row in db.execute("SELECT * FROM incidents WHERE state='published' AND diagnosis_state='pending' ORDER BY first_seen LIMIT ?", (min(limit, 100),))]

@@ -45,7 +45,7 @@ class Runner:
                 output = "S-1-5-21-1000"
         elif argv[0] == "launchctl":
             if argv[1] == "print":
-                code = int(self.launch is None)
+                code = 113 if self.launch is None else 0
                 if code:
                     error = "Could not find service in domain"
                 if self.launch:
@@ -80,7 +80,8 @@ def installation(request, tmp_path, monkeypatch):
     runner = Runner(prefix)
     values = {"roots": [tmp_path / "logs $fixture"], "state": tmp_path / "state with spaces",
               "repository": "owner/project", "python": python, "gh": prefix / "gh.exe",
-              "unit_dir": tmp_path / "user service", "runner": runner, "since": "2026-09-14T01:02:03Z"}
+              "unit_dir": tmp_path / "user service", "runner": runner, "since": "2026-09-14T01:02:03Z",
+              "reporting_config": tmp_path / "reporting.json"}
     return values, runner
 
 
@@ -110,9 +111,9 @@ def test_install_reuse_status_start_and_remove_preserve_data(installation):
 def test_reporter_policy_roundtrip_and_binding_protection(installation):
     from mindie_diagnostics.service_config import worker_options
     values, runner = installation
-    config = values['state'].parent / 'reporting.json'
-    first = service.ensure_reporter_service(**values, reporting_config=config)
-    same = service.ensure_reporter_service(**values, reporting_config=config)
+    config = values['reporting_config']
+    first = service.ensure_reporter_service(**values)
+    same = service.ensure_reporter_service(**values)
     assert not same['changed']
     manifest = Path(first['manifest'])
     current = json.loads(manifest.read_text())
@@ -121,22 +122,111 @@ def test_reporter_policy_roundtrip_and_binding_protection(installation):
     assert current['environment_file'] is None
     before = manifest.read_bytes()
     with pytest.raises(service.ServiceError, match='reporter_authorization_mismatch'):
-        service.ensure_reporter_service(**values, reporting_config=config.with_name('other.json'))
+        service.ensure_reporter_service(**{**values, 'reporting_config': config.with_name('other.json')})
     assert manifest.read_bytes() == before
 
 
-def test_reporter_refuses_legacy_model_worker(installation):
+def test_failed_mac_bootout_preserves_old_descriptions(installation):
     values, runner = installation
-    profile = dict(grok=values['gh'], grok_home=values['state'] / 'grok', grok_work=values['state'] / 'work')
-    first = service.install_service(**values, **profile)
+    if sys.platform != 'darwin':
+        pytest.skip('macOS descriptor transaction only')
+    first = service.ensure_reporter_service(**values)
+    unit, manifest = Path(first['unit']), Path(first['manifest'])
+    before = unit.read_bytes(), manifest.read_bytes()
+    def fail_bootout(argv, **options):
+        if argv[:2] == ['launchctl', 'bootout']:
+            runner.calls.append((argv, options))
+            return subprocess.CompletedProcess(argv, 112, '', 'controlled failure')
+        return runner(argv, **options)
+    with pytest.raises(service.ServiceError, match='command_failed'):
+        service.ensure_reporter_service(**{**values, 'interval': 61, 'runner': fail_bootout})
+    assert (unit.read_bytes(), manifest.read_bytes()) == before
+    assert runner.launch is not None
+
+
+def test_partial_mac_descriptor_write_restores_verified_pair_without_starting(installation, monkeypatch):
+    values, runner = installation
+    if sys.platform != 'darwin':
+        pytest.skip('macOS descriptor transaction only')
+    first = service.ensure_reporter_service(**values)
+    unit, manifest = Path(first['unit']), Path(first['manifest'])
+    before = unit.read_bytes(), manifest.read_bytes()
+    original, failed = native._write, []
+    def fail_manifest_once(path, payload):
+        if path == manifest and not failed:
+            failed.append(True)
+            raise OSError('controlled manifest write failure')
+        return original(path, payload)
+    monkeypatch.setattr(native, '_write', fail_manifest_once)
+    runner.calls.clear()
+    with pytest.raises((OSError, service.ServiceError)):
+        service.ensure_reporter_service(**{**values, 'interval': 61})
+    assert (unit.read_bytes(), manifest.read_bytes()) == before
+    assert runner.launch is None
+    actions = [argv[1] for argv, _ in runner.calls if argv[0] == 'launchctl']
+    assert actions.count('bootout') == 1 and 'bootstrap' not in actions and 'kickstart' not in actions
+
+
+def test_consent_withdrawn_during_interpreter_probe_prevents_native_side_effect(installation):
+    from mindie_diagnostics.integration import configure_reporting
+    from mindie_diagnostics.fallback import read_policy
+    values, runner = installation
+    configure_reporting(True, config=values['reporting_config'], repository=values['repository'],
+                        roots=[str(path) for path in values['roots']])
+    revision = read_policy(values['reporting_config'])['revision']
+    def withdraw_during_probe(argv, **options):
+        result = runner(argv, **options)
+        if argv[0] not in ('launchctl', 'powershell.exe'):
+            configure_reporting(False, config=values['reporting_config'], repository=values['repository'])
+        return result
+    with pytest.raises(service.ServiceError, match='reporting_authorization_changed'):
+        service.ensure_reporter_service(**{**values, 'runner': withdraw_during_probe,
+                                          'expected_consent_revision': revision})
+    assert runner.launch is None and runner.xml is None
+    assert not (values['unit_dir'] / native.MANIFEST).exists()
+
+
+def test_consent_withdrawn_between_native_commands_prevents_next_start(installation):
+    from mindie_diagnostics.integration import configure_reporting
+    from mindie_diagnostics.fallback import read_policy
+    values, runner = installation
+    service.ensure_reporter_service(**values)
+    configure_reporting(True, config=values['reporting_config'], repository=values['repository'],
+                        roots=[str(path) for path in values['roots']])
+    revision = read_policy(values['reporting_config'])['revision']
+    withdrawn = []
+    after = []
+    def withdraw_after_command(argv, **options):
+        text = base64.b64decode(argv[-1]).decode('utf-16-le') if argv[0] == 'powershell.exe' else ' '.join(argv[:2])
+        if withdrawn:
+            after.append(text)
+        result = runner(argv, **options)
+        if text == 'launchctl bootstrap' or 'Stop-ScheduledTask -TaskName' in text:
+            configure_reporting(False, config=values['reporting_config'], repository=values['repository'])
+            withdrawn.append(True)
+        return result
+    with pytest.raises(service.ServiceError, match='reporting_authorization_changed'):
+        service.ensure_reporter_service(**{**values, 'interval': 61, 'runner': withdraw_after_command,
+                                          'expected_consent_revision': revision})
+    assert withdrawn
+    assert not any(text == 'launchctl kickstart' or 'Start-ScheduledTask -TaskName' in text for text in after)
+
+
+@pytest.mark.parametrize('legacy_flag', ['--grok', '--central-bot'])
+def test_reporter_refuses_legacy_model_worker(installation, legacy_flag):
+    values, runner = installation
+    first = service.install_service(**values)
     manifest = Path(first['manifest'])
+    doc = json.loads(manifest.read_text())
+    doc['argv'].append(legacy_flag)
+    if legacy_flag == '--grok':
+        doc['argv'].append(str(values['gh']))
+    manifest.write_text(json.dumps(doc))
     before = manifest.read_bytes()
     runner.calls.clear()
-    with pytest.raises(service.ServiceError, match='legacy_model_worker'):
+    with pytest.raises(service.ServiceError, match='legacy_worker'):
         service.ensure_reporter_service(**values)
     assert manifest.read_bytes() == before and runner.calls == []
-    with pytest.raises(service.ServiceError, match='legacy_model_worker'):
-        service.ensure_reporter_service(**values, **profile)
 
 
 def test_manager_configuration_is_hidden_bounded_and_shell_free(installation):
@@ -237,21 +327,13 @@ def test_service_uses_gh_login_without_copying_temporary_token(installation, mon
     assert not (values['state'] / 'credentials.env').exists()
 
 
-def test_explicit_save_token_never_enters_manager_configuration_or_result(installation, monkeypatch):
+def test_removed_token_copy_option_cannot_write_credentials(installation, monkeypatch):
     values, runner = installation
-    secret = "private-token-saving-fixture"
-    monkeypatch.setenv("GH_TOKEN", secret)
-    result = service.install_service(**values, save_token=True)
-    config = json.loads(Path(result["manifest"]).read_text())
-    credentials = Path(config["environment_file"])
-    assert credentials.read_text() == "GH_TOKEN=" + secret + "\n"
-    assert secret not in json.dumps(result) + Path(result["manifest"]).read_text() + Path(result["unit"]).read_text()
-    assert all(secret not in script for script in scripts(runner))
-    if sys.platform == "win32":
-        assert any("SetAccessRuleProtection($true,$false)" in script for script in scripts(runner))
-        assert all(".SetOwner(" not in script for script in scripts(runner))  # DACL change must not require WRITE_OWNER.
-    elif os.name != "nt":
-        assert credentials.stat().st_mode & 0o777 == 0o600
+    monkeypatch.setenv('GH_TOKEN', 'private-token-saving-fixture')
+    with pytest.raises(TypeError, match='save_token'):
+        service.install_service(**values, save_token=True)
+    assert runner.calls == []
+    assert not values['state'].exists()
 
 
 def test_existing_private_file_is_not_read_by_installer(installation, monkeypatch):
@@ -307,15 +389,9 @@ def test_isolated_profiles_have_distinct_manager_names(installation):
     assert first[1] != second[1]
 
 
-def test_central_bot_service_requires_grok_and_accepts_no_log_roots(installation):
+def test_missing_policy_rejected_without_manager_mutation(installation):
     values, runner = installation
-    with pytest.raises(service.ServiceError, match="central_bot_does_not_watch_local_logs"):
-        service.install_service(**{**values, "central_bot": True})
-    with pytest.raises(service.ServiceError, match="central_bot_requires_grok"):
-        service.install_service(**{**values, "roots": [], "central_bot": True})
-    result = service.install_service(**{**values, "roots": [], "central_bot": True,
-                                        "grok": values["gh"], "grok_home": values["state"] / "bot-home",
-                                        "grok_work": values["state"] / "bot-work"})
-    config = json.loads(Path(result["manifest"]).read_text())
-    assert config["argv"][:2] == ["worker", "--central-bot"]
-    assert "--root" not in config["argv"]
+    with pytest.raises(service.ServiceError, match='reporting_config_required'):
+        service.install_service(**{**values, 'reporting_config': None})
+    assert runner.calls == []
+    assert not values['unit_dir'].exists()

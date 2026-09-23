@@ -1,8 +1,10 @@
 # MindIE diagnostics
 
 Bounded local logs and independently enabled automatic GitHub Issues for
-MindIE tool failures. This package has no model dependency. It does not capture
-transcripts or retry business operations.
+MindIE tool failures. Every executable diagnostics path is model-free. It does
+not capture transcripts or retry business operations. The knowledge-review
+Grok Bot desktop application is a separate product and is not a diagnostics
+command.
 
 ## Use
 
@@ -29,8 +31,8 @@ Use `--config /absolute/reporting.json` for an isolated policy. The default is
 `MINDIE_DIAGNOSTICS_CONFIG` also selects this file. Queue, receipts, health and
 runtime are stored beside that policy; adapter runtimes are not borrowed by the
 service. `reporting ensure --unit-dir /absolute/directory` isolates a native
-service for acceptance. It cannot replace a legacy model worker or another
-reporting authorization.
+service for acceptance. It installs the pure reporter and cannot replace
+another reporting authorization.
 
 `reporting status` is read-only. It includes recent local incident references
 even when reporting is off, authorization, queue results and worker health.
@@ -107,8 +109,25 @@ be proved. There is no separate cleanup daemon or transcript scan.
 
 ```sh
 python -m mindie_diagnostics.cli reporting maintain
+python -m mindie_diagnostics.cli reporting maintain --update-running
 python -m mindie_diagnostics.cli bundle --root /absolute/log-root --operation-id INCIDENT
 ```
+
+`reporting maintain` stays offline unless `--update-running` is passed.
+`--update-running` is optional. It affects only an already enabled, healthy
+worker, and only to adopt a higher semantic version of the installed runtime.
+It does not start or revive a stopped or unhealthy worker. `--unit-dir` is the
+optional owned service directory for that inspection. There is no automatic
+revival.
+
+Adapters pass their remaining time through `--budget-seconds`; maintenance
+caps this at 75 seconds and deducts time already spent on local cleanup.
+Insufficient time skips the handoff before changing the service. A failed
+target is recorded and suppressed on later automatic checks; inspect status
+and use an explicit `reporting ensure` to recover. Automatic maintenance never
+downgrades the shared worker, and different content with the same version
+reports a conflict. Failure results retain the system action and return code
+when available, without exposing raw commands or stderr.
 
 Bundle export is local and does not upload. Normal updater logs go to structured
 state / bounded diagnostics, not indefinitely appended service log files.
@@ -120,6 +139,5 @@ host behavior, GitHub delivery or Windows hardware acceptance. Real macOS
 process, rotation, Issue and native adapter evidence is recorded separately.
 Windows hardware remains deferred to the user's dedicated environment.
 
-Older explicit service/bot entry points are not used by this reporting feature.
-The knowledge-review Grok Bot desktop application is a separate product; new
-reporting enable/ensure never starts a Grok CLI or paid diagnosis task.
+Diagnostics commands do not launch a model. The desktop Grok Bot remains an
+external application and is not an entry point of this package.

@@ -494,7 +494,7 @@ def publish_one(queue: Outbox, github: GitHub) -> dict[str, Any]:
         queue.update(item, state="published", issue_number=reply["number"], issue_url=reply["html_url"], last_error=None)
         return {"status": "published", "issue_url": reply["html_url"]}
     except ConsentWithdrawn:
-        queue.update(item, state="withdrawn", diagnosis_state="withdrawn",
+        queue.update(item, state="withdrawn",
                      last_error="submission_uncertain_reporting_consent_withdrawn" if item["state"] == "uncertain" else "reporting_consent_unavailable_or_withdrawn")
         return {"status": "withdrawn"}
     except TransportError as exc:

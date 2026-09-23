@@ -1,4 +1,4 @@
-"""Support bundle and independent reporter/bot worker commands."""
+"""Support bundle and independent reporter worker commands."""
 from __future__ import annotations
 
 import argparse
@@ -13,9 +13,9 @@ from .outbox import Outbox
 from .reporter import DEFAULT_REPOSITORY, GitHub, ingest, publish_one
 
 
-def run_cycle(args, queue, github, recorder, health, grok=None, bot_queue=None, *, since=None):
+def run_cycle(args, queue, github, recorder, health, *, since=None):
     """Independent stages: a full intake queue must still be able to drain."""
-    result = {'ingestion': [], 'retention': [], 'reporter': None, 'bot': None, 'status': 'ok'}
+    result = {'ingestion': [], 'retention': [], 'reporter': None, 'status': 'ok'}
     with recorder.operation('worker.cycle') as operation:
         def attempt(stage, function):
             health.update(status='running', stage=stage)
@@ -32,25 +32,13 @@ def run_cycle(args, queue, github, recorder, health, grok=None, bot_queue=None, 
                 operation.fail('diagnostics', exception=exc)
                 return {'status': 'degraded', 'error_type': type(exc).__name__}
 
-        if getattr(args, 'central_bot', False):
-            from .bot import diagnose_one, enqueue_public_issues
-            result['bot_ingestion'] = attempt('bot.public_ingest', lambda: {'enqueued': enqueue_public_issues(github, bot_queue)})
-            result['bot'] = attempt('diagnose', lambda: diagnose_one(bot_queue, github, grok, public_repository=github.repository))
-        else:
-            from .maintenance import prune
-            queue.maintain()
-            result['consent'] = attempt('consent', lambda: {'withdrawn': queue.withdraw_unconsented()})
-            if bot_queue is not None:
-                result['bot_consent'] = attempt('bot.consent', lambda: {'withdrawn': bot_queue.withdraw_unconsented()})
-            for root in args.root:
-                result['ingestion'].append(attempt('ingest', lambda: ingest(root, queue, since=since)))
-                result['retention'].append(attempt('retention', lambda: prune(root, queue=queue)))
-            result['reporter'] = attempt('report', lambda: publish_one(queue, github))
-        if grok and bot_queue and not getattr(args, 'central_bot', False):
-            from .bot import diagnose_one, enqueue_issues
-            # Intake failure must not prevent already queued diagnoses.
-            result['bot_ingestion'] = attempt('bot.ingest', lambda: {'enqueued': enqueue_issues(github, bot_queue, source=queue)})
-            result['bot'] = attempt('diagnose', lambda: diagnose_one(bot_queue, github, grok))
+        from .maintenance import prune
+        queue.maintain()
+        result['consent'] = attempt('consent', lambda: {'withdrawn': queue.withdraw_unconsented()})
+        for root in args.root:
+            result['ingestion'].append(attempt('ingest', lambda: ingest(root, queue, since=since)))
+            result['retention'].append(attempt('retention', lambda: prune(root, queue=queue)))
+        result['reporter'] = attempt('report', lambda: publish_one(queue, github))
     health.update(status='idle' if result['status'] == 'ok' else 'degraded', stage='waiting', last_cycle=result)
     return result
 
@@ -64,8 +52,6 @@ def parser() -> argparse.ArgumentParser:
     bundle.add_argument("--output")
     status = sub.add_parser("status", help="inspect the local publishing queue without network access")
     status.add_argument("--state", required=True)
-    profile = sub.add_parser("grok-profile", help="create a dedicated tool-disabled Grok profile; existing personal config is never replaced")
-    profile.add_argument("--home", required=True)
     service = sub.add_parser('service', help='explicitly install, inspect or remove a supervised user worker')
     service_sub = service.add_subparsers(dest='action', required=True)
     install = argparse.ArgumentParser(add_help=False)
@@ -74,32 +60,24 @@ def parser() -> argparse.ArgumentParser:
     install.add_argument('--repository', default=DEFAULT_REPOSITORY)
     install.add_argument('--python')
     install.add_argument('--gh')
-    install.add_argument('--grok')
-    install.add_argument('--grok-home')
-    install.add_argument('--grok-work')
     install.add_argument('--interval', type=float, default=60)
     install.add_argument('--since')
     install.add_argument('--environment-file', help='optional private 0600 systemd environment file; contents are never logged')
-    install.add_argument('--save-token', action='store_true', help='explicitly save the current GitHub token into a private worker credential file')
     install.add_argument('--no-start', action='store_true')
-    install.add_argument('--central-bot', action='store_true', help='maintainer mode: diagnose already-public issues; do not ingest or upload local logs')
+    install.add_argument('--reporting-config', required=True, help='independent reporting policy; required')
     service_sub.add_parser('install', parents=[install])
     service_sub.add_parser('ensure', parents=[install], help='add roots to the owned local reporter while retaining state and credentials')
     service_sub.add_parser('status')
     service_sub.add_parser('remove')
-    worker = sub.add_parser("worker", help="enable local failure reporting and optional Grok diagnosis")
-    worker.add_argument("--root", action="append", default=[], help="explicit diagnostic root; repeat for multiple components/workspaces")
+    worker = sub.add_parser("worker", help="run the local pure reporter under an independent reporting policy")
+    worker.add_argument("--root", action="append", default=[], help="accepted on the command line; each cycle uses the reporting policy roots")
     worker.add_argument("--state", required=True)
     worker.add_argument("--repository", default=DEFAULT_REPOSITORY)
     worker.add_argument("--gh", default="gh")
-    worker.add_argument("--grok", help="optional Grok executable; uses a dedicated existing authenticated profile")
-    worker.add_argument("--grok-home")
-    worker.add_argument("--grok-work")
     worker.add_argument("--once", action="store_true")
     worker.add_argument("--interval", type=float, default=60)
     worker.add_argument("--since", help="optional fixed UTC start timestamp; older logs remain local")
-    worker.add_argument('--central-bot', action='store_true', help='explicit maintainer authorization to diagnose public issues in a separate state directory')
-    worker.add_argument('--reporting-config', help='independent reporting policy; pure reporter only')
+    worker.add_argument('--reporting-config', required=True, help='independent reporting policy; required')
     reporting = sub.add_parser('reporting', help='independent local fault logging and optional public reporting')
     actions = reporting.add_subparsers(dest='action', required=True)
     for name in ('status', 'configure', 'ensure', 'maintain'):
@@ -107,6 +85,12 @@ def parser() -> argparse.ArgumentParser:
         command.add_argument('--config')
         if name == 'ensure':
             command.add_argument('--unit-dir', help='explicit owned service directory for isolated installation')
+        if name == 'maintain':
+            command.add_argument('--update-running', action='store_true',
+                                 help='inspect an already enabled healthy worker for a higher runtime version; does not start a stopped worker')
+            command.add_argument('--unit-dir', help='owned service directory for that inspection')
+            command.add_argument('--budget-seconds', type=float, default=75,
+                                 help='absolute seconds shared by offline maintenance and the optional handoff; capped at 75')
         if name == 'configure':
             command.add_argument('--enabled', choices=('true', 'false'), required=True)
             command.add_argument('--repository', default=DEFAULT_REPOSITORY)
@@ -128,7 +112,8 @@ def main(argv: list[str] | None = None) -> int:
             elif args.action == 'ensure':
                 result = ensure(args.config, unit_dir=args.unit_dir)
             else:
-                result = maintain(args.config)
+                result = maintain(args.config, update_running=args.update_running, unit_dir=args.unit_dir,
+                                  budget_seconds=args.budget_seconds)
         except Exception as exc:
             result = {'status': 'degraded', 'category': 'reporting_operation_failed', 'error_type': type(exc).__name__}
         print(json.dumps(result, ensure_ascii=True))
@@ -139,11 +124,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.action in {'install', 'ensure'}:
                 action = ensure_reporter_service if args.action == 'ensure' else install_service
                 result = action(args.root, args.state, args.repository, python=args.python, gh=args.gh,
-                                         grok=args.grok, grok_home=args.grok_home, grok_work=args.grok_work,
-                                         interval=args.interval, since=args.since, environment_file=args.environment_file,
-                                         save_token=args.save_token,
-                                         central_bot=args.central_bot,
-                                         start=not args.no_start)
+                                interval=args.interval, since=args.since, environment_file=args.environment_file,
+                                start=not args.no_start, reporting_config=args.reporting_config)
             else:
                 result = service_status() if args.action == 'status' else remove_service()
         except ServiceError as exc:
@@ -156,18 +138,11 @@ def main(argv: list[str] | None = None) -> int:
         from .bundle import collect_bundle
         print(json.dumps(collect_bundle(args.root, operation_id=args.operation_id, output=args.output), ensure_ascii=True))
         return 0
-    if args.command == "grok-profile":
-        from .bot import prepare_profile
-        home = prepare_profile(args.home)
-        print(json.dumps({"home": str(home), "authentication": "Run grok login with GROK_HOME set to this directory."}))
-        return 0
     state = Path(args.state).resolve()
     if args.command == "status":
         from .health import read_health
-        result = {'worker': read_health(state)}
-        for name in ("reporter", "bot", "central-bot"):
-            path = state / f"{name}.sqlite3"
-            result[name] = Outbox(path).rows() if path.exists() else []
+        path = state / "reporter.sqlite3"
+        result = {'worker': read_health(state), 'reporter': Outbox(path).rows() if path.exists() else []}
         print(json.dumps(result, ensure_ascii=True))
         return 0
     if args.interval < 5:
@@ -181,43 +156,31 @@ def main(argv: list[str] | None = None) -> int:
             since = parsed.timestamp()
         except ValueError:
             parser().error('--since must be an ISO timestamp with a timezone')
-    if args.grok and not (args.grok_home and args.grok_work):
-        parser().error("--grok requires --grok-home and --grok-work")
-    if args.central_bot and (args.root or not args.grok):
-        parser().error('--central-bot requires --grok and does not accept local --root inputs')
-    if not args.central_bot and not args.root:
-        parser().error('a local reporting worker requires --root')
-    if args.reporting_config:
-        from . import fallback as f
-        if args.grok or args.central_bot:
-            parser().error('independent reporting refuses model or central-bot options')
-        policy = f.read_policy(args.reporting_config)
-        if policy is None or policy['repository'] != args.repository or Path(args.state).absolute() != f.state_path(args.reporting_config):
-            print(json.dumps({'status': 'configuration_unavailable', 'category': 'reporting_policy_mismatch'}))
-            return 1
-        os.environ['MINDIE_DIAGNOSTICS_CONFIG'] = str(f.policy_path(args.reporting_config))
-        args.root = policy['roots']
+    from . import fallback as f
+    policy = f.read_policy(args.reporting_config)
+    if (policy is None or policy['repository'] != args.repository
+            or Path(args.state).absolute() != f.state_path(args.reporting_config)):
+        print(json.dumps({'status': 'configuration_unavailable', 'category': 'reporting_policy_mismatch'}))
+        return 1
+    os.environ['MINDIE_DIAGNOSTICS_CONFIG'] = str(f.policy_path(args.reporting_config))
+    args.root = list(policy['roots'])
     from . import configure, __version__
     recorder = configure("mindie-diagnostics", root=state / "diagnostics", version=__version__)
-    queue = None if args.central_bot else Outbox(state / "reporter.sqlite3")
+    queue = Outbox(state / "reporter.sqlite3")
     stop = threading.Event()
     github = GitHub(args.repository, executable=args.gh, cancel=stop)
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, lambda *_: stop.set())
-    grok = bot_queue = None
-    if args.grok:
-        from .bot import Grok
-        grok, bot_queue = Grok(args.grok, home=args.grok_home, work=args.grok_work), Outbox(state / ('central-bot.sqlite3' if args.central_bot else 'bot.sqlite3'))
     from .health import Health
     with Health(state, recorder, interval=args.interval) as health:
         while not stop.is_set():
-            if args.reporting_config:
-                policy = f.read_policy(args.reporting_config)
-                if policy is None or policy['decision'] != 'enabled' or policy['repository'] != args.repository:
-                    queue.withdraw_unconsented()
-                    return 0
-                args.root = policy['roots']
-            result = run_cycle(args, queue, github, recorder, health, grok, bot_queue, since=since)
+            policy = f.read_policy(args.reporting_config)
+            if (policy is None or policy['decision'] != 'enabled' or policy['repository'] != args.repository
+                    or Path(args.state).absolute() != f.state_path(args.reporting_config)):
+                queue.withdraw_unconsented()
+                return 0
+            args.root = list(policy['roots'])
+            result = run_cycle(args, queue, github, recorder, health, since=since)
             print(json.dumps(result, ensure_ascii=True), flush=True)
             if args.once:
                 return int(result['status'] != 'ok')

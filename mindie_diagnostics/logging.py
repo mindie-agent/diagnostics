@@ -19,7 +19,6 @@ import uuid
 import weakref
 
 from .context import bind_context, current_context
-from .community import current_consent
 from .redact import redact_text
 from .reader_registry import reader_guard, cursor_snapshot, fully_consumed, pressure_blocked
 
@@ -360,8 +359,7 @@ class Recorder:
             if logger is None:
                 self.dropped_records += 1
                 return
-            event = {"community": current_consent() if "community" not in event else event["community"],
-                     **event, **self.package, "process_instance_id": self._process_id}
+            event = {**event, **self.package, "process_instance_id": self._process_id}
             encoded = json.dumps(event, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
             if len(encoded.encode("utf-8")) > MAX_RECORD_BYTES:
                 event = {**event, "attributes": {"attributes_omitted": True}}
@@ -428,11 +426,9 @@ class Operation:
         self._failure = {}
         self._phases = []
         self.parent_phase_id = None
-        self._community = None
 
     def __enter__(self):
         inherited = current_context()
-        self._community = self._parent._community if self._parent else current_consent()
         self.parent_phase_id = inherited.get("phase_id") if self._parent else None
         self.trace_id = inherited.get("trace_id") or (self._parent.trace_id if self._parent else None) or uuid.uuid4().hex
         self.parent_operation_id = self._parent.parent_operation_id if self._parent else inherited.get("operation_id")
@@ -477,7 +473,6 @@ class Operation:
                        "operation": self._parent.name if self._parent else self.name,
                        "status": self.status, "duration_ms": self._duration(),
                        "attributes": _attributes(attributes)}
-            payload["community"] = self._community
             if self.phase_id:
                 payload.update(phase_id=self.phase_id, phase=self.name, parent_phase_id=self.parent_phase_id)
             # Preserve bounded structured traceback beyond the generic shallow attrs.

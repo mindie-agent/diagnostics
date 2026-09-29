@@ -234,6 +234,36 @@ def fully_consumed(snapshot, path, inode, size) -> bool:
     return True
 
 
+class PressureReader:
+    """Reuse an unchanged pressure marker on an already-open log segment.
+
+    Check its identity on every write, so creation, replacement, edits and
+    deletion take effect immediately. Full directory validation is repeated
+    on changes and before opening/recycling a segment. Writes in between use
+    the existing descriptor, never a cached pathname to open another file.
+    """
+
+    def __init__(self, root):
+        self.root = Path(root)
+        self.path = self.root / 'retention-state.json'
+        self.signature = object()
+        self.blocked = True
+
+    def __call__(self, *, force=False):
+        try:
+            info = self.path.lstat()
+            signature = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
+                         info.st_ctime_ns, info.st_mode, info.st_nlink)
+        except FileNotFoundError:
+            signature = None
+        except OSError:
+            return True
+        if force or signature != self.signature:
+            self.blocked = pressure_blocked(self.root)
+            self.signature = signature
+        return self.blocked
+
+
 def pressure_blocked(root) -> bool:
     """Offline-maintenance backpressure, not an instantaneous global quota."""
     try:

@@ -20,7 +20,7 @@ import weakref
 
 from .context import bind_context, current_context
 from .redact import redact_text
-from .reader_registry import reader_guard, cursor_snapshot, fully_consumed, pressure_blocked
+from .reader_registry import reader_guard, cursor_snapshot, fully_consumed, PressureReader
 
 SCHEMA = 1
 MAX_RECORD_BYTES = 16_384
@@ -152,6 +152,7 @@ class _Handler(std_logging.Handler):
         super().__init__()
         self.recorder = recorder
         self.root = Path(filename).parent.parent.parent
+        self.pressure = PressureReader(self.root)
         base = Path(filename)
         self.paths = [base] + [base.with_name(base.name + '.' + str(i))
                               for i in range(1, BACKUP_COUNT + 1)]
@@ -260,12 +261,13 @@ class _Handler(std_logging.Handler):
             if len(raw) > MAX_LOG_BYTES:
                 self._drop()
                 return
-            blocked = pressure_blocked(self.root)
+            blocked = self.pressure()
             present = os.fstat(self.stream.fileno()).st_size if self.stream is not None else 0
             cap = MAX_LOG_BYTES
             if blocked:
                 cap = min(cap, self.credit if self.credit is not None else present)
             if self.stream is None or present + len(raw) > cap:
+                blocked = self.pressure(force=True)
                 if not self._select(len(raw), blocked):
                     self._drop()
                     return

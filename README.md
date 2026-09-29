@@ -6,6 +6,11 @@ not capture transcripts or retry business operations. The knowledge-review
 Grok Bot desktop application is a separate product and is not a diagnostics
 command.
 
+Active log writers stat the pressure marker once per record and reuse its
+unchanged result. Creation, replacement, modification and deletion apply on
+the next record; directory validation runs on changes and before segment
+creation or recycling. Stable writes use their existing file descriptor.
+
 ## Use
 
 Install the reviewed revision in an existing Python 3.11+ runtime. Adapters

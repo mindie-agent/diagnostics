@@ -1,8 +1,6 @@
-<p align="center">
-  <img src="https://raw.githubusercontent.com/mindie-agent/mindie-agent/main/assets/brand/mindie-agent-logo.png" alt="MindIE Agent logo" width="128" height="128">
-</p>
-
 # MindIE diagnostics
+
+Part of [MindIE Agent](https://github.com/mindie-agent/mindie-agent).
 
 Bounded local logs and independently enabled automatic GitHub Issues for
 MindIE tool failures. Every executable diagnostics path is model-free. It does

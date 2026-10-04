@@ -43,10 +43,13 @@ def maintain(config=None, *, update_running=False, unit_dir=None, budget_seconds
     deadline = time.monotonic() + min(float(budget_seconds), 75.0)
     if f._as_local_absolute(f.policy_path(config)) is None:
         raise ValueError('invalid_configuration')
-    policy = f.read_policy(config)
+    try:
+        policy = f.read_policy(config)
+    except f.PolicyUnavailable:
+        return {'status': 'configuration_unavailable', 'category': 'reporting_policy_unavailable', 'network': False}
     roots = policy['roots'] if policy else [str(f.default_root())]
     path = f.state_path(config) / 'reporter.sqlite3'
-    queue = Outbox(path) if path.exists() else None
+    queue = Outbox(path) if f._lstat_or_missing(path) is not None else None
     result = {'status': 'ok', 'network': False, 'ingestion': [], 'retention': []}
     if queue is not None:
         queue.maintain()
@@ -77,7 +80,10 @@ def maintain(config=None, *, update_running=False, unit_dir=None, budget_seconds
 
 def ensure(config=None, *, unit_dir=None):
     """Explicitly choose installed source and start the one owned pure reporter."""
-    policy = f.read_policy(config)
+    try:
+        policy = f.read_policy(config)
+    except f.PolicyUnavailable:
+        return {'status': 'configuration_unavailable', 'category': 'reporting_policy_unavailable'}
     if policy is None:
         return {'status': 'configuration_unavailable', 'category': 'reporting_not_configured'}
     if policy['decision'] != 'enabled':
@@ -123,8 +129,11 @@ def ensure(config=None, *, unit_dir=None):
                         _write_update_record(root, runtime['source_hash'],
                             {**record, 'status': 'updated', 'recovery': 'explicit_ensure',
                              'finished_at': _utcnow()})
-                except (OSError, RuntimeError):
-                    pass
+                except (OSError, RuntimeError) as exc:
+                    return {'status': 'degraded', 'category': 'recovery_record_failed',
+                            'operation_completed': True, 'runtime': runtime, 'service': native,
+                            'service_status': native_status, 'worker': worker,
+                            'recording_error': type(exc).__name__}
             return {'status': 'running' if ready else 'degraded',
                     'runtime': runtime, 'service': native, 'service_status': native_status, 'worker': worker,
                     'recovery_hint': 'Inspect reporting status; an explicit reporting ensure may restart a stopped worker.'}
@@ -231,6 +240,8 @@ def upgrade_running(config=None, *, unit_dir=None, deadline=None):
             return {'status': 'skipped', 'reason': 'reporter_service_not_running',
                     'service_status': native.get('status')}
         worker = _worker_view(config)
+        if worker.get('status') == 'unavailable':
+            return {'status': 'degraded', 'reason': 'reporter_worker_unavailable'}
         if not worker.get('healthy'):
             return {'status': 'skipped', 'reason': 'reporter_worker_not_running',
                     'worker_status': worker.get('status')}

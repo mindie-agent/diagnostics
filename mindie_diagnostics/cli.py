@@ -22,7 +22,7 @@ def run_cycle(args, queue, github, recorder, health, *, since=None):
             try:
                 with operation.phase(stage):
                     value = function()
-                if value.get('status') in {'retry', 'uncertain', 'blocked', 'rate_limited', 'exhausted', 'permanent-failed'} or value.get('limited'):
+                if value.get('status') in {'recording_failed', 'retry', 'uncertain', 'blocked', 'rate_limited', 'exhausted', 'permanent-failed'} or value.get('limited'):
                     result['status'] = 'degraded'
                     operation.event('WARNING', 'worker.stage_degraded', stage=stage,
                                     error_code=value.get('error'))
@@ -141,8 +141,9 @@ def main(argv: list[str] | None = None) -> int:
     state = Path(args.state).resolve()
     if args.command == "status":
         from .health import read_health
+        from .fallback import _lstat_or_missing
         path = state / "reporter.sqlite3"
-        result = {'worker': read_health(state), 'reporter': Outbox(path).rows() if path.exists() else []}
+        result = {'worker': read_health(state), 'reporter': Outbox(path).rows() if _lstat_or_missing(path) is not None else []}
         print(json.dumps(result, ensure_ascii=True))
         return 0
     if args.interval < 5:
@@ -157,7 +158,11 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError:
             parser().error('--since must be an ISO timestamp with a timezone')
     from . import fallback as f
-    policy = f.read_policy(args.reporting_config)
+    try:
+        policy = f.read_policy(args.reporting_config)
+    except f.PolicyUnavailable:
+        print(json.dumps({'status': 'configuration_unavailable', 'category': 'reporting_policy_unavailable'}))
+        return 1
     if (policy is None or policy['repository'] != args.repository
             or Path(args.state).absolute() != f.state_path(args.reporting_config)):
         print(json.dumps({'status': 'configuration_unavailable', 'category': 'reporting_policy_mismatch'}))
@@ -174,7 +179,16 @@ def main(argv: list[str] | None = None) -> int:
     from .health import Health
     with Health(state, recorder, interval=args.interval) as health:
         while not stop.is_set():
-            policy = f.read_policy(args.reporting_config)
+            try:
+                policy = f.read_policy(args.reporting_config)
+            except f.PolicyUnavailable:
+                health.update(status='failed', stage='configuration')
+                print(json.dumps({'status': 'configuration_unavailable', 'category': 'reporting_policy_unavailable'}), flush=True)
+                return 1
+            if policy is None:
+                health.update(status='failed', stage='configuration')
+                print(json.dumps({'status': 'configuration_unavailable', 'category': 'reporting_policy_missing'}), flush=True)
+                return 1
             if (policy is None or policy['decision'] != 'enabled' or policy['repository'] != args.repository
                     or Path(args.state).absolute() != f.state_path(args.reporting_config)):
                 queue.withdraw_unconsented()

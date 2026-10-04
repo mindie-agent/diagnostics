@@ -351,6 +351,8 @@ def configure_reporting(enabled, *, repository="mindie-agent/mindie-agent", conf
             "worker": {"status": "not_checked"},
             "recovery_hint": "Run reporting ensure outside the hook to install or verify the worker.",
         }
+    except f.PolicyUnavailable:
+        return _error("reporting_policy_unavailable")
     except Exception:
         return _error("write_failed")
 
@@ -392,9 +394,8 @@ def _worker_view(config):
         return {"status": "unavailable", "healthy": False}
     path = state / "worker-health.json"
     try:
-        os.lstat(path)
-    except FileNotFoundError:
-        return {"status": "not_started", "healthy": False}
+        if f._lstat_or_missing(path) is None:
+            return {"status": "not_started", "healthy": False}
     except OSError:
         return {"status": "unavailable", "healthy": False}
     raw = f._read_regular_bounded(path, _HEALTH_LIMIT)
@@ -510,9 +511,9 @@ def _read_outbox(config, repository):
         return _queue_absent()
     path = state / "reporter.sqlite3"
     try:
-        info = os.lstat(path)
-    except FileNotFoundError:
-        return _queue_absent()
+        info = f._lstat_or_missing(path)
+        if info is None:
+            return _queue_absent()
     except OSError:
         return _queue_unavailable()
     if os.path.islink(path) or not f._ancestors_are_real_dirs(path):
@@ -580,9 +581,15 @@ def _retention_view(roots):
 
 
 def _runtime_view(config):
-    raw = f._read_regular_bounded(f.policy_path(config).with_suffix('.runtime') / 'current.json', 4096)
+    path = f.policy_path(config).with_suffix('.runtime') / 'current.json'
+    try:
+        if f._lstat_or_missing(path) is None:
+            return {'status': 'not_prepared'}
+    except OSError:
+        return {'status': 'unavailable'}
+    raw = f._read_regular_bounded(path, 4096)
     if raw is None:
-        return {'status': 'not_prepared'}
+        return {'status': 'unavailable'}
     try:
         value = json.loads(raw)
         if not isinstance(value, dict) or value.get('schema') != 1:
@@ -596,7 +603,11 @@ def _runtime_view(config):
 def reporting_status(*, config=None) -> dict:
     """Read-only bounded local faults, policy, worker, and outbox. Creates nothing."""
     from .local_snapshot import recent_failures
-    policy = f.read_policy(config)
+    try:
+        policy = f.read_policy(config)
+    except f.PolicyUnavailable:
+        return {"status": "configuration_unavailable", "category": "reporting_policy_unavailable",
+                "local": {"status": "unavailable", "recent": []}}
     roots = policy["roots"] if policy else [str(f.default_root())]
     local = recent_failures(roots)
     local["retention"] = _retention_view(roots)
@@ -604,9 +615,7 @@ def reporting_status(*, config=None) -> dict:
         path = f._as_local_absolute(f.policy_path(config))
         if path is None:
             return {"status": "configuration_unavailable", "category": "invalid_configuration", "local": local}
-        try:
-            os.lstat(path)
-        except FileNotFoundError:
+        if f._lstat_or_missing(path) is None:
             return {"status": "not_configured", "configuration_path": str(path), "local": local}
         if policy is None:
             return {"status": "configuration_unavailable", "category": "invalid_configuration", "local": local}

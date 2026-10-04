@@ -9,12 +9,16 @@ import sys
 import time
 
 from .bundle import _write_output
+from .fallback import _lstat_or_missing
 
 
 def read_health(state, *, clock=time.time):
     path = Path(state) / 'worker-health.json'
     try:
-        if path.is_symlink() or path.stat().st_size > 65536:
+        info = _lstat_or_missing(path)
+        if info is None:
+            return {'status': 'not_started', 'healthy': False}
+        if path.is_symlink() or info.st_size > 65536:
             raise ValueError('invalid health file')
         data = json.loads(path.read_text(encoding='utf-8'))
         now = clock()
@@ -23,8 +27,6 @@ def read_health(state, *, clock=time.time):
                                     now - data['progress_at'] > max(1200, data['interval'] * 3))
         data['healthy'] = not data['stale'] and not data['progress_stalled'] and data['status'] in {'running', 'idle'}
         return data
-    except FileNotFoundError:
-        return {'status': 'not_started', 'healthy': False}
     except (OSError, ValueError, TypeError, KeyError):
         return {'status': 'unreadable', 'healthy': False}
 
@@ -75,5 +77,4 @@ class Health:
     def __exit__(self, exc_type, exc, tb):
         self.stop.set()
         self.thread.join(timeout=2)
-        self.update(status='failed' if exc_type else 'stopped', stage='stopped')
-
+        self.update(status='failed' if exc_type or self.data['status'] == 'failed' else 'stopped', stage='stopped')

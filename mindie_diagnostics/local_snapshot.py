@@ -28,15 +28,19 @@ def _tail(path):
 def recent_failures(roots):
     """Inspect <=256 entries, eight 16KiB tails, and 150ms; never create files."""
     deadline = time.monotonic() + .15
-    result = {'recent': [], 'truncated': False, 'scanned_files': 0}
+    result = {'recent': [], 'truncated': False, 'scanned_files': 0, 'status': 'ok', 'errors': []}
     files, visited = [], 0
     try:
         for raw in roots[:32]:
             root = f._as_local_absolute(raw)
-            if root is None or not f._ancestors_are_real_dirs(root / 'events' / '_'):
+            if root is None:
+                result['errors'].append({'category': 'invalid_log_root'})
                 continue
             events = root / 'events'
             if not events.exists():
+                continue
+            if not f._ancestors_are_real_dirs(events / '_'):
+                result['errors'].append({'category': 'unsafe_or_unreadable_log_root'})
                 continue
             with os.scandir(events) as folders:
                 for folder in folders:
@@ -69,11 +73,13 @@ def recent_failures(roots):
                 break
             try:
                 data, partial = _tail(name)
-            except OSError:
+            except OSError as exc:
+                result['errors'].append({'category': 'log_read_failed', 'error_type': type(exc).__name__})
                 result['truncated'] = True
                 continue
             result['truncated'] |= partial
             if data is None:
+                result['errors'].append({'category': 'unsafe_log_file'})
                 continue
             result['scanned_files'] += 1
             for line in data.splitlines():
@@ -104,6 +110,9 @@ def recent_failures(roots):
         records.sort(key=lambda row: row.get('timestamp', ''), reverse=True)
         result['recent'] = records[:5]
         result['truncated'] |= len(records) > 5
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError) as exc:
+        result['errors'].append({'category': 'log_scan_failed', 'error_type': type(exc).__name__})
         result['truncated'] = True
+    if result['errors']:
+        result['status'] = 'partial' if result['scanned_files'] else 'unavailable'
     return result

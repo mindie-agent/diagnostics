@@ -10,6 +10,7 @@ publication still reconciles the GitHub marker.
 from __future__ import annotations
 
 import json
+import errno
 import os
 import sqlite3
 import stat
@@ -29,21 +30,8 @@ _TERMINAL_STATES = ("published", "withdrawn", "expired", "exhausted", "blocked",
 _RECEIPT_TOKEN_LIMIT = 128
 
 
-class QueueFull(RuntimeError):
-    pass
-
-
-class Outbox:
-    def __init__(self, path: str | Path, *, capacity: int = 1000, clock=time.time):
-        if type(capacity) is not int or not 1 <= capacity <= 1000:
-            raise ValueError("diagnostic queue capacity must be between 1 and 1000")
-        self.path = Path(path)
-        self._prepare_storage()
-        self.clock = clock
-        self.capacity = capacity
-        with self.connect() as db:
-            db.executescript("""
-                CREATE TABLE IF NOT EXISTS incidents (
+_SCHEMA = """
+                CREATE TABLE incidents (
                     fingerprint TEXT PRIMARY KEY, payload TEXT NOT NULL,
                     first_seen REAL NOT NULL, last_seen REAL NOT NULL,
                     occurrences INTEGER NOT NULL DEFAULT 1,
@@ -51,17 +39,128 @@ class Outbox:
                     next_attempt REAL NOT NULL DEFAULT 0, lease_until REAL NOT NULL DEFAULT 0,
                     lease_token TEXT, issue_number INTEGER, issue_url TEXT, last_error TEXT,
                     consent TEXT);
-                CREATE TABLE IF NOT EXISTS seen (
+                CREATE TABLE seen (
                     operation_id TEXT PRIMARY KEY, observed REAL NOT NULL);
-                CREATE TABLE IF NOT EXISTS publications (at REAL NOT NULL);
-            """)
-            if 'consent' not in {row[1] for row in db.execute('PRAGMA table_info(incidents)')}:
-                raise ValueError('unsupported diagnostic queue schema; use a fresh state directory')
+                CREATE TABLE publications (at REAL NOT NULL);
+            """
+
+class QueueFull(RuntimeError):
+    pass
+
+
+@contextmanager
+def _initialization_lock(path):
+    lock = path.with_name(path.name + '.init.lock')
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or (os.name != 'nt' and info.st_uid != os.getuid()):
+            raise ValueError('unsafe diagnostic initialization lock')
+        if info.st_size == 0:
+            os.write(fd, b'0')
+        if os.name == 'nt':
+            import msvcrt
+            while True:
+                try:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError as exc:
+                    if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                        raise
+                    time.sleep(.01)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if os.name == 'nt':
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+class Outbox:
+    def __init__(self, path: str | Path, *, capacity: int = 1000, clock=time.time):
+        if type(capacity) is not int or not 1 <= capacity <= 1000:
+            raise ValueError("diagnostic queue capacity must be between 1 and 1000")
+        self.path = Path(path).absolute()
+        self._prepare_storage()
+        self.clock = clock
+        self.capacity = capacity
+        with _initialization_lock(self.path):
+            marker = self.path.with_name(self.path.name + '.initialized')
+            if marker.is_symlink():
+                raise ValueError('unsafe diagnostic initialization marker')
+            if marker.exists():
+                info = marker.lstat()
+                if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size != 28
+                        or (os.name != 'nt' and info.st_uid != os.getuid())
+                        or marker.read_bytes() != b'mindie-diagnostics-outbox/1\n'):
+                    raise ValueError('invalid diagnostic initialization marker')
+            fresh = not self.path.exists()
+            if fresh:
+                if marker.exists() or any(self.path.with_name(self.path.name + suffix).exists() for suffix in ('-wal', '-journal', '-shm')) or (self.path.parent / 'worker-health.json').exists():
+                    raise ValueError('diagnostic outbox is missing after initialization; prior outcomes cannot be reconstructed')
+                self._write_marker(marker)
+                descriptor = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+                os.close(descriptor)
+            with self.connect() as db:
+                if fresh:
+                    db.executescript(_SCHEMA)
+                self._validate_schema(db)
+            if not marker.exists():
+                self._write_marker(marker)
         self._restrict_database_file()
+        self._authority_identity = self._current_identity()
+
+    def _validate_schema(self, db):
+        expected_db = sqlite3.connect(':memory:')
+        try:
+            expected_db.executescript(_SCHEMA)
+            for table in ('incidents', 'seen', 'publications'):
+                expected = {row[1]: tuple(row[1:]) for row in expected_db.execute(f'PRAGMA table_info({table})')}
+                actual = {row[1]: tuple(row[1:]) for row in db.execute(f'PRAGMA table_info({table})')}
+                if any(actual.get(name) != value for name, value in expected.items()):
+                    raise ValueError('diagnostic queue schema is incomplete; prior outcomes cannot be reconstructed')
+                for pragma in ('index_list', 'foreign_key_list'):
+                    required = list(expected_db.execute(f'PRAGMA {pragma}({table})'))
+                    found = [tuple(row) for row in db.execute(f'PRAGMA {pragma}({table})')]
+                    if found != required:
+                        raise ValueError('diagnostic queue constraints are incomplete; prior outcomes cannot be reconstructed')
+            self._schema_version = db.execute('PRAGMA schema_version').fetchone()[0]
+        finally:
+            expected_db.close()
+
+    def _current_identity(self):
+        marker = self.path.with_name(self.path.name + '.initialized')
+        rows = []
+        for path in (self.path, marker):
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError('diagnostic authority is not a regular file')
+            rows.append((info.st_dev, info.st_ino))
+        if marker.read_bytes() != b'mindie-diagnostics-outbox/1\n':
+            raise ValueError('diagnostic authority marker is invalid')
+        return tuple(rows)
+
+    @staticmethod
+    def _write_marker(marker):
+        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(b'mindie-diagnostics-outbox/1\n')
+            stream.flush()
+            os.fsync(stream.fileno())
 
     def _prepare_storage(self) -> None:
         """Create only missing parents as owner-only dirs. Never chmod an existing parent."""
         path = self.path
+        if any(parent.is_symlink() for parent in path.parents):
+            raise ValueError("diagnostic queue directory must not traverse symlinks")
         if path.is_symlink():
             raise ValueError("diagnostic queue path must be a regular SQLite file")
         parent = path.parent
@@ -86,12 +185,6 @@ class Outbox:
             if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
                 raise ValueError("diagnostic queue requires an owner-only directory")
         self._reject_unsafe_database_path()
-        try:
-            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
-        except FileExistsError:
-            self._reject_unsafe_database_path()
-        else:
-            os.close(descriptor)
 
     def _reject_unsafe_database_path(self) -> None:
         path = self.path
@@ -112,9 +205,21 @@ class Outbox:
     @contextmanager
     def connect(self):
         self._reject_unsafe_database_path()
-        db = sqlite3.connect(self.path, timeout=0.1)
+        if (hasattr(self, '_authority_identity')
+                and self._current_identity() != self._authority_identity):
+            raise ValueError('diagnostic authority identity changed; prior outcomes cannot be reconstructed')
+        # Never let sqlite create a missing authority during ordinary reads or
+        # mutations. Only the locked first initialization may create this file.
+        db = sqlite3.connect(self.path.as_uri() + '?mode=rw', uri=True, timeout=0.1)
         db.row_factory = sqlite3.Row
-        db.execute("PRAGMA busy_timeout=100")
+        try:
+            if (hasattr(self, '_schema_version')
+                    and db.execute('PRAGMA schema_version').fetchone()[0] != self._schema_version):
+                self._validate_schema(db)
+            db.execute("PRAGMA busy_timeout=100")
+        except BaseException:
+            db.close()
+            raise
         try:
             with db:
                 yield db
@@ -294,13 +399,32 @@ class Outbox:
             ).fetchone()
             if row is None:
                 return None
+            # Validate persisted authority before spending a cycle or leasing
+            # the row. Broken saved consent is not an unscoped old event.
+            consent = self._stored_consent(row["consent"])
+            payload = json.loads(row["payload"])
             attempts = int(row["attempts"]) + 1
             db.execute(
                 "UPDATE incidents SET attempts=?, lease_until=?, lease_token=? WHERE fingerprint=?",
                 (attempts, now + lease_seconds, token, row["fingerprint"]),
             )
-        return {**dict(row), "attempts": attempts, "lease_token": token, "payload": json.loads(row["payload"]),
-                "consent": self._consent(row["consent"])}
+        return {**dict(row), "attempts": attempts, "lease_token": token, "payload": payload,
+                "consent": consent}
+
+    @staticmethod
+    def _stored_consent(raw):
+        if raw is None or raw == "":
+            return None
+        from . import fallback as f
+        from .reporting import ConsentUnavailable
+        try:
+            reference = json.loads(raw)
+        except (ValueError, TypeError) as exc:
+            raise ConsentUnavailable() from exc
+        if (not f.scope_key("saved-reference-validation", reference)
+                or f._as_local_absolute(reference.get("config_file")) is None):
+            raise ConsentUnavailable()
+        return reference
 
     @staticmethod
     def _consent(raw):
@@ -315,7 +439,7 @@ class Outbox:
         This includes entries with no explicit scope. Leases are fenced so an
         overlapping worker cannot publish a revoked item.
         """
-        from .reporting import consent_allowed
+        from .reporting import consent_status, ConsentUnavailable
         with self.connect() as db:
             rows = db.execute(
                 "SELECT fingerprint,consent,state FROM incidents WHERE state NOT IN ('withdrawn','published')"
@@ -324,9 +448,13 @@ class Outbox:
         for row in rows:
             raw = row["consent"]
             if raw not in checked:
-                checked[raw] = consent_allowed(self._consent(raw))
-            if checked[raw]:
+                checked[raw] = consent_status(self._stored_consent(raw))
+            if checked[raw] == "allowed":
                 continue
+            if checked[raw] == "unavailable":
+                # A damaged/missing policy is not a user revocation. Preserve
+                # pending/unknown evidence and its processing budget.
+                raise ConsentUnavailable()
             with self.connect() as db:
                 changed = db.execute(
                     "UPDATE incidents SET state='withdrawn',"

@@ -148,3 +148,17 @@ Windows hardware remains deferred to the user's dedicated environment.
 
 Diagnostics commands do not launch a model. The desktop Grok Bot remains an
 external application and is not an entry point of this package.
+
+Failure observation keeps reporting authorization distinct from policy storage.
+`fallback.read_policy()` returns `None` only when the selected policy is absent;
+an existing malformed, unsafe or unreadable policy raises `PolicyUnavailable`.
+`consent_status()` distinguishes `allowed`, `withdrawn` and `unavailable`.
+Unavailable policy blocks sending and preserves pending evidence and log cursors;
+only a verified disabled or changed authorization withdraws queued work. The
+nonthrowing local recorder still records the original fault independently.
+
+Outbox initialization is serialized and recorded by a small ownership marker.
+An existing empty/incomplete database, or a missing previously initialized
+outbox, is a storage failure. No query or reopen recreates lost publication
+history. A POST intent remains uncertain through policy, reply and local receipt
+failures, and later automatic processing only reconciles the original marker.

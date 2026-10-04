@@ -30,6 +30,20 @@ _TERMINAL_STATES = ("published", "withdrawn", "expired", "exhausted", "blocked",
 _RECEIPT_TOKEN_LIMIT = 128
 
 
+_SCHEMA = """
+                CREATE TABLE incidents (
+                    fingerprint TEXT PRIMARY KEY, payload TEXT NOT NULL,
+                    first_seen REAL NOT NULL, last_seen REAL NOT NULL,
+                    occurrences INTEGER NOT NULL DEFAULT 1,
+                    state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+                    next_attempt REAL NOT NULL DEFAULT 0, lease_until REAL NOT NULL DEFAULT 0,
+                    lease_token TEXT, issue_number INTEGER, issue_url TEXT, last_error TEXT,
+                    consent TEXT);
+                CREATE TABLE seen (
+                    operation_id TEXT PRIMARY KEY, observed REAL NOT NULL);
+                CREATE TABLE publications (at REAL NOT NULL);
+            """
+
 class QueueFull(RuntimeError):
     pass
 
@@ -97,31 +111,42 @@ class Outbox:
                 os.close(descriptor)
             with self.connect() as db:
                 if fresh:
-                    db.executescript("""
-                CREATE TABLE incidents (
-                    fingerprint TEXT PRIMARY KEY, payload TEXT NOT NULL,
-                    first_seen REAL NOT NULL, last_seen REAL NOT NULL,
-                    occurrences INTEGER NOT NULL DEFAULT 1,
-                    state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
-                    next_attempt REAL NOT NULL DEFAULT 0, lease_until REAL NOT NULL DEFAULT 0,
-                    lease_token TEXT, issue_number INTEGER, issue_url TEXT, last_error TEXT,
-                    consent TEXT);
-                CREATE TABLE seen (
-                    operation_id TEXT PRIMARY KEY, observed REAL NOT NULL);
-                CREATE TABLE publications (at REAL NOT NULL);
-            """)
-                required = {
-                    'incidents': {'fingerprint', 'payload', 'first_seen', 'last_seen', 'occurrences', 'state',
-                                  'attempts', 'next_attempt', 'lease_until', 'lease_token', 'issue_number',
-                                  'issue_url', 'last_error', 'consent'},
-                    'seen': {'operation_id', 'observed'}, 'publications': {'at'},
-                }
-                for table, columns in required.items():
-                    if not columns <= {row[1] for row in db.execute('PRAGMA table_info(' + table + ')')}:
-                        raise ValueError('diagnostic queue schema is incomplete; prior outcomes cannot be reconstructed')
+                    db.executescript(_SCHEMA)
+                self._validate_schema(db)
             if not marker.exists():
                 self._write_marker(marker)
         self._restrict_database_file()
+        self._authority_identity = self._current_identity()
+
+    def _validate_schema(self, db):
+        expected_db = sqlite3.connect(':memory:')
+        try:
+            expected_db.executescript(_SCHEMA)
+            for table in ('incidents', 'seen', 'publications'):
+                expected = {row[1]: tuple(row[1:]) for row in expected_db.execute(f'PRAGMA table_info({table})')}
+                actual = {row[1]: tuple(row[1:]) for row in db.execute(f'PRAGMA table_info({table})')}
+                if any(actual.get(name) != value for name, value in expected.items()):
+                    raise ValueError('diagnostic queue schema is incomplete; prior outcomes cannot be reconstructed')
+                for pragma in ('index_list', 'foreign_key_list'):
+                    required = list(expected_db.execute(f'PRAGMA {pragma}({table})'))
+                    found = [tuple(row) for row in db.execute(f'PRAGMA {pragma}({table})')]
+                    if found != required:
+                        raise ValueError('diagnostic queue constraints are incomplete; prior outcomes cannot be reconstructed')
+            self._schema_version = db.execute('PRAGMA schema_version').fetchone()[0]
+        finally:
+            expected_db.close()
+
+    def _current_identity(self):
+        marker = self.path.with_name(self.path.name + '.initialized')
+        rows = []
+        for path in (self.path, marker):
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError('diagnostic authority is not a regular file')
+            rows.append((info.st_dev, info.st_ino))
+        if marker.read_bytes() != b'mindie-diagnostics-outbox/1\n':
+            raise ValueError('diagnostic authority marker is invalid')
+        return tuple(rows)
 
     @staticmethod
     def _write_marker(marker):
@@ -180,11 +205,21 @@ class Outbox:
     @contextmanager
     def connect(self):
         self._reject_unsafe_database_path()
+        if (hasattr(self, '_authority_identity')
+                and self._current_identity() != self._authority_identity):
+            raise ValueError('diagnostic authority identity changed; prior outcomes cannot be reconstructed')
         # Never let sqlite create a missing authority during ordinary reads or
         # mutations. Only the locked first initialization may create this file.
         db = sqlite3.connect(self.path.as_uri() + '?mode=rw', uri=True, timeout=0.1)
         db.row_factory = sqlite3.Row
-        db.execute("PRAGMA busy_timeout=100")
+        try:
+            if (hasattr(self, '_schema_version')
+                    and db.execute('PRAGMA schema_version').fetchone()[0] != self._schema_version):
+                self._validate_schema(db)
+            db.execute("PRAGMA busy_timeout=100")
+        except BaseException:
+            db.close()
+            raise
         try:
             with db:
                 yield db

@@ -100,7 +100,7 @@ def test_outbox_damage_is_not_initialized_as_an_empty_authority(tmp_path, damage
         Outbox(path)
     assert (path.read_bytes() if path.exists() else None) == before
     if damage == 'deleted':
-        with pytest.raises(sqlite3.OperationalError):
+        with pytest.raises((sqlite3.OperationalError, FileNotFoundError)):
             queue.rows()
         assert not path.exists()
 
@@ -175,3 +175,32 @@ def test_external_outcome_survives_receipt_failure(tmp_path, monkeypatch, mode):
     now[0] += 4000
     publish_one(queue, publisher)
     assert publisher.calls.count('post') == (0 if mode == "reconcile" else 1)
+
+
+@pytest.mark.parametrize("damage", ["marker_missing", "marker_changed", "database_replaced", "missing_primary_key"])
+def test_open_outbox_never_uses_replaced_or_incomplete_authority(tmp_path, damage):
+    path = tmp_path / "queue.db"
+    queue = Outbox(path)
+    queue.enqueue('fault', 'a' * 32, {'retained': True})
+    marker = path.with_name(path.name + '.initialized')
+    if damage == 'marker_missing':
+        marker.unlink()
+    elif damage == 'marker_changed':
+        marker.write_bytes(b'bad-marker')
+    elif damage == 'database_replaced':
+        replacement = tmp_path / 'replacement'
+        replacement.write_bytes(path.read_bytes())
+        replacement.replace(path)
+    else:
+        with sqlite3.connect(path) as db:
+            rows = db.execute('SELECT * FROM seen').fetchall()
+            db.execute('DROP TABLE seen')
+            db.execute('CREATE TABLE seen(operation_id TEXT, observed REAL NOT NULL)')
+            db.executemany('INSERT INTO seen VALUES(?,?)', rows)
+    with pytest.raises((ValueError, OSError)):
+        queue.claim()
+    if damage == 'missing_primary_key':
+        with pytest.raises(ValueError, match='schema'):
+            Outbox(path)
+    with sqlite3.connect(path) as db:
+        assert db.execute('SELECT attempts,state FROM incidents').fetchone() == (0, 'pending')

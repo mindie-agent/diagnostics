@@ -49,7 +49,7 @@ def maintain(config=None, *, update_running=False, unit_dir=None, budget_seconds
         return {'status': 'configuration_unavailable', 'category': 'reporting_policy_unavailable', 'network': False}
     roots = policy['roots'] if policy else [str(f.default_root())]
     path = f.state_path(config) / 'reporter.sqlite3'
-    queue = Outbox(path) if path.exists() else None
+    queue = Outbox(path) if f._lstat_or_missing(path) is not None else None
     result = {'status': 'ok', 'network': False, 'ingestion': [], 'retention': []}
     if queue is not None:
         queue.maintain()
@@ -240,6 +240,8 @@ def upgrade_running(config=None, *, unit_dir=None, deadline=None):
             return {'status': 'skipped', 'reason': 'reporter_service_not_running',
                     'service_status': native.get('status')}
         worker = _worker_view(config)
+        if worker.get('status') == 'unavailable':
+            return {'status': 'degraded', 'reason': 'reporter_worker_unavailable'}
         if not worker.get('healthy'):
             return {'status': 'skipped', 'reason': 'reporter_worker_not_running',
                     'worker_status': worker.get('status')}

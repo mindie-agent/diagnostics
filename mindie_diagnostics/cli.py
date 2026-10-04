@@ -141,8 +141,9 @@ def main(argv: list[str] | None = None) -> int:
     state = Path(args.state).resolve()
     if args.command == "status":
         from .health import read_health
+        from .fallback import _lstat_or_missing
         path = state / "reporter.sqlite3"
-        result = {'worker': read_health(state), 'reporter': Outbox(path).rows() if path.exists() else []}
+        result = {'worker': read_health(state), 'reporter': Outbox(path).rows() if _lstat_or_missing(path) is not None else []}
         print(json.dumps(result, ensure_ascii=True))
         return 0
     if args.interval < 5:

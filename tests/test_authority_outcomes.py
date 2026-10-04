@@ -1,5 +1,7 @@
 """Existing policy/queue damage never turns into first use or consent revoke."""
+import errno
 import json
+import os
 import sqlite3
 from pathlib import Path
 
@@ -13,6 +15,125 @@ from mindie_diagnostics.reporting import ConsentUnavailable
 from mindie_diagnostics.reporter import publish_one
 from test_reporting_consent import Publisher, reporting_failure, reporting_policy
 from test_reporter import payload as public_payload
+
+
+@pytest.mark.parametrize('parts', [(), ('missing', 'nested')])
+def test_policy_below_file_is_unavailable_not_unconfigured(tmp_path, parts, capsys):
+    from mindie_diagnostics import cli, reporting_commands as commands
+
+    parent = tmp_path / 'not-a-directory'
+    parent.write_bytes(b'retained file')
+    config = parent.joinpath(*parts, 'diagnostics.json')
+    before = list(tmp_path.iterdir())
+    with pytest.raises(f.PolicyUnavailable):
+        f.read_policy(config)
+    status = reporting_status(config=config)
+    assert status['status'] == 'configuration_unavailable'
+    assert status['category'] == 'reporting_policy_unavailable'
+    assert commands.upgrade_running(config) == {
+        'status': 'degraded', 'reason': 'reporting_policy_unavailable'}
+    assert commands.maintain(config)['category'] == 'reporting_policy_unavailable'
+    assert cli.main(['reporting', 'status', '--config', str(config)]) == 1
+    assert json.loads(capsys.readouterr().out)['category'] == 'reporting_policy_unavailable'
+    assert list(tmp_path.iterdir()) == before and parent.read_bytes() == b'retained file'
+
+
+@pytest.mark.parametrize('parts', [(), ('missing', 'nested')])
+def test_genuinely_missing_policy_remains_read_only_first_use(tmp_path, parts):
+    from mindie_diagnostics import reporting_commands as commands
+
+    config = tmp_path.joinpath(*parts, 'diagnostics.json')
+    before = list(tmp_path.iterdir())
+    assert f.read_policy(config) is None
+    assert reporting_status(config=config)['status'] == 'not_configured'
+    assert commands.upgrade_running(config) == {
+        'status': 'skipped', 'reason': 'reporting_not_configured'}
+    assert list(tmp_path.iterdir()) == before
+
+
+def test_missing_policy_keeps_existing_no_symlink_ancestor_policy(tmp_path):
+    actual = tmp_path / 'actual'
+    actual.mkdir()
+    link = tmp_path / 'linked'
+    try:
+        link.symlink_to(actual, target_is_directory=True)
+    except OSError:
+        pytest.skip('symlink creation unavailable')
+    with pytest.raises(f.PolicyUnavailable):
+        f.read_policy(link / 'missing' / 'diagnostics.json')
+    assert list(actual.iterdir()) == [] and link.is_symlink()
+
+
+@pytest.mark.parametrize('code', [errno.EACCES, errno.EIO])
+def test_missing_policy_preserves_ancestor_io_error(tmp_path, monkeypatch, code):
+    parent = tmp_path / 'unreadable'
+    config = parent / 'diagnostics.json'
+    original_lstat = os.lstat
+    fault = OSError(code, 'synthetic ancestor fault')
+    def lstat(path, *args, **kwargs):
+        if Path(path) == parent:
+            raise fault
+        return original_lstat(path, *args, **kwargs)
+    monkeypatch.setattr(f.os, 'lstat', lstat)
+    with pytest.raises(f.PolicyUnavailable) as caught:
+        f.read_policy(config)
+    assert caught.value.__cause__ is fault
+    assert not parent.exists()
+
+
+def test_missing_policy_without_any_verified_ancestor_is_unavailable(tmp_path, monkeypatch):
+    config = tmp_path / 'missing' / 'diagnostics.json'
+    candidates = {config, *config.parents}
+    original_lstat = os.lstat
+    def lstat(path, *args, **kwargs):
+        if Path(path) in candidates:
+            raise FileNotFoundError(errno.ENOENT, 'synthetic inaccessible root', str(path))
+        return original_lstat(path, *args, **kwargs)
+    with monkeypatch.context() as patch:
+        patch.setattr(f.os, 'lstat', lstat)
+        with pytest.raises(f.PolicyUnavailable):
+            f.read_policy(config)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_file_in_place_of_state_or_runtime_is_not_an_empty_status(tmp_path, capsys):
+    from mindie_diagnostics import cli
+    from mindie_diagnostics.health import read_health
+
+    config = tmp_path / 'diagnostics.json'
+    assert configure_reporting(True, config=config, roots=[str(tmp_path / 'logs')])['status'] == 'configured'
+    state, runtime = config.with_suffix('.state'), config.with_suffix('.runtime')
+    state.write_bytes(b'retained state')
+    runtime.write_bytes(b'retained runtime')
+    status = reporting_status(config=config)
+    assert status['worker']['status'] == 'unavailable'
+    assert status['queue']['status'] == 'unavailable'
+    assert status['runtime']['status'] == 'unavailable'
+    assert read_health(state) == {'status': 'unreadable', 'healthy': False}
+    with pytest.raises(NotADirectoryError):
+        cli.main(['status', '--state', str(state)])
+    assert capsys.readouterr().out == ''
+    assert cli.main(['reporting', 'maintain', '--config', str(config)]) == 1
+    assert json.loads(capsys.readouterr().out)['status'] == 'degraded'
+    assert state.read_bytes() == b'retained state' and runtime.read_bytes() == b'retained runtime'
+
+
+def test_missing_health_queue_and_runtime_do_not_create_state(tmp_path, capsys):
+    from mindie_diagnostics import cli
+    from mindie_diagnostics.health import read_health
+
+    config = tmp_path / 'diagnostics.json'
+    assert configure_reporting(True, config=config, roots=[str(tmp_path / 'logs')])['status'] == 'configured'
+    before = list(tmp_path.iterdir())
+    status = reporting_status(config=config)
+    assert status['worker']['status'] == 'not_started'
+    assert status['queue'] == {'counts': {}, 'recent': []}
+    assert status['runtime']['status'] == 'not_prepared'
+    state = config.with_suffix('.state')
+    assert read_health(state) == {'status': 'not_started', 'healthy': False}
+    assert cli.main(['status', '--state', str(state)]) == 0
+    assert json.loads(capsys.readouterr().out)['reporter'] == []
+    assert list(tmp_path.iterdir()) == before
 
 
 @pytest.mark.parametrize('damage', ['invalid_json', 'empty', 'wrong_type', 'permission'])

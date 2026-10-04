@@ -7,6 +7,7 @@ records exception text, arguments, command lines, or outputs.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
@@ -103,6 +104,29 @@ class PolicyUnavailable(RuntimeError):
         super().__init__("reporting_policy_unavailable")
 
 
+def _lstat_or_missing(path):
+    """Only a missing leaf below a verified directory prefix is first use."""
+    try:
+        return os.lstat(path)
+    except FileNotFoundError:
+        # Windows also reports ENOENT below a regular file. Check the real
+        # prefix without creating it or following forbidden parent symlinks.
+        verified = False
+        for parent in reversed(Path(path).parents):
+            try:
+                info = os.lstat(parent)
+            except FileNotFoundError:
+                if not verified:
+                    raise
+                return None
+            if not stat.S_ISDIR(info.st_mode):
+                raise NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR), str(parent))
+            verified = True
+        if not verified:
+            raise
+        return None
+
+
 def read_policy(config=None):
     """Return a verified policy, None only for absence, or raise visibly.
 
@@ -113,9 +137,7 @@ def read_policy(config=None):
         path = _as_local_absolute(policy_path(config))
         if path is None:
             raise PolicyUnavailable()
-        try:
-            os.lstat(path)
-        except FileNotFoundError:
+        if _lstat_or_missing(path) is None:
             return None
         if not _ancestors_are_real_dirs(path):
             raise PolicyUnavailable()

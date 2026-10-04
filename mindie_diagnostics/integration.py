@@ -394,9 +394,8 @@ def _worker_view(config):
         return {"status": "unavailable", "healthy": False}
     path = state / "worker-health.json"
     try:
-        os.lstat(path)
-    except FileNotFoundError:
-        return {"status": "not_started", "healthy": False}
+        if f._lstat_or_missing(path) is None:
+            return {"status": "not_started", "healthy": False}
     except OSError:
         return {"status": "unavailable", "healthy": False}
     raw = f._read_regular_bounded(path, _HEALTH_LIMIT)
@@ -512,9 +511,9 @@ def _read_outbox(config, repository):
         return _queue_absent()
     path = state / "reporter.sqlite3"
     try:
-        info = os.lstat(path)
-    except FileNotFoundError:
-        return _queue_absent()
+        info = f._lstat_or_missing(path)
+        if info is None:
+            return _queue_absent()
     except OSError:
         return _queue_unavailable()
     if os.path.islink(path) or not f._ancestors_are_real_dirs(path):
@@ -584,9 +583,8 @@ def _retention_view(roots):
 def _runtime_view(config):
     path = f.policy_path(config).with_suffix('.runtime') / 'current.json'
     try:
-        os.lstat(path)
-    except FileNotFoundError:
-        return {'status': 'not_prepared'}
+        if f._lstat_or_missing(path) is None:
+            return {'status': 'not_prepared'}
     except OSError:
         return {'status': 'unavailable'}
     raw = f._read_regular_bounded(path, 4096)
@@ -617,9 +615,7 @@ def reporting_status(*, config=None) -> dict:
         path = f._as_local_absolute(f.policy_path(config))
         if path is None:
             return {"status": "configuration_unavailable", "category": "invalid_configuration", "local": local}
-        try:
-            os.lstat(path)
-        except FileNotFoundError:
+        if f._lstat_or_missing(path) is None:
             return {"status": "not_configured", "configuration_path": str(path), "local": local}
         if policy is None:
             return {"status": "configuration_unavailable", "category": "invalid_configuration", "local": local}

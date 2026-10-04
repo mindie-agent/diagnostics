@@ -364,13 +364,32 @@ class Outbox:
             ).fetchone()
             if row is None:
                 return None
+            # Validate persisted authority before spending a cycle or leasing
+            # the row. Broken saved consent is not an unscoped old event.
+            consent = self._stored_consent(row["consent"])
+            payload = json.loads(row["payload"])
             attempts = int(row["attempts"]) + 1
             db.execute(
                 "UPDATE incidents SET attempts=?, lease_until=?, lease_token=? WHERE fingerprint=?",
                 (attempts, now + lease_seconds, token, row["fingerprint"]),
             )
-        return {**dict(row), "attempts": attempts, "lease_token": token, "payload": json.loads(row["payload"]),
-                "consent": self._consent(row["consent"])}
+        return {**dict(row), "attempts": attempts, "lease_token": token, "payload": payload,
+                "consent": consent}
+
+    @staticmethod
+    def _stored_consent(raw):
+        if raw is None or raw == "":
+            return None
+        from . import fallback as f
+        from .reporting import ConsentUnavailable
+        try:
+            reference = json.loads(raw)
+        except (ValueError, TypeError) as exc:
+            raise ConsentUnavailable() from exc
+        if (not f.scope_key("saved-reference-validation", reference)
+                or f._as_local_absolute(reference.get("config_file")) is None):
+            raise ConsentUnavailable()
+        return reference
 
     @staticmethod
     def _consent(raw):
@@ -394,7 +413,7 @@ class Outbox:
         for row in rows:
             raw = row["consent"]
             if raw not in checked:
-                checked[raw] = consent_status(self._consent(raw))
+                checked[raw] = consent_status(self._stored_consent(raw))
             if checked[raw] == "allowed":
                 continue
             if checked[raw] == "unavailable":

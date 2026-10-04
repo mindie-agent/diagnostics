@@ -113,3 +113,29 @@ def test_unreadable_existing_runtime_pointer_is_not_first_use(tmp_path):
     assert _runtime_view(config)['status'] == 'unavailable'
     pointer.unlink()
     assert _runtime_view(config)['status'] == 'not_prepared'
+
+
+@pytest.mark.parametrize('raw', ['{broken', '[]', 'null', '{}'])
+@pytest.mark.parametrize('state', ['pending', 'uncertain'])
+def test_damaged_saved_consent_keeps_original_row_and_never_publishes(tmp_path, raw, state):
+    config = tmp_path / 'config.json'
+    queue = Outbox(tmp_path / 'queue.db')
+    queue.enqueue('fault', 'a' * 32, {'evidence': 'retained'}, consent=reporting_policy(config))
+    with queue.connect() as db:
+        db.execute('UPDATE incidents SET state=?,consent=?', (state, raw))
+        before = dict(db.execute('SELECT * FROM incidents').fetchone())
+    publisher = Publisher()
+    with pytest.raises(ConsentUnavailable):
+        queue.withdraw_unconsented()
+    with pytest.raises(ConsentUnavailable):
+        publish_one(queue, publisher)
+    with queue.connect() as db:
+        assert dict(db.execute('SELECT * FROM incidents').fetchone()) == before
+    assert publisher.calls == []
+
+
+def test_absent_saved_consent_is_still_an_unreportable_legacy_event(tmp_path):
+    queue = Outbox(tmp_path / 'queue.db')
+    queue.enqueue('legacy', 'a' * 32, {})
+    assert queue.withdraw_unconsented() == 1
+    assert queue.rows()[0]['state'] == 'withdrawn'

@@ -96,19 +96,41 @@ def state_path(config=None) -> Path:
     return policy_path(config).with_suffix(".state")
 
 
+class PolicyUnavailable(RuntimeError):
+    """An existing policy cannot establish an authorization decision."""
+
+    def __init__(self):
+        super().__init__("reporting_policy_unavailable")
+
+
 def read_policy(config=None):
-    """Validate a local reporting policy. Zero writes. None on any doubt."""
+    """Return a verified policy, None only for absence, or raise visibly.
+
+    The recorder's current_consent is deliberately non-throwing; lifecycle,
+    ingestion and reporting callers must distinguish read failure from revoke.
+    """
     try:
         path = _as_local_absolute(policy_path(config))
-        if path is None or not _ancestors_are_real_dirs(path):
+        if path is None:
+            raise PolicyUnavailable()
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
             return None
+        if not _ancestors_are_real_dirs(path):
+            raise PolicyUnavailable()
         raw = _read_regular_bounded(path, _MAX_POLICY_BYTES)
         if raw is None:
-            return None
+            raise PolicyUnavailable()
         data = json.loads(raw.decode("utf-8"))
-        return _validated_policy(data)
-    except Exception:
-        return None
+        policy = _validated_policy(data)
+        if policy is None:
+            raise PolicyUnavailable()
+        return policy
+    except PolicyUnavailable:
+        raise
+    except (OSError, ValueError, TypeError) as exc:
+        raise PolicyUnavailable() from exc
 
 
 def current_consent(config=None):
@@ -128,31 +150,41 @@ def current_consent(config=None):
         return None
 
 
-def consent_allowed(reference) -> bool:
-    """True only when a fresh enabled policy still matches this local reference."""
+def consent_status(reference):
+    """Return allowed/withdrawn/unavailable without conflating read failures."""
     try:
         if set(reference.keys()) != _CONSENT_KEYS:
-            return False
+            return "withdrawn"
         purpose = reference["purpose"]
         repository = reference["repository"]
         revision = reference["revision"]
         config_file = reference["config_file"]
         if purpose != _POLICY_PURPOSE or not _valid_repo(repository):
-            return False
+            return "withdrawn"
         if not isinstance(revision, str) or _INCIDENT_RE.fullmatch(revision) is None:
-            return False
+            return "withdrawn"
         if not isinstance(config_file, str):
-            return False
+            return "withdrawn"
         policy = read_policy(config_file)
-        if not policy or policy.get("decision") != "enabled":
-            return False
-        return (
+        if policy is None:
+            return "unavailable"
+        matches = (
+            policy["decision"] == "enabled"
+            and
             policy["purpose"] == purpose
             and policy["repository"] == repository
             and policy["revision"] == revision
         )
-    except Exception:
-        return False
+        return "allowed" if matches else "withdrawn"
+    except PolicyUnavailable:
+        return "unavailable"
+    except (AttributeError, TypeError, KeyError):
+        return "withdrawn"
+
+
+def consent_allowed(reference) -> bool:
+    """Fail-closed boolean for code needing only permission, never a decision."""
+    return consent_status(reference) == "allowed"
 
 
 def scope_key(public_fingerprint, reference) -> str:

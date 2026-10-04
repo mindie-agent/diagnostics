@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from .outbox import Outbox
-from .reporting import ConsentWithdrawn, check_remote_action, guard_consent, require_consent
+from .reporting import ConsentUnavailable, ConsentWithdrawn, check_remote_action, guard_consent, require_consent
 
 DEFAULT_REPOSITORY = "mindie-agent/mindie-agent"
 MARKER = "<!-- mindie-incident:"
@@ -487,6 +487,7 @@ def publish_one(queue: Outbox, github: GitHub) -> dict[str, Any]:
         title, body = render_issue(item)
         require_consent(item.get("consent"))
         queue.begin_post(item)
+        item["state"] = "uncertain"
         with guard_consent(item.get("consent")):
             reply = github.create_issue(title, body)
         if not _issue_reference(reply, github.repository):
@@ -497,6 +498,12 @@ def publish_one(queue: Outbox, github: GitHub) -> dict[str, Any]:
         queue.update(item, state="withdrawn",
                      last_error="submission_uncertain_reporting_consent_withdrawn" if item["state"] == "uncertain" else "reporting_consent_unavailable_or_withdrawn")
         return {"status": "withdrawn"}
+    except ConsentUnavailable:
+        uncertain = item["state"] == "uncertain"
+        state = "exhausted" if exhausted else "uncertain" if uncertain else "retry"
+        code = ("submission_uncertain_" if uncertain else "") + "reporting_policy_unavailable"
+        queue.update(item, state=state, next_attempt=queue.clock() + 300, last_error=code)
+        return {"status": state, "error": code}
     except TransportError as exc:
         uncertain = exc.uncertain or item["state"] == "uncertain"
         state = "permanent-failed" if exc.permanent else "exhausted" if exhausted else "uncertain" if uncertain else "retry"
@@ -505,8 +512,11 @@ def publish_one(queue: Outbox, github: GitHub) -> dict[str, Any]:
         queue.update(item, state=state, next_attempt=queue.clock() + delay, last_error=code)
         return {"status": state, "error": code}
     except (ValueError, TypeError, KeyError):
-        queue.update(item, state="blocked", last_error="invalid_or_unsafe_diagnostic_payload")
-        return {"status": "blocked", "error": "invalid_or_unsafe_diagnostic_payload"}
+        uncertain = item["state"] == "uncertain"
+        state = "exhausted" if uncertain and exhausted else "uncertain" if uncertain else "blocked"
+        code = "submission_uncertain_invalid_reply" if uncertain else "invalid_or_unsafe_diagnostic_payload"
+        queue.update(item, state=state, next_attempt=queue.clock() + 300, last_error=code)
+        return {"status": state, "error": code}
     finally:
         if started:
             github.end_cycle()

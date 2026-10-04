@@ -75,5 +75,4 @@ class Health:
     def __exit__(self, exc_type, exc, tb):
         self.stop.set()
         self.thread.join(timeout=2)
-        self.update(status='failed' if exc_type else 'stopped', stage='stopped')
-
+        self.update(status='failed' if exc_type or self.data['status'] == 'failed' else 'stopped', stage='stopped')

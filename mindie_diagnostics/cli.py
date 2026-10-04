@@ -157,7 +157,11 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError:
             parser().error('--since must be an ISO timestamp with a timezone')
     from . import fallback as f
-    policy = f.read_policy(args.reporting_config)
+    try:
+        policy = f.read_policy(args.reporting_config)
+    except f.PolicyUnavailable:
+        print(json.dumps({'status': 'configuration_unavailable', 'category': 'reporting_policy_unavailable'}))
+        return 1
     if (policy is None or policy['repository'] != args.repository
             or Path(args.state).absolute() != f.state_path(args.reporting_config)):
         print(json.dumps({'status': 'configuration_unavailable', 'category': 'reporting_policy_mismatch'}))
@@ -174,7 +178,16 @@ def main(argv: list[str] | None = None) -> int:
     from .health import Health
     with Health(state, recorder, interval=args.interval) as health:
         while not stop.is_set():
-            policy = f.read_policy(args.reporting_config)
+            try:
+                policy = f.read_policy(args.reporting_config)
+            except f.PolicyUnavailable:
+                health.update(status='failed', stage='configuration')
+                print(json.dumps({'status': 'configuration_unavailable', 'category': 'reporting_policy_unavailable'}), flush=True)
+                return 1
+            if policy is None:
+                health.update(status='failed', stage='configuration')
+                print(json.dumps({'status': 'configuration_unavailable', 'category': 'reporting_policy_missing'}), flush=True)
+                return 1
             if (policy is None or policy['decision'] != 'enabled' or policy['repository'] != args.repository
                     or Path(args.state).absolute() != f.state_path(args.reporting_config)):
                 queue.withdraw_unconsented()

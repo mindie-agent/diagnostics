@@ -10,7 +10,7 @@ import re
 
 from .bundle import _safe_open, collect_bundle, export_public_event
 from .outbox import Outbox
-from .reporting import consent_allowed, scope_key
+from .reporting import consent_status, ConsentUnavailable, scope_key
 from .reader_registry import register_reader
 
 _FILE = re.compile(r"\d+-[0-9a-f]{32}\.jsonl(?:\.[1-3])?\Z")
@@ -121,7 +121,13 @@ def ingest(root, queue: Outbox, *, max_files=256, max_bytes=8 * 1024 * 1024, sin
                             or attributes.get('classification') in {'caller', 'cancelled'}):
                         counts['caller_errors'] += 1
                         continue
-                    if not consent_allowed(consent):
+                    authorization = consent_status(consent)
+                    if authorization == "unavailable":
+                        # Do not consume/advance past an authorized event whose
+                        # current policy could not be read. A later maintenance
+                        # cycle continues these same bytes after recovery.
+                        raise ConsentUnavailable()
+                    if authorization != "allowed":
                         counts['consent_skipped'] += 1
                         continue
                     records = [row for row, scope in recent if scope == consent and row['operation_id'] == event['operation_id']]

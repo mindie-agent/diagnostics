@@ -70,14 +70,15 @@ def test_repository_mismatch_stops_before_remote_action(tmp_path, reporting_cons
     assert github.reads == github.writes == 0
 
 
-def test_revocation_after_read_stops_before_post(tmp_path, reporting_consent):
+def test_missing_policy_after_read_blocks_post_without_claiming_revocation(tmp_path, reporting_consent):
     queue, _ = queue_at(tmp_path, reporting_consent)
     github = FakeGitHub(reporting_consent['repository'])
     def revoke(item):
         Path(reporting_consent['config_file']).unlink()
         return None
     github.find_issue = revoke
-    assert publish_one(queue, github)['status'] == 'withdrawn'
+    assert publish_one(queue, github)['status'] == 'retry'
+    assert queue.rows()[0]['last_error'] == 'reporting_policy_unavailable'
     assert github.writes == 0
 
 

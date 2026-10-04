@@ -458,6 +458,17 @@ def _issue_reference(reply, repository):
     return reply.get("html_url") == f"https://github.com/{repository}/issues/{reply['number']}"
 
 
+def _record_publication_outcome(queue, item, result, **updates):
+    """Local receipt failure must not erase an acknowledged external result."""
+    try:
+        queue.update(item, **updates)
+    except Exception as exc:
+        return {**result, "publication_status": result["status"], "status": "recording_failed",
+                "local_recording": {"status": "failed", "error_type": type(exc).__name__},
+                "error": result.get("error") or "publication_receipt_failed"}
+    return result
+
+
 def publish_one(queue: Outbox, github: GitHub) -> dict[str, Any]:
     from .outbox import MAX_AUTOMATIC_CYCLES
     item = queue.claim(lease_seconds=github.timeout + 5)
@@ -477,13 +488,14 @@ def publish_one(queue: Outbox, github: GitHub) -> dict[str, Any]:
         if existing:
             if not _issue_reference(existing, github.repository):
                 raise TransportError("github_invalid_issue_reference")
-            queue.update(item, state="published", issue_number=existing["number"], issue_url=existing["html_url"], last_error=None)
-            return {"status": "reconciled", "issue_url": existing["html_url"]}
+            return _record_publication_outcome(queue, item,
+                {"status": "reconciled", "issue_url": existing["html_url"], "operation_completed": True},
+                state="published", issue_number=existing["number"], issue_url=existing["html_url"], last_error=None)
         if item["state"] == "uncertain":
             state = "exhausted" if exhausted else "uncertain"
-            queue.update(item, state=state, next_attempt=queue.clock() + 300,
-                         last_error="submission_uncertain_budget_exhausted" if exhausted else "submission_uncertain_no_match")
-            return {"status": state}
+            return _record_publication_outcome(queue, item, {"status": state, "submission_state": "uncertain"},
+                state=state, next_attempt=queue.clock() + 300,
+                last_error="submission_uncertain_budget_exhausted" if exhausted else "submission_uncertain_no_match")
         title, body = render_issue(item)
         require_consent(item.get("consent"))
         queue.begin_post(item)
@@ -492,31 +504,36 @@ def publish_one(queue: Outbox, github: GitHub) -> dict[str, Any]:
             reply = github.create_issue(title, body)
         if not _issue_reference(reply, github.repository):
             raise TransportError("github_invalid_create_reply", uncertain=True)
-        queue.update(item, state="published", issue_number=reply["number"], issue_url=reply["html_url"], last_error=None)
-        return {"status": "published", "issue_url": reply["html_url"]}
+        return _record_publication_outcome(queue, item,
+            {"status": "published", "issue_url": reply["html_url"], "operation_completed": True},
+            state="published", issue_number=reply["number"], issue_url=reply["html_url"], last_error=None)
     except ConsentWithdrawn:
-        queue.update(item, state="withdrawn",
-                     last_error="submission_uncertain_reporting_consent_withdrawn" if item["state"] == "uncertain" else "reporting_consent_unavailable_or_withdrawn")
-        return {"status": "withdrawn"}
+        uncertain = item["state"] == "uncertain"
+        return _record_publication_outcome(queue, item,
+            {"status": "withdrawn", "submission_state": "uncertain" if uncertain else "not_sent"},
+            state="withdrawn", last_error="submission_uncertain_reporting_consent_withdrawn" if uncertain else "reporting_consent_unavailable_or_withdrawn")
     except ConsentUnavailable:
         uncertain = item["state"] == "uncertain"
         state = "exhausted" if exhausted else "uncertain" if uncertain else "retry"
         code = ("submission_uncertain_" if uncertain else "") + "reporting_policy_unavailable"
-        queue.update(item, state=state, next_attempt=queue.clock() + 300, last_error=code)
-        return {"status": state, "error": code}
+        return _record_publication_outcome(queue, item,
+            {"status": state, "error": code, "submission_state": "uncertain" if uncertain else "not_sent"},
+            state=state, next_attempt=queue.clock() + 300, last_error=code)
     except TransportError as exc:
         uncertain = exc.uncertain or item["state"] == "uncertain"
         state = "permanent-failed" if exc.permanent else "exhausted" if exhausted else "uncertain" if uncertain else "retry"
         code = "submission_uncertain_" + exc.code if uncertain and state in {"permanent-failed", "exhausted"} else exc.code
         delay = max(exc.retry_after, 30 * 2 ** item["attempts"])
-        queue.update(item, state=state, next_attempt=queue.clock() + delay, last_error=code)
-        return {"status": state, "error": code}
+        return _record_publication_outcome(queue, item,
+            {"status": state, "error": code, "submission_state": "uncertain" if uncertain else "not_sent"},
+            state=state, next_attempt=queue.clock() + delay, last_error=code)
     except (ValueError, TypeError, KeyError):
         uncertain = item["state"] == "uncertain"
         state = "exhausted" if uncertain and exhausted else "uncertain" if uncertain else "blocked"
         code = "submission_uncertain_invalid_reply" if uncertain else "invalid_or_unsafe_diagnostic_payload"
-        queue.update(item, state=state, next_attempt=queue.clock() + 300, last_error=code)
-        return {"status": state, "error": code}
+        return _record_publication_outcome(queue, item,
+            {"status": state, "error": code, "submission_state": "uncertain" if uncertain else "not_sent"},
+            state=state, next_attempt=queue.clock() + 300, last_error=code)
     finally:
         if started:
             github.end_cycle()

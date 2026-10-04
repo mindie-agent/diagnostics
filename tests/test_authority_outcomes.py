@@ -139,3 +139,39 @@ def test_absent_saved_consent_is_still_an_unreportable_legacy_event(tmp_path):
     queue.enqueue('legacy', 'a' * 32, {})
     assert queue.withdraw_unconsented() == 1
     assert queue.rows()[0]['state'] == 'withdrawn'
+
+
+@pytest.mark.parametrize("mode", ["ack", "reconcile", "transport_failure"])
+def test_external_outcome_survives_receipt_failure(tmp_path, monkeypatch, mode):
+    from mindie_diagnostics.reporter import TransportError
+    config = tmp_path / 'config.json'
+    consent = reporting_policy(config)
+    now = [1000.]
+    queue = Outbox(tmp_path / 'queue.db', clock=lambda: now[0])
+    queue.enqueue('fault', 'a' * 32, public_payload(), consent=consent)
+    reply = {"number": 7, "html_url": "https://github.com/example/project/issues/7"}
+    class Writer(Publisher):
+        def find_issue(self, item):
+            return reply if mode == "reconcile" else None
+        def create_issue(self, title, body):
+            self.calls.append('post')
+            if mode == "transport_failure":
+                raise TransportError("original_transport_failure", uncertain=True)
+            return reply
+    publisher = Writer()
+    def failed_record(*args, **kwargs):
+        raise sqlite3.OperationalError("synthetic disk failure")
+    original = queue.update
+    monkeypatch.setattr(queue, "update", failed_record)
+    result = publish_one(queue, publisher)
+    assert result["status"] == "recording_failed"
+    assert result["local_recording"]["error_type"] == "OperationalError"
+    if mode == "transport_failure":
+        assert result["error"] == "original_transport_failure" and result["submission_state"] == "uncertain"
+    else:
+        assert result["issue_url"] == reply["html_url"] and result["operation_completed"]
+        assert result["publication_status"] == ("published" if mode == "ack" else "reconciled")
+    monkeypatch.setattr(queue, "update", original)
+    now[0] += 4000
+    publish_one(queue, publisher)
+    assert publisher.calls.count('post') == (0 if mode == "reconcile" else 1)

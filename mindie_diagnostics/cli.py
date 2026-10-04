@@ -22,7 +22,7 @@ def run_cycle(args, queue, github, recorder, health, *, since=None):
             try:
                 with operation.phase(stage):
                     value = function()
-                if value.get('status') in {'retry', 'uncertain', 'blocked', 'rate_limited', 'exhausted', 'permanent-failed'} or value.get('limited'):
+                if value.get('status') in {'recording_failed', 'retry', 'uncertain', 'blocked', 'rate_limited', 'exhausted', 'permanent-failed'} or value.get('limited'):
                     result['status'] = 'degraded'
                     operation.event('WARNING', 'worker.stage_degraded', stage=stage,
                                     error_code=value.get('error'))

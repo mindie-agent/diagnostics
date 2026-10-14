@@ -37,6 +37,11 @@ class Health:
         self.lock, self.stop = threading.RLock(), threading.Event()
         self.data = {'schema': 1, 'pid': os.getpid(), 'started_at': clock(), 'interval': interval,
                      'heartbeat_at': clock(), 'progress_at': clock(), 'status': 'running', 'stage': 'starting'}
+        if os.name == 'nt':
+            from .worker_process import windows_process
+            alive, created = windows_process(os.getpid())
+            if alive is True and type(created) is int and created > 0:
+                self.data['process_created'] = created
         from .integration import _component_meta
         from . import fallback as f
         version, revision = _component_meta('mindie-diagnostics')

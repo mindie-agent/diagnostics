@@ -422,6 +422,15 @@ def _worker_view(config):
                 alive = False
             except OSError:
                 pass
+        elif os.name == "nt":
+            from .worker_process import windows_process
+            observed, created = windows_process(pid)
+            expected = data.get("process_created")
+            if observed is False:
+                alive = False
+            elif observed is True and type(expected) is int and expected > 0:
+                # A reused PID must not make a stopped worker look healthy.
+                alive = created == expected
         if status in {"running", "idle"}:
             if alive is False:
                 status = "stopped"

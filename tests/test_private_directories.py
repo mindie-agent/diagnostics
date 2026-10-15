@@ -67,6 +67,10 @@ class PrivateDirectoryTests(unittest.TestCase):
             (child / "readback").write_bytes(b"synthetic")
             script = (
                 "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);"
+                "$ErrorActionPreference='Stop';"
+                # The CI parent may export PowerShell 7 modules to this 5.1
+                # process. Read ACLs using this process's own built-in modules.
+                "$env:PSModulePath=$PSHOME+'\\Modules';"
                 "$s=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;"
                 "$a=Get-Acl -LiteralPath '" + str(root).replace("'", "''") + "';"
                 "$c=Get-Acl -LiteralPath '" + str(child).replace("'", "''") + "';"

@@ -38,9 +38,19 @@ worker's creation FILETIME; a reader matches that value with the live process,
 rejecting PID reuse. Access denial, unsupported inspection and old records
 without identity remain unverified. No signal or process mutation is used.
 
+Real scheduled-task installation then exposed a separate permissions defect.
+On the elevated Windows SSH session, `mkdir(mode=0700)` created directories
+owned by Administrators, so the same user's ordinary interactive token could
+not read the reporter runtime and Task Scheduler returned access denied.
+New private directories now use an explicit current-user SID owner and a
+private inheritable ACL for that user, SYSTEM and Administrators. The service
+retains `LeastPrivilege`; existing directories and machine policy are not
+repermissioned. Native checks cover owner/inheritance, unchanged existing ACL,
+concurrent creation, collisions, junction refusal and visible creation errors.
+
 ## Evidence and limits
 
-Local component suite: 291 passed and four skipped. Focused tests cover identity
+Latest local component suite: 297 passed and six platform skips. Focused tests cover identity
 match/mismatch, an exited or inaccessible process, missing legacy identity,
 authorization transitions, redaction, deduplication, and uncertain POST
 reconciliation. Existing macOS component behavior remains covered.
@@ -59,3 +69,6 @@ These are process/API and adapter/component checks. Native scheduled-task
 installation, Claude/Codex host event delivery, an actual GitHub Issue, and a
 complete production fault under the frozen release package still require their
 separate acceptance evidence. No public Issue was created by these tests.
+The corrected service candidate is being revalidated against native managers;
+the earlier macOS mock POST and Windows startup failure are retained as failed
+acceptance receipts, not relabelled as successful delivery.

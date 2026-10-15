@@ -14,6 +14,40 @@ from mindie_diagnostics import fallback
 
 
 class PrivateDirectoryTests(unittest.TestCase):
+    def assert_private_acl(self, facts):
+        self.assertEqual(facts["owner"], facts["sid"])
+        allowed = {facts["sid"], "S-1-5-18", "S-1-5-32-544"}
+        for name, inherited in (("access", False), ("child_access", True)):
+            rules = facts[name]
+            self.assertTrue(all(rule["sid"] in allowed and rule["allow"] for rule in rules))
+            current = [rule for rule in rules if rule["sid"] == facts["sid"]]
+            self.assertEqual(len(current), 1)
+            rule = current[0]
+            for field, mask in (("rights", facts["full_control"]),
+                                ("inheritance", facts["container_inherit"]),
+                                ("inheritance", facts["object_inherit"])):
+                self.assertEqual(rule[field] & mask, mask)
+            self.assertEqual(rule["propagation"], 0)
+            self.assertEqual(rule["inherited"], inherited)
+
+    def test_acl_assertions_use_translated_sid_not_sddl_alias(self):
+        sid = "S-1-5-21-1643835476-1616584234-1346609752-500"
+        rule = dict(sid=sid, rights=2032127, inheritance=3, propagation=0,
+                    inherited=False, allow=True)
+        facts = dict(
+            sid=sid, owner=sid, sddl="O:LAD:P(A;OICI;FA;;;LA)",
+            child_sddl="O:LAD:(A;OICIID;FA;;;LA)",
+            access=[rule], child_access=[dict(rule, inherited=True)],
+            full_control=2032127, container_inherit=1, object_inherit=2,
+        )
+        self.assertNotIn(sid, facts["sddl"])
+        self.assert_private_acl(facts)
+        for change in ({"rights": 131209}, {"inheritance": 1}, {"inherited": False}):
+            with self.subTest(change=change), self.assertRaises(AssertionError):
+                altered = dict(rule, inherited=True)
+                altered.update(change)
+                self.assert_private_acl(dict(facts, child_access=[altered]))
+
     def test_existing_directory_is_not_repermissioned(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -74,16 +108,21 @@ class PrivateDirectoryTests(unittest.TestCase):
                 "$s=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;"
                 "$a=Get-Acl -LiteralPath '" + str(root).replace("'", "''") + "';"
                 "$c=Get-Acl -LiteralPath '" + str(child).replace("'", "''") + "';"
+                "function Rules($acl) { @($acl.Access | ForEach-Object {"
+                "@{sid=$_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value;"
+                "rights=[int]$_.FileSystemRights;inheritance=[int]$_.InheritanceFlags;"
+                "propagation=[int]$_.PropagationFlags;inherited=$_.IsInherited;"
+                "allow=($_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow)}}) };"
                 "@{sid=$s;owner=$a.GetOwner([Security.Principal.SecurityIdentifier]).Value;"
-                "sddl=$a.Sddl;child_sddl=$c.Sddl}|ConvertTo-Json -Compress"
+                "sddl=$a.Sddl;child_sddl=$c.Sddl;access=@(Rules $a);child_access=@(Rules $c);"
+                "full_control=[int][Security.AccessControl.FileSystemRights]::FullControl;"
+                "container_inherit=[int][Security.AccessControl.InheritanceFlags]::ContainerInherit;"
+                "object_inherit=[int][Security.AccessControl.InheritanceFlags]::ObjectInherit"
+                "}|ConvertTo-Json -Compress -Depth 5"
             )
             command = ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script]
             facts = json.loads(subprocess.check_output(command, encoding="utf-8"))
-            self.assertEqual(facts["owner"], facts["sid"])
-            self.assertIn("(A;OICI;FA;;;" + facts["sid"] + ")", facts["sddl"])
-            self.assertIn(facts["sid"], facts["child_sddl"])
-            for principal in ("WD", "BU", "AU"):
-                self.assertNotIn(";;;" + principal + ")", facts["sddl"])
+            self.assert_private_acl(facts)
             fallback._private_mkdir(root, exist_ok=True)
             self.assertEqual(json.loads(subprocess.check_output(command, encoding="utf-8"))["sddl"], facts["sddl"])
             print("NATIVE_PRIVATE_DIRECTORY=" + json.dumps(facts), flush=True)

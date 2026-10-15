@@ -19,6 +19,16 @@ exclude raw exception text, task content, commands, paths, credentials, local
 incident IDs and session IDs. Reporter and logging failures remain visible
 separately from the business result.
 
+The native reporter-service fixture exposed a violation of this contract:
+the offline support-bundle projection retained operation, trace and process
+IDs, and automatic Issue rendering reused that projection. Automatic Issue
+events now exclude those IDs, parent/phase IDs and process-local clock values
+at both ingestion and final rendering. Local logs, seen-event cursors and
+outbox incident links are preserved. The fault fingerprint is unchanged by
+removing correlation fields, including when a saved pre-fix outbox item is
+rendered or an uncertain POST is reconciled. Reprojection remains idempotent.
+No real GitHub Issue was created by the fixture.
+
 ## Windows readiness correction
 
 The previous `_worker_view` probed process liveness only on POSIX, making an

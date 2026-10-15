@@ -31,7 +31,8 @@ def test_real_failure_ingestion_redaction_and_incremental_resume(tmp_path):
     item = queue.claim()
     title, body = render_issue(item)
     assert 'PRIVATE-OUTPUT-SENTINEL' not in body and 'secret-do-not-upload' not in body
-    assert 'connect' in body and op.operation_id in body
+    assert 'connect' in body and op.operation_id not in body
+    assert queue.rows()[0]['incident_ids'] == [op.operation_id]
 
 
 def test_partial_final_record_is_revisited(tmp_path):

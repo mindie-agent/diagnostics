@@ -325,9 +325,9 @@ def _parse_response(raw: bytes, returncode: int, method: str):
 
 def fingerprint(bundle: dict[str, Any]) -> str:
     """Public fault identity excludes consent, incident IDs and host wrappers."""
-    from .bundle import export_public_event
+    from .bundle import export_issue_event
     events = bundle.get("events", [])
-    failures = [safe for event in events if (safe := export_public_event(event))
+    failures = [safe for event in events if (safe := export_issue_event(event))
                 is not None and safe.get("status") == "error"]
     event = failures[-1] if failures else {}
     attrs = event.get("attributes", {})
@@ -344,14 +344,14 @@ def fingerprint(bundle: dict[str, Any]) -> str:
 
 def issue_payload(bundle: dict[str, Any]) -> dict[str, Any]:
     """Re-project even a caller supplied bundle; never trust a 'redacted' flag."""
-    from .bundle import export_public_event
+    from .bundle import export_issue_event
     from .redact import scan_text
 
-    events = [safe for record in bundle.get("events", []) if (safe := export_public_event(record)) is not None]
+    events = [safe for record in bundle.get("events", []) if (safe := export_issue_event(record)) is not None]
     if not events or not any(e.get("status") == "error" for e in events):
         raise ValueError("no publishable failure events")
     public = {"schema": "mindie.support.issue.v1", "events": events[-80:],
-              "omissions": "Raw output, commands, prompts, environment values, local paths and unknown fields are excluded. Evidence is a bounded window; absent phases may be outside it."}
+              "omissions": "Raw output, commands, prompts, environment values, local paths, local correlation IDs, process clocks and unknown fields are excluded. Evidence is a bounded window; absent phases may be outside it."}
     # Fit the complete evidence into the issue itself; no expiring attachment URL.
     while len(json.dumps(public, ensure_ascii=True).encode()) > 36000 and len(public["events"]) > 1:
         public["events"].pop(0)

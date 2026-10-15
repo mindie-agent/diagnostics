@@ -1,10 +1,11 @@
 import copy
+import json
 from pathlib import Path
 
 import pytest
 
 from mindie_diagnostics.outbox import Outbox
-from mindie_diagnostics.reporter import GitHub, TransportError, fingerprint, publish_one, render_issue
+from mindie_diagnostics.reporter import GitHub, TransportError, fingerprint, issue_payload, publish_one, render_issue
 from mindie_diagnostics.reporting import scope_key
 
 
@@ -101,3 +102,55 @@ def test_public_fingerprint_is_independent_of_consent_and_incident():
     assert fingerprint(same) != fingerprint(original)
     _, body = render_issue({'fingerprint': 'private_consent_key', 'payload': original, 'occurrences': 1})
     assert fingerprint(original) in body and 'private_consent_key' not in body
+
+
+def test_issue_projection_excludes_local_identity_and_remains_reprojectable():
+    original = payload()
+    event = original['events'][0]
+    identifiers = ('operation_id', 'trace_id', 'parent_operation_id', 'phase_id',
+                   'parent_phase_id', 'process_instance_id', 'process_ref')
+    for index, name in enumerate(identifiers, 1):
+        event[name] = (f'{index:x}' + 'abcdef0123456789' * 3)[:32]
+    event['attributes']['session_id'] = 'private-session-canary'
+    before = copy.deepcopy(original)
+    projected = issue_payload(original)
+    text = json.dumps(projected)
+    for name in (*identifiers, 'monotonic_ns', 'clock_domain_unknown', 'pid'):
+        assert name not in projected['events'][0]
+    assert all(event[name] not in text for name in identifiers)
+    assert 'private-session-canary' not in text
+    assert original == before
+    assert issue_payload(projected) == projected
+    assert fingerprint(projected) == fingerprint(original)
+    assert projected['events'][0]['package_revision'] == event['package_revision']
+
+
+def test_sanitized_issue_marker_reconciles_an_uncertain_post(tmp_path, reporting_consent):
+    queue, now = queue_at(tmp_path, reporting_consent)
+
+    class LostResponse(GitHub):
+        def __init__(self):
+            super().__init__(reporting_consent['repository'])
+            self.posts = []
+
+        def request(self, method, path, payload=None):
+            if method == 'GET':
+                return self.posts
+            assert method == 'POST'
+            issue = dict(payload, number=7,
+                         html_url=f'https://github.com/{self.repository}/issues/7')
+            self.posts.append(issue)
+            raise TransportError('github_timeout', uncertain=True)
+
+    github = LostResponse()
+    publish_one(queue, github)
+    assert len(github.posts) == 1
+    assert queue.rows()[0]['state'] == 'uncertain'
+    now[0] += 4000
+    assert publish_one(queue, github)['status'] == 'reconciled'
+    assert queue.rows()[0]['state'] == 'published'
+    assert len(github.posts) == 1
+    assert queue.rows()[0]['incident_ids'] == ['a' * 32]
+    body = github.posts[0]['body']
+    assert 'a' * 32 not in body and 'b' * 32 not in body
+    assert fingerprint(payload()) in body

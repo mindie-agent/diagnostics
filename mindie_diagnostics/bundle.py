@@ -53,7 +53,7 @@ def _number(value):
     return (type(value) in (int, float) and math.isfinite(value) and abs(value) < 10**30)
 
 
-def _project(record):
+def _project(record, *, correlation=True):
     if not isinstance(record, dict) or type(record.get("schema")) is not int or record["schema"] != SCHEMA:
         return None, 0
     required = ("component", "event")
@@ -68,22 +68,23 @@ def _project(record):
         datetime.fromisoformat(stamp.replace("Z", "+00:00"))
     except ValueError:
         return None, 0
-    if type(record.get("monotonic_ns")) is not int or not 0 <= record["monotonic_ns"] < 10**30:
-        return None, 0
-    if not isinstance(record.get("operation_id"), str) or not _ID.fullmatch(record["operation_id"]):
-        return None, 0
-    if not isinstance(record.get("trace_id"), str) or not _ID.fullmatch(record["trace_id"]):
-        return None, 0
-    result = {key: record[key] for key in ("schema", "timestamp", "monotonic_ns", "component",
-                                          "severity", "event", "operation_id", "trace_id")}
+    result = {key: record[key] for key in ("schema", "timestamp", "component", "severity", "event")}
     omitted = len(set(record) - _TOP)
-    for key in ("parent_operation_id", "phase_id", "parent_phase_id"):
-        if record.get(key) is None:
-            continue
-        if isinstance(record[key], str) and _ID.fullmatch(record[key]):
+    if correlation:
+        if type(record.get("monotonic_ns")) is not int or not 0 <= record["monotonic_ns"] < 10**30:
+            return None, 0
+        if any(not isinstance(record.get(key), str) or not _ID.fullmatch(record[key])
+               for key in ("operation_id", "trace_id")):
+            return None, 0
+        for key in ("monotonic_ns", "operation_id", "trace_id"):
             result[key] = record[key]
-        else:
-            omitted += 1
+        for key in ("parent_operation_id", "phase_id", "parent_phase_id"):
+            if record.get(key) is None:
+                continue
+            if isinstance(record[key], str) and _ID.fullmatch(record[key]):
+                result[key] = record[key]
+            else:
+                omitted += 1
     for key in ("operation", "phase"):
         if key in record:
             label = _label(record[key])
@@ -95,21 +96,22 @@ def _project(record):
         result["status"] = record["status"]
     if _number(record.get("duration_ms")) and record["duration_ms"] >= 0:
         result["duration_ms"] = record["duration_ms"]
-    # Do not export machine PID or paths. Process-local clock needs its own key.
-    if isinstance(record.get("process_instance_id"), str) and _ID.fullmatch(record["process_instance_id"]):
-        result["process_instance_id"] = record["process_instance_id"]
-        result["process_ref"] = record["process_instance_id"]
-    elif isinstance(record.get("process_ref"), str) and _ID.fullmatch(record["process_ref"]):
-        result["process_instance_id"] = record["process_ref"]
-        result["process_ref"] = record["process_ref"]
-    elif type(record.get("pid")) is int and record["pid"] > 0:
-        result["process_ref"] = hashlib.sha256((record["component"] + ":" + str(record["pid"])).encode()).hexdigest()[:16]
-        result["clock_domain_unknown"] = True
-    elif isinstance(record.get("process_ref"), str) and re.fullmatch(r"[0-9a-f]{16}", record["process_ref"]):
-        result["process_ref"] = record["process_ref"]
-        result["clock_domain_unknown"] = True
-    else:
-        return None, 0
+    if correlation:
+        # Offline bundles keep clock domains; automatic Issues exclude them.
+        if isinstance(record.get("process_instance_id"), str) and _ID.fullmatch(record["process_instance_id"]):
+            result["process_instance_id"] = record["process_instance_id"]
+            result["process_ref"] = record["process_instance_id"]
+        elif isinstance(record.get("process_ref"), str) and _ID.fullmatch(record["process_ref"]):
+            result["process_instance_id"] = record["process_ref"]
+            result["process_ref"] = record["process_ref"]
+        elif type(record.get("pid")) is int and record["pid"] > 0:
+            result["process_ref"] = hashlib.sha256((record["component"] + ":" + str(record["pid"])).encode()).hexdigest()[:16]
+            result["clock_domain_unknown"] = True
+        elif isinstance(record.get("process_ref"), str) and re.fullmatch(r"[0-9a-f]{16}", record["process_ref"]):
+            result["process_ref"] = record["process_ref"]
+            result["clock_domain_unknown"] = True
+        else:
+            return None, 0
     attributes = record.get("attributes", {})
     if not isinstance(attributes, dict):
         return None, 0
@@ -165,9 +167,17 @@ def _project(record):
 
 
 def export_public_event(record):
-    """Return a strict, publishable event or None; never copy arbitrary fields."""
+    """Project an offline support bundle event, retaining local correlations."""
     try:
         return _project(record)[0]
+    except (TypeError, ValueError, OverflowError, RecursionError):
+        return None
+
+
+def export_issue_event(record):
+    """Project automatic Issue evidence without local identity or clock keys."""
+    try:
+        return _project(record, correlation=False)[0]
     except (TypeError, ValueError, OverflowError, RecursionError):
         return None
 

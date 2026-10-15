@@ -22,6 +22,7 @@ import time
 from xml.etree import ElementTree as ET
 
 from . import service as common
+from .fallback import _private_mkdir
 
 MARKER = "mindie-diagnostics.native-service.v1"
 MANIFEST = "mindie-diagnostics-service.json"
@@ -77,7 +78,7 @@ def _paths(unit_dir=None):
 
 @contextmanager
 def _locked(path, deadline=None):
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _private_mkdir(path.parent, parents=True, exist_ok=True)
     lock = path.with_suffix(".lock")
     if lock.is_symlink():
         raise common.ServiceError("unowned_lock")
@@ -356,12 +357,12 @@ def install_service(roots, state, repository, *, python=None, gh=None, interval=
             directory = Path(root)
             if any(item.is_symlink() for item in (directory, *directory.parents)):
                 raise common.ServiceError('unsafe_diagnostic_root')
-            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            _private_mkdir(directory, parents=True, exist_ok=True)
             physical_roots.append(str(_physical(directory)))
         roots = list(dict.fromkeys(physical_roots))
         if any(item.is_symlink() for item in (state, *state.parents)):
             raise common.ServiceError('unsafe_state_directory')
-        state.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _private_mkdir(state, parents=True, exist_ok=True)
         state = _physical(state)
         env_file = _private_environment(environment_file, runner)
         gh_path = (str(common._executable(gh)) if ensure and existing and env_file is None
@@ -386,7 +387,7 @@ def install_service(roots, state, repository, *, python=None, gh=None, interval=
                                       "StandardOutPath": "/dev/null", "StandardErrorPath": "/dev/null"})
         config["unit_sha256"] = hashlib.sha256(payload).hexdigest()
         changed = existing != config
-        state.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _private_mkdir(state, parents=True, exist_ok=True)
         manifest_bytes = (json.dumps(config, ensure_ascii=True, indent=2) + "\n").encode("utf-8")
         if sys.platform == "win32":
             # Consent recheck after the native lock, before writing/registering.

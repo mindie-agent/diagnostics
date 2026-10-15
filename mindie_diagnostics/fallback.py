@@ -54,6 +54,103 @@ _process_pid = None
 _process_uuid = None
 
 
+def _windows_private_mkdir(path):
+    """Atomically bind a new private directory to TokenUser, not TokenOwner."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    security = ctypes.WinDLL("advapi32", use_last_error=True)
+
+    class SecurityAttributes(ctypes.Structure):
+        _fields_ = [("length", wintypes.DWORD), ("descriptor", ctypes.c_void_p),
+                    ("inherit", wintypes.BOOL)]
+
+    class SidAndAttributes(ctypes.Structure):
+        _fields_ = [("sid", ctypes.c_void_p), ("attributes", wintypes.DWORD)]
+
+    kernel.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel.LocalFree.restype = ctypes.c_void_p
+    kernel.CreateDirectoryW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(SecurityAttributes)]
+    kernel.CreateDirectoryW.restype = wintypes.BOOL
+    security.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    security.OpenProcessToken.restype = wintypes.BOOL
+    security.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                             wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    security.GetTokenInformation.restype = wintypes.BOOL
+    security.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
+    security.ConvertSidToStringSidW.restype = wintypes.BOOL
+    security.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.DWORD)]
+    security.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
+    token = wintypes.HANDLE()
+    sid_string = wintypes.LPWSTR()
+    descriptor = ctypes.c_void_p()
+    try:
+        if not security.OpenProcessToken(kernel.GetCurrentProcess(), 0x0008, ctypes.byref(token)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        size = wintypes.DWORD()
+        security.GetTokenInformation(token, 1, None, 0, ctypes.byref(size))
+        if ctypes.get_last_error() != 122 or not size.value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        user = ctypes.create_string_buffer(size.value)
+        if not security.GetTokenInformation(token, 1, user, size, ctypes.byref(size)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        sid = ctypes.cast(user, ctypes.POINTER(SidAndAttributes)).contents.sid
+        if not security.ConvertSidToStringSidW(sid, ctypes.byref(sid_string)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        user_sid = sid_string.value
+        # An elevated token can default to Administrators as the object owner.
+        # OWNER RIGHTS alone then excludes that same user's filtered login token.
+        sddl = f"O:{user_sid}D:P(A;OICI;FA;;;{user_sid})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+        if not security.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl, 1, ctypes.byref(descriptor), None):
+            raise ctypes.WinError(ctypes.get_last_error())
+        attributes = SecurityAttributes(ctypes.sizeof(SecurityAttributes), descriptor, False)
+        if not kernel.CreateDirectoryW(str(path), ctypes.byref(attributes)):
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        if descriptor:
+            kernel.LocalFree(descriptor)
+        if sid_string:
+            kernel.LocalFree(ctypes.cast(sid_string, ctypes.c_void_p))
+        if token:
+            kernel.CloseHandle(token)
+
+
+def _private_mkdir(path, *, parents=False, exist_ok=False):
+    """Create private directories without changing permissions of existing ones."""
+    path = Path(path)
+    if os.name != "nt":
+        path.mkdir(mode=0o700, parents=parents, exist_ok=exist_ok)
+        return
+    path = path.absolute()
+    for parent in reversed(path.parents):
+        try:
+            info = parent.lstat()
+        except FileNotFoundError:
+            break
+        if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+                or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+            raise OSError(errno.ELOOP, "private directory must not traverse a reparse point", str(parent))
+    try:
+        _windows_private_mkdir(path)
+    except FileNotFoundError:
+        if not parents or path.parent == path:
+            raise
+        _private_mkdir(path.parent, parents=True, exist_ok=True)
+        _private_mkdir(path, exist_ok=exist_ok)
+    except FileExistsError:
+        if not exist_ok:
+            raise
+        info = path.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+                or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+            raise
+
+
 def _after_fork():
     global _lock, _warn_lock, _warned, _process_pid, _process_uuid
     _lock, _warn_lock = threading.Lock(), threading.Lock()
@@ -477,7 +574,7 @@ def _owned_dir(path, *, create) -> bool:
         if not create:
             return False
         try:
-            os.mkdir(path, 0o700)
+            _private_mkdir(path)
         except FileExistsError:
             pass
         except OSError:
@@ -513,7 +610,7 @@ def _ancestors_are_real_dirs(path, *, create=False) -> bool:
             if not create:
                 return False
             try:
-                os.mkdir(current, 0o700)
+                _private_mkdir(current)
                 info = os.lstat(current)
             except FileExistsError:
                 info = os.lstat(current)

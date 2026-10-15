@@ -333,7 +333,8 @@ class Recorder:
         folder = root / "events" / self.component
         if any(parent.is_symlink() for parent in (folder, *folder.parents)):
             raise OSError("diagnostic log directory must not be a symlink")
-        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+        from .fallback import _private_mkdir
+        _private_mkdir(folder, parents=True, exist_ok=True)
         if os.name != "nt":
             folder.chmod(0o700)  # Only this component's diagnostic leaf, never its parents.
         path = folder / (str(pid) + "-" + self._process_id + ".jsonl")

@@ -19,6 +19,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+from .fallback import _private_mkdir
 
 
 MAX_AUTOMATIC_CYCLES = 3
@@ -174,7 +175,7 @@ class Outbox:
         if probe.is_symlink():
             raise ValueError("diagnostic queue directory must not be a symlink")
         for directory in reversed(missing):
-            os.mkdir(directory, 0o700)
+            _private_mkdir(directory)
             os.chmod(directory, 0o700)
         if parent.is_symlink():
             raise ValueError("diagnostic queue directory must not be a symlink")

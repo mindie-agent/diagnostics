@@ -11,6 +11,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
+from .fallback import _private_mkdir
 
 _PKG = "mindie_diagnostics"
 _DIST = "mindie-diagnostics"
@@ -188,7 +189,7 @@ def _ensure_dir(path, ancestors, absolute, owned):
     if not ancestors(path, create=True):
         _fail("runtime_untrusted")
     if not path.exists():
-        os.mkdir(path, _DIR)
+        _private_mkdir(path)
     if os.name != "nt":
         os.chmod(path, _DIR)
     _require_dir(path, owned)
@@ -216,7 +217,7 @@ def _mkdirs(base, dest):
             if cur.is_symlink() or not cur.is_dir():
                 _fail("source_rejected")
             continue
-        os.mkdir(cur, _DIR)
+        _private_mkdir(cur)
         if os.name != "nt":
             os.chmod(cur, _DIR)
 
@@ -536,7 +537,7 @@ def _prepare_locked(config, *, publish=True, source=None, deadline=None):
             _verify(py, version, site, dest, deadline)
         else:
             staging = generations / f".staging-{uuid.uuid4().hex}"
-            os.mkdir(staging, _DIR)
+            _private_mkdir(staging)
             if os.name != "nt":
                 os.chmod(staging, _DIR)
             _create_venv(staging / "venv", deadline)

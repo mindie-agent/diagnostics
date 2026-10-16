@@ -210,7 +210,10 @@ def _check_reporting_consent(reporting_config, expected_consent_revision):
     if expected_consent_revision is None:
         return
     from . import fallback as f
-    policy = f.read_policy(reporting_config)
+    try:
+        policy = f.read_policy(reporting_config)
+    except f.PolicyUnavailable as exc:
+        raise ServiceError('reporting_policy_unavailable') from exc
     if policy is None or policy['decision'] != 'enabled' or policy.get('revision') != expected_consent_revision:
         raise ServiceError('reporting_authorization_changed')
 

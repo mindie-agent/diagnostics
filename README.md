@@ -46,6 +46,9 @@ even when reporting is off, authorization, queue results and worker health.
 An enabled setting, an installed service and a healthy running worker are
 separate facts. A stopped worker requires an explicit `reporting ensure`;
 macOS, Linux and Windows do not automatically restart crashed workers.
+Windows readiness checks a live process handle and matches its creation time
+to the worker's health record. A reused PID cannot establish readiness; an
+inaccessible process or an older record without that identity stays unverified.
 
 ## Failure ownership
 
@@ -144,7 +147,24 @@ state / bounded diagnostics, not indefinitely appended service log files.
 Run `python -m pytest` for development regressions. They do not establish native
 host behavior, GitHub delivery or Windows hardware acceptance. Real macOS
 process, rotation, Issue and native adapter evidence is recorded separately.
-Windows hardware remains deferred to the user's dedicated environment.
+Native Windows process identity and the Claude Code adapter's local
+fault-to-outbox pipeline are covered separately in
+`docs/production-reporting-acceptance-2026-10-15.md`. This does not establish
+Windows scheduled-task installation or public GitHub delivery.
 
 Diagnostics commands do not launch a model. The desktop Grok Bot remains an
 external application and is not an entry point of this package.
+
+Failure observation keeps reporting authorization distinct from policy storage.
+`fallback.read_policy()` returns `None` only when the selected policy is absent;
+an existing malformed, unsafe or unreadable policy raises `PolicyUnavailable`.
+`consent_status()` distinguishes `allowed`, `withdrawn` and `unavailable`.
+Unavailable policy blocks sending and preserves pending evidence and log cursors;
+only a verified disabled or changed authorization withdraws queued work. The
+nonthrowing local recorder still records the original fault independently.
+
+Outbox initialization is serialized and recorded by a small ownership marker.
+An existing empty/incomplete database, or a missing previously initialized
+outbox, is a storage failure. No query or reopen recreates lost publication
+history. A POST intent remains uncertain through policy, reply and local receipt
+failures, and later automatic processing only reconciles the original marker.

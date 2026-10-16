@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from .outbox import Outbox
-from .reporting import ConsentWithdrawn, check_remote_action, guard_consent, require_consent
+from .reporting import ConsentUnavailable, ConsentWithdrawn, check_remote_action, guard_consent, require_consent
 
 DEFAULT_REPOSITORY = "mindie-agent/mindie-agent"
 MARKER = "<!-- mindie-incident:"
@@ -325,9 +325,9 @@ def _parse_response(raw: bytes, returncode: int, method: str):
 
 def fingerprint(bundle: dict[str, Any]) -> str:
     """Public fault identity excludes consent, incident IDs and host wrappers."""
-    from .bundle import export_public_event
+    from .bundle import export_issue_event
     events = bundle.get("events", [])
-    failures = [safe for event in events if (safe := export_public_event(event))
+    failures = [safe for event in events if (safe := export_issue_event(event))
                 is not None and safe.get("status") == "error"]
     event = failures[-1] if failures else {}
     attrs = event.get("attributes", {})
@@ -344,14 +344,14 @@ def fingerprint(bundle: dict[str, Any]) -> str:
 
 def issue_payload(bundle: dict[str, Any]) -> dict[str, Any]:
     """Re-project even a caller supplied bundle; never trust a 'redacted' flag."""
-    from .bundle import export_public_event
+    from .bundle import export_issue_event
     from .redact import scan_text
 
-    events = [safe for record in bundle.get("events", []) if (safe := export_public_event(record)) is not None]
+    events = [safe for record in bundle.get("events", []) if (safe := export_issue_event(record)) is not None]
     if not events or not any(e.get("status") == "error" for e in events):
         raise ValueError("no publishable failure events")
     public = {"schema": "mindie.support.issue.v1", "events": events[-80:],
-              "omissions": "Raw output, commands, prompts, environment values, local paths and unknown fields are excluded. Evidence is a bounded window; absent phases may be outside it."}
+              "omissions": "Raw output, commands, prompts, environment values, local paths, local correlation IDs, process clocks and unknown fields are excluded. Evidence is a bounded window; absent phases may be outside it."}
     # Fit the complete evidence into the issue itself; no expiring attachment URL.
     while len(json.dumps(public, ensure_ascii=True).encode()) > 36000 and len(public["events"]) > 1:
         public["events"].pop(0)
@@ -458,6 +458,17 @@ def _issue_reference(reply, repository):
     return reply.get("html_url") == f"https://github.com/{repository}/issues/{reply['number']}"
 
 
+def _record_publication_outcome(queue, item, result, **updates):
+    """Local receipt failure must not erase an acknowledged external result."""
+    try:
+        queue.update(item, **updates)
+    except Exception as exc:
+        return {**result, "publication_status": result["status"], "status": "recording_failed",
+                "local_recording": {"status": "failed", "error_type": type(exc).__name__},
+                "error": result.get("error") or "publication_receipt_failed"}
+    return result
+
+
 def publish_one(queue: Outbox, github: GitHub) -> dict[str, Any]:
     from .outbox import MAX_AUTOMATIC_CYCLES
     item = queue.claim(lease_seconds=github.timeout + 5)
@@ -477,36 +488,52 @@ def publish_one(queue: Outbox, github: GitHub) -> dict[str, Any]:
         if existing:
             if not _issue_reference(existing, github.repository):
                 raise TransportError("github_invalid_issue_reference")
-            queue.update(item, state="published", issue_number=existing["number"], issue_url=existing["html_url"], last_error=None)
-            return {"status": "reconciled", "issue_url": existing["html_url"]}
+            return _record_publication_outcome(queue, item,
+                {"status": "reconciled", "issue_url": existing["html_url"], "operation_completed": True},
+                state="published", issue_number=existing["number"], issue_url=existing["html_url"], last_error=None)
         if item["state"] == "uncertain":
             state = "exhausted" if exhausted else "uncertain"
-            queue.update(item, state=state, next_attempt=queue.clock() + 300,
-                         last_error="submission_uncertain_budget_exhausted" if exhausted else "submission_uncertain_no_match")
-            return {"status": state}
+            return _record_publication_outcome(queue, item, {"status": state, "submission_state": "uncertain"},
+                state=state, next_attempt=queue.clock() + 300,
+                last_error="submission_uncertain_budget_exhausted" if exhausted else "submission_uncertain_no_match")
         title, body = render_issue(item)
         require_consent(item.get("consent"))
         queue.begin_post(item)
+        item["state"] = "uncertain"
         with guard_consent(item.get("consent")):
             reply = github.create_issue(title, body)
         if not _issue_reference(reply, github.repository):
             raise TransportError("github_invalid_create_reply", uncertain=True)
-        queue.update(item, state="published", issue_number=reply["number"], issue_url=reply["html_url"], last_error=None)
-        return {"status": "published", "issue_url": reply["html_url"]}
+        return _record_publication_outcome(queue, item,
+            {"status": "published", "issue_url": reply["html_url"], "operation_completed": True},
+            state="published", issue_number=reply["number"], issue_url=reply["html_url"], last_error=None)
     except ConsentWithdrawn:
-        queue.update(item, state="withdrawn",
-                     last_error="submission_uncertain_reporting_consent_withdrawn" if item["state"] == "uncertain" else "reporting_consent_unavailable_or_withdrawn")
-        return {"status": "withdrawn"}
+        uncertain = item["state"] == "uncertain"
+        return _record_publication_outcome(queue, item,
+            {"status": "withdrawn", "submission_state": "uncertain" if uncertain else "not_sent"},
+            state="withdrawn", last_error="submission_uncertain_reporting_consent_withdrawn" if uncertain else "reporting_consent_unavailable_or_withdrawn")
+    except ConsentUnavailable:
+        uncertain = item["state"] == "uncertain"
+        state = "exhausted" if exhausted else "uncertain" if uncertain else "retry"
+        code = ("submission_uncertain_" if uncertain else "") + "reporting_policy_unavailable"
+        return _record_publication_outcome(queue, item,
+            {"status": state, "error": code, "submission_state": "uncertain" if uncertain else "not_sent"},
+            state=state, next_attempt=queue.clock() + 300, last_error=code)
     except TransportError as exc:
         uncertain = exc.uncertain or item["state"] == "uncertain"
         state = "permanent-failed" if exc.permanent else "exhausted" if exhausted else "uncertain" if uncertain else "retry"
         code = "submission_uncertain_" + exc.code if uncertain and state in {"permanent-failed", "exhausted"} else exc.code
         delay = max(exc.retry_after, 30 * 2 ** item["attempts"])
-        queue.update(item, state=state, next_attempt=queue.clock() + delay, last_error=code)
-        return {"status": state, "error": code}
+        return _record_publication_outcome(queue, item,
+            {"status": state, "error": code, "submission_state": "uncertain" if uncertain else "not_sent"},
+            state=state, next_attempt=queue.clock() + delay, last_error=code)
     except (ValueError, TypeError, KeyError):
-        queue.update(item, state="blocked", last_error="invalid_or_unsafe_diagnostic_payload")
-        return {"status": "blocked", "error": "invalid_or_unsafe_diagnostic_payload"}
+        uncertain = item["state"] == "uncertain"
+        state = "exhausted" if uncertain and exhausted else "uncertain" if uncertain else "blocked"
+        code = "submission_uncertain_invalid_reply" if uncertain else "invalid_or_unsafe_diagnostic_payload"
+        return _record_publication_outcome(queue, item,
+            {"status": state, "error": code, "submission_state": "uncertain" if uncertain else "not_sent"},
+            state=state, next_attempt=queue.clock() + 300, last_error=code)
     finally:
         if started:
             github.end_cycle()

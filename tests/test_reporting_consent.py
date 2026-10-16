@@ -98,7 +98,7 @@ def test_revoke_pending_and_reenable_never_reauthorizes_old_revision(tmp_path):
     reporting_failure(tmp_path,path)
     queue=Outbox(tmp_path/'queue.db');assert ingest(tmp_path,queue)['enqueued']==1
     reporting_policy(path,False)
-    assert publish_one(queue,NoNetwork())=={'status':'withdrawn'}
+    assert publish_one(queue,NoNetwork())=={'status':'withdrawn','submission_state':'not_sent'}
     reporting_policy(path)
     assert publish_one(Outbox(queue.path),NoNetwork())=={'status':'idle'}
     assert not reporting_allowed(reference)
@@ -136,7 +136,7 @@ def test_revocation_after_reconciliation_stops_issue_post(tmp_path):
             reporting_policy(path,False)
         def create_issue(self,*args):
             pytest.fail('revoked issue must not be posted')
-    assert publish_one(queue,DuringRead())=={'status':'withdrawn'}
+    assert publish_one(queue,DuringRead())=={'status':'withdrawn','submission_state':'not_sent'}
     assert queue.rows()[0]['attempts']==1  # claim consumes before its GET phase
 
 
@@ -151,7 +151,7 @@ def test_each_github_reconciliation_page_rechecks_receipt(tmp_path,monkeypatch):
     from mindie_diagnostics import reporter
     monkeypatch.setattr(GitHub,'request',_REAL_REQUEST)
     monkeypatch.setattr(reporter,'_run_gh',run)
-    assert publish_one(queue,GitHub(repository='example/project'))=={'status':'withdrawn'}
+    assert publish_one(queue,GitHub(repository='example/project'))=={'status':'withdrawn','submission_state':'not_sent'}
     assert len(calls)==1
 
 
@@ -160,5 +160,5 @@ def test_unscoped_outbox_cannot_use_process_consent(tmp_path,state):
     path=tmp_path/'reporting.json';reporting_policy(path)
     queue=Outbox(tmp_path/'queue.db');queue.enqueue('a','b',{})
     item=queue.claim();queue.update(item,state=state)
-    assert publish_one(queue,NoNetwork())=={'status':'withdrawn'}
+    assert publish_one(queue,NoNetwork())=={'status':'withdrawn','submission_state':'uncertain' if state=='uncertain' else 'not_sent'}
     assert queue.rows()[0]['attempts']==2

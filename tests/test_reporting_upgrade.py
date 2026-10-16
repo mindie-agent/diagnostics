@@ -63,6 +63,20 @@ def test_preparation_cannot_revive_stopped_worker_or_cross_consent_revision(prep
     assert json.loads((root / 'current.json').read_text())['source_hash'] == 'a' * 64
 
 
+def test_invalid_worker_directory_is_a_failure_not_a_normal_update_skip(prepared, monkeypatch):
+    from mindie_diagnostics.integration import _worker_view
+
+    config, root, _state, calls = prepared
+    state = config.with_suffix('.state')
+    state.write_bytes(b'retained invalid state')
+    monkeypatch.setattr(commands, '_worker_view', _worker_view)
+    assert commands.upgrade_running(config) == {
+        'status': 'degraded', 'reason': 'reporter_worker_unavailable'}
+    assert calls == [] and state.read_bytes() == b'retained invalid state'
+    assert json.loads((root / 'current.json').read_text())['source_hash'] == 'a' * 64
+    assert not list(root.glob('update-*.json'))
+
+
 @pytest.mark.parametrize('bad_hash', ['../outside', 'g' * 64, 'a' * 65])
 def test_current_source_hash_cannot_select_arbitrary_generation(tmp_path, bad_hash):
     (tmp_path / 'current.json').write_text(json.dumps({'schema': 1, 'version': '0.3.0', 'source_hash': bad_hash}))

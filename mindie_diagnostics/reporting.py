@@ -9,6 +9,7 @@ from . import fallback as f
 
 current_consent = f.current_consent
 consent_allowed = f.consent_allowed
+consent_status = f.consent_status
 scope_key = f.scope_key
 read_policy = f.read_policy
 policy_path = f.policy_path
@@ -25,9 +26,19 @@ class ConsentWithdrawn(RuntimeError):
         RuntimeError.__init__(self, "mindie diagnostics reporting consent is not enabled")
 
 
+class ConsentUnavailable(RuntimeError):
+    """Policy read failed; sending is blocked and prior evidence is retained."""
+
+    def __init__(self):
+        super().__init__("reporting_policy_unavailable")
+
+
 def require_consent(reference):
     """Raise when a fresh policy check rejects this reference."""
-    if not f.consent_allowed(reference):
+    status = consent_status(reference)
+    if status == "unavailable":
+        raise ConsentUnavailable()
+    if status != "allowed":
         raise ConsentWithdrawn()
 
 

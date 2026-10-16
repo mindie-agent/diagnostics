@@ -10,6 +10,7 @@ from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
+from .fallback import _private_mkdir
 import sqlite3
 import stat
 import time
@@ -51,9 +52,9 @@ def _read(path: Path, limit: int) -> bytes:
 def _folder(root) -> Path:
     root = _real_path(root)
     # Only create our missing root/registry directories, never chmod parents.
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _private_mkdir(root, parents=True, exist_ok=True)
     folder = root / ".readers"
-    folder.mkdir(mode=0o700, exist_ok=True)
+    _private_mkdir(folder, exist_ok=True)
     info = folder.lstat()
     if not stat.S_ISDIR(info.st_mode) or (os.name != "nt" and
             (info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077)):

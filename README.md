@@ -1,170 +1,118 @@
-# MindIE diagnostics
+<h1 align="center">MindIE Agent Diagnostics (<code>mindie-diagnostics</code>)</h1>
 
-Part of [MindIE Agent](https://github.com/mindie-agent/mindie-agent).
+<p align="center">
+  <strong>面向 MindIE Agent 组件的有界本地结构化日志、离线诊断包与可选 GitHub Issue 自动上报底座</strong>
+</p>
 
-Bounded local logs and independently enabled automatic GitHub Issues for
-MindIE tool failures. Every executable diagnostics path is model-free. It does
-not capture transcripts or retry business operations. The knowledge-review
-Grok Bot desktop application is a separate product and is not a diagnostics
-command.
+<p align="center">
+  <strong>中文</strong> · <a href="./README.en.md">English</a> · <a href="./docs/README.md">文档中心</a> · <a href="https://github.com/mindie-agent/mindie-agent">MindIE Agent 主仓库</a>
+</p>
 
-Active log writers stat the pressure marker once per record and reuse its
-unchanged result. Creation, replacement, modification and deletion apply on
-the next record; directory validation runs on changes and before segment
-creation or recycling. Stable writes use their existing file descriptor.
+---
 
-## Use
+## 项目简介
 
-Install the reviewed revision in an existing Python 3.11+ runtime. Adapters
-provide native reporting commands; standalone components can use:
+`mindie-diagnostics` 是 [MindIE Agent](https://github.com/mindie-agent/mindie-agent) 的共享可观测性与故障诊断组件（Python 包名 `mindie-diagnostics`，导入名 `mindie_diagnostics`）。它为 `remote-dev`、`coordinator`、`npu-top`、`knowledge` 及各原生客户端适配器提供统一、无模型调用（Model-free）的本地结构化日志轮转、故障归属记录、离线脱敏诊断包导出，以及经用户显式授权的 GitHub Issue 自动上报服务。
 
-```sh
+- **100% 无模型执行路径**：所有诊断记录、维护、导出与上报路径均不调用任何大语言模型，不抓取对话转录（Transcript），也绝不自动重放业务命令。
+- **有界本地日志轮转**：每个进程/组件使用 4 个固定 1 MiB JSONL 分段，仅在所有已注册读取器消费完毕后复用，默认按 7 天 / 128 MiB / 512 个文件上限执行离线维护。
+- **严格的隐私白名单**：公开 Issue 与离线诊断包仅投影静态组件名、版本号、阶段、错误类别、单调时钟耗时、退出码与产品代码栈帧；命令原文、输出、Prompt、路径、端点地址与凭据一律排除。
+- **显式授权的自动上报**：GitHub Issue 自动上报默认关闭（Opt-in），配置与服务安装完全独立于知识库贡献，关闭后立即吊销待发送队列。
+
+---
+
+## 快速开始
+
+### 1. 环境要求与安装
+
+需要 Python `>= 3.11`。如需启用自动 GitHub Issue 上报，需本地已安装并登录 `gh` CLI。
+
+```bash
+uv pip install -e .
+```
+
+### 2. 自动上报状态查询与配置（CLI）
+
+各原生客户端适配器均提供内置诊断入口；独立组件也可直接调用 CLI：
+
+```bash
+# 查看只读状态（包含本地近期故障引用、授权状态、队列与 Worker 健康度）
 python -m mindie_diagnostics.cli reporting status
+
+# 开启自动上报（默认目标仓库为 mindie-agent/mindie-agent，可通过 --repository 指定）
 python -m mindie_diagnostics.cli reporting configure --enabled true
+
+# 准备独立运行时并启动后台上报 Worker
 python -m mindie_diagnostics.cli reporting ensure
+
+# 关闭自动上报（立即失效未发送的远端操作）
 python -m mindie_diagnostics.cli reporting configure --enabled false
 ```
 
-The default destination is `mindie-agent/mindie-agent`. Choose another authorized
-repository with `configure --repository OWNER/REPO`. Reporting is off until the
-user chooses it, independently of knowledge contribution. Configuration is a
-small local write; `ensure` explicitly prepares an independent installed runtime
-and starts one owned reporter outside native Hooks. `gh` and its existing login
-are required. Installation does not copy transient credentials.
+### 3. 日志维护与离线诊断包导出
 
-Use `--config /absolute/reporting.json` for an isolated policy. The default is
-`$XDG_CONFIG_HOME/mindie-agent/diagnostics.json`, or
-`~/.config/mindie-agent/diagnostics.json` on all supported operating systems.
-`MINDIE_DIAGNOSTICS_CONFIG` also selects this file. Queue, receipts, health and
-runtime are stored beside that policy; adapter runtimes are not borrowed by the
-service. `reporting ensure --unit-dir /absolute/directory` isolates a native
-service for acceptance. It installs the pure reporter and cannot replace
-another reporting authorization.
+```bash
+# 执行离线日志保留维护
+python -m mindie_diagnostics.cli reporting maintain
 
-`reporting status` is read-only. It includes recent local incident references
-even when reporting is off, authorization, queue results and worker health.
-An enabled setting, an installed service and a healthy running worker are
-separate facts. A stopped worker requires an explicit `reporting ensure`;
-macOS, Linux and Windows do not automatically restart crashed workers.
-Windows readiness checks a live process handle and matches its creation time
-to the worker's health record. A reused PID cannot establish readiness; an
-inaccessible process or an older record without that identity stays unverified.
+# 升级运行中且健康的 Worker 至更高语义版本（不自动拉起已停止的 Worker）
+python -m mindie_diagnostics.cli reporting maintain --update-running
 
-## Failure ownership
+# 针对指定 operation_id 导出离线脱敏诊断包（不上传网络）
+python -m mindie_diagnostics.cli bundle --root /absolute/log-root --operation-id INCIDENT_ID
+```
+
+---
+
+## Python 集成示例
+
+在拥有该故障边界的组件入口记录结构化故障：
 
 ```python
 from mindie_diagnostics.integration import record_failure
 
 result = record_failure(
-    "remote-dev", "mcp.request", stage="decode", category="protocol_mismatch",
+    "remote-dev",
+    "mcp.request",
+    stage="decode",
+    category="protocol_mismatch",
     exception=error,
 )
 ```
 
-Call only at the component boundary that owns the failure. Pass static product
-metadata, never user input as a category or operation. The result contains a
-random incident ID only when writing succeeds; otherwise it exposes
-`logging_failed`. Preserve a trusted inner diagnostic reference instead of
-recording the same error again. Logging never publishes, installs, starts a
-model, or changes the original tool result.
+- 仅传入静态产品元数据，切勿将用户输入作为 `category` 或 `operation`。
+- 调用方参数错误、缺配置、权限不足、网络/认证失败或业务命令非零退出不属于产品自身缺陷，应标记为 `reportable=False` 仅保留在本地。
+- 常规操作可通过 `configure(...).operation(...)` 记录有界阶段、单调时钟耗时与清理证据。
 
-Ordinary caller errors, missing configuration, inactive admission, cancellation,
-permissions, network/authentication failures and business commands returning
-nonzero or timing out do not establish a product defect. Native model failure
-alone is also not a bug. These can stay local with `reportable=False`. Confirmed
-internal faults and malformed own-tool protocols can be reportable.
+---
 
-Normal operations can use `configure(...).operation(...)` for bounded stages,
-monotonic timings and cleanup evidence. Remote stdout/stderr artifacts remain
-owned by remote-dev; log maintenance never trims business output.
+## 环境变量与配置路径
 
-## Publication and privacy
+| 配置项 / 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `MINDIE_DIAGNOSTICS_CONFIG` | `~/.config/mindie-agent/diagnostics.json`（或 `$XDG_CONFIG_HOME/mindie-agent/diagnostics.json`） | 上报策略配置文件路径（队列、回执、健康度与独立运行时存于同级目录） |
+| `MINDIE_DIAGNOSTICS_ROOT` | 平台用户状态目录 | 本地结构化诊断日志根目录 |
+| `MINDIE_LOG_LEVEL` | `INFO` | 日志级别（`DEBUG` / `INFO` / `WARNING` / `ERROR`） |
 
-Public Issues are built without a model, from a strict allowlist: component,
-loaded version/revision, operation/stage, static category, duration, exit/cleanup
-facts and product code frames. Raw messages, commands, output, prompts,
-transcripts, environment values, credentials, session/job IDs, paths and
-addresses are excluded. Evidence is observed behavior, not an asserted cause.
+---
 
-Each candidate has at most three persisted processing cycles, including reads
-and crashes. A cycle has a total deadline, output and page limits. Unknown POST
-results only reconcile; they are never blindly posted again. The public fault
-fingerprint is independent of consent and local incident identity. Existing
-open or closed Issues are linked without commenting or reopening. Simultaneous
-independent clients can still race; this is not a distributed exactly-once
-service. Reporter failures stay local.
+## 文档导航
 
-The active queue holds at most 1,000 candidates for seven days. Terminal evidence
-is compacted to small receipts (at most 1,000 / 30 days). Disabling immediately
-invalidates new remote actions under the previous authorization. Re-enabling
-cannot resurrect its pending evidence. Events produced while off are not
-backfilled.
+| 文档 | 中文 | English |
+| --- | --- | --- |
+| 文档中心索引 | [docs/README.md](./docs/README.md) | [docs/README.en.md](./docs/README.en.md) |
+| 架构、隐私白名单与日志保留规范 | [docs/architecture-and-privacy.md](./docs/architecture-and-privacy.md) | [docs/architecture-and-privacy.en.md](./docs/architecture-and-privacy.en.md) |
 
-## Log retention
+---
 
-Installed writers use four stable 1 MiB segments per process/component. They
-reuse closed segments only after all registered readers have consumed that
-inode. Unknown readers, active or unknown writer PIDs and unconsumed evidence
-are protected. Space pressure is visible as dropped records / `logging_failed`;
-writes resume when safe space becomes available. The dependency-free startup
-fallback is limited to one 1 MiB fault file and fails visibly when full.
+## 开发与测试
 
-Existing adapter updater checks call offline `reporting maintain`, including
-when reporting is off. The default retention target is seven days, 128 MiB and
-512 files per configured root, with bounded scans. A small pressure marker
-prevents new growth when protected data blocks cleanup. These are offline
-maintenance limits, not an instantaneous aggregate cap under arbitrary
-concurrency. Registries are retained conservatively when reader shutdown cannot
-be proved. There is no separate cleanup daemon or transcript scan.
-
-```sh
-python -m mindie_diagnostics.cli reporting maintain
-python -m mindie_diagnostics.cli reporting maintain --update-running
-python -m mindie_diagnostics.cli bundle --root /absolute/log-root --operation-id INCIDENT
+```bash
+python -m pytest
 ```
 
-`reporting maintain` stays offline unless `--update-running` is passed.
-`--update-running` is optional. It affects only an already enabled, healthy
-worker, and only to adopt a higher semantic version of the installed runtime.
-It does not start or revive a stopped or unhealthy worker. `--unit-dir` is the
-optional owned service directory for that inspection. There is no automatic
-revival.
+---
 
-Adapters pass their remaining time through `--budget-seconds`; maintenance
-caps this at 75 seconds and deducts time already spent on local cleanup.
-Insufficient time skips the handoff before changing the service. A failed
-target is recorded and suppressed on later automatic checks; inspect status
-and use an explicit `reporting ensure` to recover. Automatic maintenance never
-downgrades the shared worker, and different content with the same version
-reports a conflict. Failure results retain the system action and return code
-when available, without exposing raw commands or stderr.
+## 许可证
 
-Bundle export is local and does not upload. Normal updater logs go to structured
-state / bounded diagnostics, not indefinitely appended service log files.
-
-## Validation
-
-Run `python -m pytest` for development regressions. They do not establish native
-host behavior, GitHub delivery or Windows hardware acceptance. Real macOS
-process, rotation, Issue and native adapter evidence is recorded separately.
-Native Windows process identity and the Claude Code adapter's local
-fault-to-outbox pipeline are covered separately in
-`docs/production-reporting-acceptance-2026-10-15.md`. This does not establish
-Windows scheduled-task installation or public GitHub delivery.
-
-Diagnostics commands do not launch a model. The desktop Grok Bot remains an
-external application and is not an entry point of this package.
-
-Failure observation keeps reporting authorization distinct from policy storage.
-`fallback.read_policy()` returns `None` only when the selected policy is absent;
-an existing malformed, unsafe or unreadable policy raises `PolicyUnavailable`.
-`consent_status()` distinguishes `allowed`, `withdrawn` and `unavailable`.
-Unavailable policy blocks sending and preserves pending evidence and log cursors;
-only a verified disabled or changed authorization withdraws queued work. The
-nonthrowing local recorder still records the original fault independently.
-
-Outbox initialization is serialized and recorded by a small ownership marker.
-An existing empty/incomplete database, or a missing previously initialized
-outbox, is a storage failure. No query or reopen recreates lost publication
-history. A POST intent remains uncertain through policy, reply and local receipt
-failures, and later automatic processing only reconciles the original marker.
+本项目基于 [MIT License](./LICENSE) 开源。

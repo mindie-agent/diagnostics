@@ -1,14 +1,14 @@
-# Architecture, Privacy & Log Retention Reference
+# Architecture, Privacy Allowlist & Log Rotation Guide
 
 [中文](./architecture-and-privacy.md) · **English** · [Back to Documentation Index](./README.en.md)
 
-This document specifies the failure ownership boundary, strict public Issue allowlist, consent versus policy-storage separation, and bounded local log rotation in `mindie-diagnostics`.
+This guide explains the four core mechanisms inside `mindie-diagnostics`: **how component failures are attributed, how the strict privacy allowlist guarantees zero data leaks, why user consent is kept separate from config storage errors, and how ring-buffer log rotation keeps disk usage bounded.**
 
 ---
 
-## 1. Failure Ownership Boundary
+## 1. Failure Attribution: Product Bugs vs. Everyday User Errors
 
-Invoke `mindie_diagnostics.integration.record_failure` only at the component boundary that owns the failure:
+Inside MindIE Agent components, only the boundary that owns a fault calls `mindie_diagnostics.integration.record_failure`:
 
 ```python
 from mindie_diagnostics.integration import record_failure
@@ -22,40 +22,49 @@ result = record_failure(
 )
 ```
 
-- **Static Metadata Only**: Pass static product identifiers and categories—never pass user input as `category` or `operation`.
-- **Non-Throwing Recording**: The result includes a random `incident_id` when local persistence succeeds; otherwise it exposes `logging_failed` without altering the caller's business result, invoking a model, or performing network I/O.
-- **Caller Errors vs. Product Defects**: Ordinary caller errors, missing configuration, inactive admission, cancellation, permissions, network/authentication failures, non-zero business command exits/timeouts, and native model failures are not product defects and stay local (`reportable=False`). Only confirmed internal faults and malformed own-tool protocols are reportable.
+- **Fixed Code Labels Only**: `category` and `operation` must be static string constants defined in product code — user inputs, commands, and file paths are never passed into these fields.
+- **Logging Failures Never Break Your Task**: When local persistence succeeds, `record_failure` returns a random `incident_id`. If the disk is full or unwritable, it simply flags `logging_failed` in the diagnostic envelope without altering the tool's return value, calling a model, or touching the network.
+- **Separating User Errors from Product Bugs**:
+  - Invalid arguments, missing configuration, insufficient permissions, SSH authentication failures, or non-zero exit codes from your own training scripts are normal operational events, not MindIE Agent bugs. They are recorded locally with `reportable=False` and **never open GitHub Issues**.
+  - Only confirmed internal exceptions and broken own-tool protocols are marked as reportable candidates.
 
 ---
 
-## 2. Public Reporting & Strict Allowlist Privacy
+## 2. Strict Allowlist Privacy for Public Issue Reporting
 
-When a user explicitly enables automatic reporting (`reporting configure --enabled true` followed by `reporting ensure`), the background worker constructs GitHub Issues without any LLM calls from a strict allowlist:
+When you explicitly opt in (`reporting configure --enabled true` and `reporting ensure`), the background worker files GitHub Issues using a deterministic allowlist — **with zero LLM calls**:
 
-- **Allowlisted Fields**: Component name, loaded version/revision, operation and stage, static error category, monotonic duration, exit/cleanup facts, and product code stack frames.
-- **Excluded Data**: Raw exception messages, shell commands, stdout/stderr, prompts, transcripts, environment values, credentials, session/job IDs, file paths, and host addresses.
-- **Bounded Cycles & Idempotent Reconciliation**: Each candidate has at most three persisted processing cycles. Uncertain `POST` outcomes only reconcile on subsequent cycles and are never blindly reposted. Existing open or closed Issues matching the public fault fingerprint are linked without commenting or reopening.
-- **Queue Caps & Immediate Revocation**: The active queue holds at most 1,000 candidates (for 7 days), and terminal evidence is compacted to small receipts (at most 1,000 for 30 days). Disabling reporting immediately invalidates pending remote actions under the prior authorization; re-enabling never backfills events produced while off or resurrects withdrawn candidates.
+| Category | Fields |
+| --- | --- |
+| **✅ Allowlisted (Included)** | Component name, package version & Git commit revision, operation & stage name, static error category, monotonic duration, process exit/cleanup flags, and product code stack frames (file & line numbers within MindIE packages) |
+| **🚫 Strictly Excluded (Never Sent)** | Raw exception message text (`str(e)`), shell commands, `stdout` / `stderr`, prompts, conversation transcripts, environment variable values, credentials/keys, session or job IDs, user file paths, and remote host IPs or hostnames |
 
----
-
-## 3. Consent Status vs. Policy Storage
-
-Failure observation keeps reporting authorization distinct from policy file availability:
-
-- `fallback.read_policy()` returns `None` only when the selected policy file does not exist; an existing malformed, unsafe, or unreadable policy raises `PolicyUnavailable`.
-- `consent_status()` distinguishes `allowed`, `withdrawn`, and `unavailable`:
-  - `unavailable` blocks network transmission while preserving pending evidence and log cursors;
-  - only a verified disabled or changed authorization (`withdrawn`) withdraws queued work.
-- Outbox initialization is serialized and guarded by an ownership marker. An existing empty/incomplete database or a missing previously initialized outbox fails visibly as a storage error rather than silently recreating publication history.
+**Anti-Spam & Instant Revocation Guarantees**:
+- **Idempotent Reconciliation (No Duplicate Issue Spam)**: Each candidate goes through at most 3 processing cycles. If a network drop leaves a `POST` request uncertain, the next cycle checks GitHub first rather than blindly reposting. If an open or closed Issue with the same fault fingerprint already exists, it links to that Issue without commenting or reopening it.
+- **Immediate Revocation When Disabled**: The active queue holds at most 1,000 candidates (for 7 days) and keeps at most 1,000 compact receipts (for 30 days). Running `configure --enabled false` **immediately invalidates all pending items in the queue**; re-enabling later never backfills events recorded while reporting was off.
 
 ---
 
-## 4. Bounded Local Log Rotation & Maintenance
+## 3. Keeping User Consent Separate from Config File Errors
 
-- **Four-Segment Rotation**: Installed writers maintain four fixed 1 MiB JSONL segments per process/component and reuse closed segments only after all registered readers have consumed that inode. Space pressure surfaces visibly as dropped records / `logging_failed` and resumes automatically once safe space is reclaimed.
-- **Dependency-Free Startup Fallback**: Capped at a single 1 MiB fault file that fails visibly when full.
+Many tools treat a corrupted or unreadable config file the same as "first run" or "feature disabled," silently resetting user state or wiping queues.
+
+`mindie-diagnostics` strictly separates consent state from storage errors (`consent_status()`):
+1. **`allowed`**: The policy file is valid and reporting is explicitly enabled.
+2. **`withdrawn`**: The policy file does not exist yet or reporting is explicitly set to `false`. Queued items are withdrawn **only** when `withdrawn` is verified.
+3. **`unavailable`**: If the policy file exists on disk but is malformed, has unsafe permissions, or cannot be read, `fallback.read_policy()` raises `PolicyUnavailable`. In this state, the worker **blocks all network transmission while preserving pending evidence and log cursors** until the file is fixed.
+
+Similarly, the SQLite outbox database records an initialization marker; if a previously initialized database goes missing or becomes empty, it fails visibly as a storage error rather than silently creating a blank history.
+
+---
+
+## 4. Bounded Ring-Buffer Logs & Offline Maintenance
+
+- **4 × 1 MiB Segment Rotation**:
+  Each process/component writes to four fixed `1 MiB` JSONL segments, reusing a closed segment only after all registered readers have finished reading it. If disk space runs low, dropped record counts and `logging_failed` are surfaced visibly and writing resumes automatically once space is freed.
+- **Zero-Dependency Startup Fallback**:
+  Early startup faults before full logger setup are capped at a single `1 MiB` fallback file.
 - **Offline Maintenance (`reporting maintain`)**:
-  - Default retention target: **7 days, 128 MiB, and 512 files** per configured root.
-  - Runs completely offline unless `--update-running` is passed, which only upgrades an already enabled, healthy worker to a higher semantic version (never starting or reviving stopped/unhealthy workers).
-  - Adapters pass their remaining time budget via `--budget-seconds` (capped at 75 seconds).
+  - Enforces a default retention budget of **7 days, 128 MiB, and 512 files** per log root.
+  - Runs completely offline by default. Passing `--update-running` smoothly upgrades an already enabled, healthy background worker to a newer semantic version without ever starting or reviving stopped workers.
+  - Client adapters can pass `--budget-seconds` to bound maintenance runtime (up to 75 seconds).

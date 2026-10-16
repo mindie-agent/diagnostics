@@ -2,10 +2,10 @@
 
 [中文](./README.md) · **English** · [Back to Project Homepage](../README.en.md)
 
-This directory contains the architecture, allowlist privacy specification, outbox state machine, and bounded log retention reference for `mindie-diagnostics`.
+Welcome to the `mindie-diagnostics` documentation hub. Here you will find details on how privacy allowlisting, failure attribution, user consent handling, and bounded ring-buffer logging work.
 
-## Documents
+## Guides & References
 
-| Document | 中文 | English | Summary |
+| Topic | 中文 | English | What You'll Learn |
 | --- | --- | --- | --- |
-| Architecture, Privacy & Log Retention | [architecture-and-privacy.md](./architecture-and-privacy.md) | [architecture-and-privacy.en.md](./architecture-and-privacy.en.md) | Failure ownership boundary, strict public Issue allowlist, consent vs. policy storage separation, 1 MiB segment rotation, and offline maintenance |
+| Architecture, Privacy Allowlist & Log Rotation | [architecture-and-privacy.md](./architecture-and-privacy.md) | [architecture-and-privacy.en.md](./architecture-and-privacy.en.md) | What data is allowlisted vs. stripped, how caller errors are separated from product bugs, how consent and outbox storage are guarded, and how 4 × 1 MiB log rotation works |

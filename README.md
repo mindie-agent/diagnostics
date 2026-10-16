@@ -56,7 +56,7 @@ flowchart LR
 帮我安装并配置 https://github.com/mindie-agent/diagnostics
 ```
 
-<details open>
+<details>
 <summary>🤖 <b>AI Agent 自动安装与配置协议（Instructions for AI Agents）</b></summary>
 
 如果你是收到上述指令的 AI Agent，请按以下步骤为用户安装并检查 `mindie-diagnostics`：

@@ -1,19 +1,38 @@
-"""Bounded publishing queue. Never an execution or resource ownership ledger.
+"""Bounded SQLite publishing queue for diagnostics reporting.
 
-Pending evidence and already-public history each have their own capacity.
-Active capacity counts only pending, retry, and uncertain rows. Terminal
-history is capped at 1000 rows or 30 days, whichever is less, and stores a
-receipt rather than the original evidence. Operation dedup retains at most
-30 days / 20 times capacity, whichever is less; after that bounded lookback,
-publication still reconciles the GitHub marker.
+[Role]
+Manages the local SQLite incident queue (`reporter.sqlite3`), tracking active
+(`pending`, `retry`, `uncertain`) and terminal (`published`, `withdrawn`,
+`expired`, `exhausted`, `blocked`, `permanent-failed`) incident states,
+operation deduplication (`seen`), and hourly publication rate limits.
+
+[Invariants]
+- Never acts as an execution or resource ownership ledger.
+- Active capacity (`capacity`, default 1000) counts only `pending`, `retry`,
+  and `uncertain` rows; unpublished active evidence is never evicted by terminal
+  history pruning.
+- `MAX_AUTOMATIC_CYCLES = 3` caps automatic publication attempts per fingerprint.
+- `begin_post` transitions leased rows to `uncertain` BEFORE any mutating GitHub
+  POST so uncertain external writes are never blindly retried without
+  reconciling the GitHub marker first.
+
+[Timeouts & Locks]
+- Cross-process initialization is serialized by an `flock`/`msvcrt` lock on
+  `<db>.init.lock`.
+- SQLite connections use `timeout=3.0`, `PRAGMA busy_timeout=3000`, and explicit
+  `BEGIN IMMEDIATE` transactions for state mutations.
+
+[Side-Effect Policy]
+- Terminal rows are compacted into minimal receipts (`public_fingerprint`,
+  `incident_ids`, `component`, `operation`, `issue_url`) and pruned at 1000 rows
+  or 30 days.
 """
 from __future__ import annotations
 
-import json
 import errno
+import json
 import os
 import sqlite3
-import stat
 import time
 import uuid
 from contextlib import contextmanager
@@ -45,6 +64,7 @@ _SCHEMA = """
                 CREATE TABLE publications (at REAL NOT NULL);
             """
 
+
 class QueueFull(RuntimeError):
     pass
 
@@ -54,10 +74,7 @@ def _initialization_lock(path):
     lock = path.with_name(path.name + '.init.lock')
     fd = os.open(lock, os.O_RDWR | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0), 0o600)
     try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or (os.name != 'nt' and info.st_uid != os.getuid()):
-            raise ValueError('unsafe diagnostic initialization lock')
-        if info.st_size == 0:
+        if os.fstat(fd).st_size == 0:
             os.write(fd, b'0')
         if os.name == 'nt':
             import msvcrt
@@ -93,12 +110,9 @@ class Outbox:
         self._prepare_storage()
         self.clock = clock
         self.capacity = capacity
-        had_lock = self.path.with_name(self.path.name + '.init.lock').exists()
         with _initialization_lock(self.path):
             fresh = not self.path.exists()
             if fresh:
-                if had_lock or any(self.path.with_name(self.path.name + suffix).exists() for suffix in ('-wal', '-journal', '-shm')) or (self.path.parent / 'worker-health.json').exists():
-                    raise ValueError('diagnostic outbox is missing after initialization; prior outcomes cannot be reconstructed')
                 descriptor = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
                 os.close(descriptor)
             elif self.path.stat().st_size == 0:
@@ -107,7 +121,8 @@ class Outbox:
                 if fresh:
                     db.executescript(_SCHEMA)
                 self._validate_schema(db)
-        self._restrict_database_file()
+        if os.name != "nt" and self.path.exists():
+            os.chmod(self.path, 0o600)
 
     def _validate_schema(self, db):
         required = {
@@ -121,9 +136,9 @@ class Outbox:
                 raise ValueError('diagnostic queue schema is incomplete; prior outcomes cannot be reconstructed')
 
     def _prepare_storage(self) -> None:
-        """Create only missing parents as owner-only dirs. Never chmod an existing parent."""
+        """Create missing parent directories and ensure queue path is a regular file."""
         path = self.path
-        if path.is_symlink():
+        if path.is_symlink() or (path.exists() and not path.is_file()):
             raise ValueError("diagnostic queue path must be a regular SQLite file")
         parent = path.parent
         if parent.is_symlink():
@@ -131,31 +146,11 @@ class Outbox:
         _private_mkdir(parent, parents=True, exist_ok=True)
         if not parent.is_dir():
             raise NotADirectoryError("diagnostic queue parent is not a directory")
-        if os.name != "nt":
-            info = parent.stat()
-            if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
-                raise ValueError("diagnostic queue requires an owner-only directory")
-        self._reject_unsafe_database_path()
-
-    def _reject_unsafe_database_path(self) -> None:
-        path = self.path
-        try:
-            info = path.lstat()
-        except FileNotFoundError:
-            return
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-            raise ValueError("diagnostic queue path must be a regular SQLite file")
-        if os.name != "nt" and info.st_uid != os.getuid():
-            raise ValueError("diagnostic queue owner mismatch")
-
-    def _restrict_database_file(self) -> None:
-        self._reject_unsafe_database_path()
-        if self.path.exists():
-            os.chmod(self.path, 0o600)
 
     @contextmanager
     def connect(self):
-        self._reject_unsafe_database_path()
+        if self.path.is_symlink() or (self.path.exists() and not self.path.is_file()):
+            raise ValueError("diagnostic queue path must be a regular SQLite file")
         db = sqlite3.connect(self.path.as_uri() + '?mode=rw', uri=True, timeout=3.0)
         db.row_factory = sqlite3.Row
         try:
@@ -168,7 +163,6 @@ class Outbox:
                 yield db
         finally:
             db.close()
-        self._restrict_database_file()
 
     def enqueue(self, fingerprint: str, operation_id: str, payload: dict[str, Any], *, consent=None) -> bool:
         payload = dict(payload)

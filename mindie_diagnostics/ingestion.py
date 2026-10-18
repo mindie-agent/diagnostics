@@ -1,4 +1,26 @@
-"""Incremental bounded log consumption, with durable byte cursors and dedup."""
+"""Incremental bounded log consumption with durable SQLite byte cursors.
+
+[Role]
+Scans `<root>/events/<component>/*.jsonl` segments, tracks per-inode byte
+offsets in the `Outbox` `cursors` table, projects failed reportable operations
+into redacted issue bundles, and enqueues them into `Outbox`.
+
+[Invariants]
+- Registers `queue.path` in `<root>/.readers/registry.json` before reading so
+  active segments are not pruned or recycled before ingestion.
+- Never backfills unscoped events or events recorded before `since`.
+- Raises `ConsentUnavailable` without advancing the byte cursor if a scoped
+  event's `reporting.json` policy cannot be read, preserving evidence for a
+  subsequent cycle.
+
+[Timeouts & Locks]
+- Bounded by `max_files=256`, `max_bytes=8 MiB`, and 4096 directory entries per
+  ingestion cycle.
+
+[Side-Effect Policy]
+- Persists `(path, inode, offset, touched, discard)` in `Outbox` `cursors` and
+  enqueues deduplicated incident payloads into `Outbox` `incidents`.
+"""
 from __future__ import annotations
 
 from collections import deque

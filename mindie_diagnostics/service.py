@@ -1,8 +1,26 @@
-"""Install an explicitly enabled native user service; never edit personal units.
+"""Linux systemd user service management and cross-platform service dispatch.
 
-This is installation work, not a task entry or background execution authority.
-The unit rate-limits its journal output; system-wide journal capacity remains
-under the administrator's existing policy. No journald configuration is changed.
+[Role]
+Manages `mindie-diagnostics.service` under `~/.config/systemd/user` on Linux and
+delegates to `platform_service` on macOS (`darwin`) and Windows (`win32`).
+
+[Invariants]
+- Refuses to overwrite or unload unowned unit files or units with systemd
+  `DropInPaths` overrides (`unowned_unit`, `unowned_unit_override`).
+- Requires an installed virtualenv Python interpreter (`installed_venv_required`)
+  and an enabled `reporting.json` policy matching `expected_consent_revision`.
+- Preserves the initial `since` timestamp across `ensure` updates.
+
+[Timeouts & Locks]
+- `_locked` serializes unit installation/removal via `flock` on
+  `.mindie-diagnostics-service.lock` with a 10s timeout capped by `runner.deadline`.
+- All `systemctl` / `systemd-analyze` subprocess calls use a 30s timeout.
+
+[Side-Effect Policy]
+- Stages unit files in a sibling directory and runs `systemd-analyze verify`
+  (when available) before atomic `os.replace`.
+- `remove_service` disables and deletes the unit file while preserving all local
+  logs and SQLite outbox state.
 """
 from __future__ import annotations
 

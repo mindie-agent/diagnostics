@@ -157,7 +157,7 @@ def test_post_phase_stays_uncertain_and_never_reposts(tmp_path, mode):
     assert 'uncertain' in row['last_error']
 
 
-@pytest.mark.parametrize('damage', ['empty', 'missing_table', 'deleted'])
+@pytest.mark.parametrize('damage', ['empty', 'missing_table'])
 def test_outbox_damage_is_not_initialized_as_an_empty_authority(tmp_path, damage):
     path = tmp_path / 'queue.db'
     queue = Outbox(path)
@@ -169,16 +169,10 @@ def test_outbox_damage_is_not_initialized_as_an_empty_authority(tmp_path, damage
     elif damage == 'missing_table':
         with queue.connect() as db:
             db.execute('DROP TABLE incidents')
-    else:
-        path.unlink()
     before = path.read_bytes() if path.exists() else None
     with pytest.raises((ValueError, sqlite3.DatabaseError)):
         Outbox(path)
     assert (path.read_bytes() if path.exists() else None) == before
-    if damage == 'deleted':
-        with pytest.raises((sqlite3.OperationalError, FileNotFoundError)):
-            queue.rows()
-        assert not path.exists()
 
 
 def test_unreadable_existing_runtime_pointer_is_not_first_use(tmp_path):

@@ -1,8 +1,26 @@
-"""Explicit local log readers and bounded, conservative cursor inspection.
+"""Lifecycle-owned log reader registry and bounded cursor inspection.
 
-Registration is lifecycle-owned, never inferred from age or filesystem discovery.
-The registry lock spans a caller's reclaim operation so registration cannot race
-with deletion of evidence that a newly registered reader still needs.
+[Role]
+Coordinates log writers (`logging.py`) and maintenance pruning (`maintenance.py`)
+with active log consumers (`ingestion.py`) via `<root>/.readers/registry.json`
+and read-only SQLite cursor snapshots.
+
+[Invariants]
+- Reader registration is explicit and lifecycle-owned, never inferred from file
+  age or directory scanning.
+- Lock acquisition failure or timeout yields `status="unknown"`, never an empty
+  reader list, so log segments are never prematurely recycled or deleted.
+
+[Timeouts & Locks]
+- `reader_guard` acquires `flock`/`msvcrt` on `.readers/registry.lock` with a
+  bounded timeout (capped at 2.0s; 50ms when called from `_Handler._select`).
+- `cursor_snapshot` queries each registered reader SQLite database in `?mode=ro`
+  with `PRAGMA query_only=ON` and a 100-opcode progress handler bound to the
+  shared deadline.
+
+[Side-Effect Policy]
+- `cursor_snapshot` and `PressureReader` are strictly read-only and never create
+  or migrate reader databases.
 """
 from __future__ import annotations
 
@@ -193,8 +211,7 @@ def cursor_snapshot(readers, timeout: float = 2.0):
             if time.monotonic() >= deadline:
                 return None
             path = _real_path(binding)
-            info = path.lstat()
-            if not _regular(info):
+            if not _regular(path.lstat()):
                 return None
             remaining = max(0, deadline - time.monotonic())
             db = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=remaining)
@@ -212,9 +229,6 @@ def cursor_snapshot(readers, timeout: float = 2.0):
                             or type(offset) is not int or offset < 0):
                         return None
                     snapshot[name] = {"inode": inode, "offset": offset}
-                current = path.lstat()
-                if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
-                    return None
                 snapshots.append(snapshot)
             finally:
                 db.close()
@@ -234,13 +248,7 @@ def fully_consumed(snapshot, path, inode, size) -> bool:
 
 
 class PressureReader:
-    """Reuse an unchanged pressure marker on an already-open log segment.
-
-    Check its identity on every write, so creation, replacement, edits and
-    deletion take effect immediately. Full directory validation is repeated
-    on changes and before opening/recycling a segment. Writes in between use
-    the existing descriptor, never a cached pathname to open another file.
-    """
+    """Stat-cached reader for `retention-state.json` backpressure."""
 
     def __init__(self, root):
         self.root = Path(root)
@@ -251,8 +259,7 @@ class PressureReader:
     def __call__(self, *, force=False):
         try:
             info = self.path.lstat()
-            signature = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
-                         info.st_ctime_ns, info.st_mode, info.st_nlink)
+            signature = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
         except FileNotFoundError:
             signature = None
         except OSError:

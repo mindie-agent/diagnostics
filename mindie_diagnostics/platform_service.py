@@ -1,8 +1,27 @@
-"""Owned Windows scheduled tasks and macOS launch agents for the local worker.
+"""macOS LaunchAgent and Windows Scheduled Task management for the local worker.
 
-Managers supervise an installed Python process. Their configuration contains
-paths and arguments only; optional credentials are read by that process from a
-private file. Nothing installs a machine-wide service or changes login policy.
+[Role]
+Installs, queries, starts, and removes the user-scoped native background worker
+on macOS (`~/Library/LaunchAgents`) and Windows (Scheduled Tasks) using a JSON
+manifest (`mindie-diagnostics-service.json`) and SHA-256 unit verification.
+
+[Invariants]
+- Never installs a machine-wide service or modifies user login policy.
+- Re-verifies `reporting.json` consent and revision before any native unit write
+  or service start/stop mutation.
+- On macOS, `_await_bootout` confirms label removal (`launchctl print` exit 113)
+  before running `launchctl bootstrap`.
+
+[Timeouts & Locks]
+- `_locked` acquires an exclusive `flock`/`msvcrt` lock on `.lock` with a 10s
+  default ceiling capped by `runner.deadline`.
+- `_await_bootout` polls `launchctl print` every 50ms within a 3.0s deadline.
+
+[Side-Effect Policy]
+- If writing the updated unit or manifest fails after `bootout`, the prior unit
+  and manifest bytes are restored without starting the service.
+- `remove_service` unloads and deletes only owned unit/manifest files while
+  preserving diagnostic logs and outbox state.
 """
 from __future__ import annotations
 

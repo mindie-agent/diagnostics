@@ -1,6 +1,23 @@
-"""Pure scanner migrated from mindie-knowledge r2 without changing rule behavior.
+"""Pure privacy and credential redaction scanner (`REDACTION_PROFILE = "r2"`).
 
-File/CLI parsing remains with callers. This module has no knowledge dependency.
+[Role]
+Scans and redacts strings (`scan_text`, `redact_text`) and parsed JSON/YAML trees
+(`scan_tree`) against 21 deterministic privacy rules covering credentials, network
+addresses, user paths/identities, internal machine/container identifiers, and
+high-entropy tokens.
+
+[Invariants]
+- Zero external or `mindie-knowledge` runtime dependencies; deterministic rule
+  ordering where earlier rules claim spans and skip overlapping matches.
+- Hex digests (commit SHAs, SHA-256 hashes) and UUIDs are excluded from
+  `credential-high-entropy` false positives.
+
+[Timeouts & Locks]
+- Pure in-memory regex/token evaluation with zero I/O or locks on `scan_text`,
+  `scan_tree`, and `redact_text`.
+
+[Side-Effect Policy]
+- Pure functions returning `Finding` lists or `<redacted:rule-id>` strings.
 """
 from __future__ import annotations
 import json

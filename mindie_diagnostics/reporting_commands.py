@@ -1,4 +1,28 @@
-"""Explicit local reporting operations; never invoked by recording a fault."""
+"""Explicit local reporting lifecycle commands (`maintain`, `ensure`, `upgrade_running`).
+
+[Role]
+Implements offline maintenance (`maintain`), explicit runtime + native service
+provisioning (`ensure`), and bounded automatic runtime handoff (`upgrade_running`).
+
+[Invariants]
+- Never invoked automatically when a tool records a local failure.
+- `upgrade_running` only upgrades an already-active healthy worker when the
+  installed distribution is strictly newer (`_source_order == "newer"`) and at
+  least 60s of budget remain (`61s` from `maintain`).
+- `current.json` is published only AFTER the replaced service passes health and
+  `runtime_source` readback verification; otherwise rolls back to `old_python`.
+
+[Timeouts & Locks]
+- `maintain` shares a single monotonic deadline capped at `75.0s` (or
+  `_UPDATE_BUDGET_S + 15.0`).
+- `upgrade_running` reserves `_ROLLBACK_RESERVE_S = 20.0s` for rollback before
+  `deadline`, caps lock acquisition at `_LOCK_WAIT_S = 12.0s`, and polls worker
+  readback for up to `_READBACK_S = 8.0s`.
+
+[Side-Effect Policy]
+- Coordinates runtime generation preparation and native service installation
+  under `runtime_transaction`.
+"""
 from __future__ import annotations
 
 import math
@@ -15,7 +39,13 @@ from .integration import reporting_status, _worker_view
 
 def _state(config):
     path = f._as_local_absolute(f.state_path(config))
-    if path is None or not f._owned_dir(path, create=True):
+    if path is None or path.is_symlink():
+        raise ValueError('unsafe_state_directory')
+    try:
+        f._private_mkdir(path, parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ValueError('unsafe_state_directory') from exc
+    if not path.is_dir():
         raise ValueError('unsafe_state_directory')
     return path
 

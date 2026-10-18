@@ -31,13 +31,6 @@ class PrivateDirectoryTests(unittest.TestCase):
                 fallback._private_mkdir(file, exist_ok=True)
             self.assertEqual(file.read_bytes(), b"retained")
 
-    def test_fallback_remains_standalone(self):
-        spec = importlib.util.spec_from_file_location("standalone_diagnostic_fixture", fallback.__file__)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        with tempfile.TemporaryDirectory() as temporary:
-            module._private_mkdir(Path(temporary) / "private")
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,4 +1,28 @@
-"""User-owned runtime copied from the installed mindie-diagnostics distribution."""
+"""Immutable generation-based runtime preparation for the diagnostics worker.
+
+[Role]
+Copies the installed `mindie_diagnostics` distribution into a user-owned,
+content-addressed generation virtualenv (`<policy>.runtime/generations/<sha256>/venv`)
+and atomically updates `current.json` under an exclusive transaction lock.
+
+[Invariants]
+- Rejects editable installs (`direct_url.json` `editable=True`), symlinked package
+  files, and version downgrades (`downgrade_rejected`).
+- Each generation is verified via `python -I -c ...` with `PYTHONPATH` and
+  `PYTHONHOME` stripped before promotion to `current.json`.
+
+[Timeouts & Locks]
+- `runtime_transaction` acquires an advisory lock on `.prepare.lock` with a
+  default 12.0s wait budget (`_LOCK_WAIT`).
+- Shared monotonic `deadline` bounds venv creation (`<= 30s`), file placement,
+  and subprocess verification (`<= 10s`).
+
+[Side-Effect Policy]
+- Failed staging directories (`.staging-<uuid>`) are cleaned up in `finally`
+  without mutating `current.json`.
+- `retire_other_generations` removes superseded generation directories only
+  after a successful service handoff.
+"""
 
 import hashlib
 import json
@@ -127,16 +151,13 @@ def _collect(dist, read_bounded):
         except Exception:
             _fail("source_rejected")
         if data is None:
-            # pip creates an empty dist-info/REQUESTED marker. Validate it with
-            # the same no-follow regular-file boundary before preserving it.
-            fd = os.open(loc, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
             try:
-                info = os.fstat(fd)
-                if not stat.S_ISREG(info.st_mode) or info.st_size != 0 or (hasattr(os, 'geteuid') and info.st_uid != os.geteuid()):
-                    _fail("source_rejected")
-                data = b""
-            finally:
-                os.close(fd)
+                st = loc.lstat()
+            except OSError:
+                _fail("source_rejected")
+            if not stat.S_ISREG(st.st_mode) or st.st_size != 0:
+                _fail("source_rejected")
+            data = b""
         if not isinstance(data, bytes):
             _fail("source_rejected")
         total += len(data)

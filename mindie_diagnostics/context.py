@@ -1,4 +1,22 @@
-"""Diagnostic correlation only: none of these identifiers grants authority."""
+"""ContextVar-backed diagnostic correlation identifiers (`trace_id`, `operation_id`, `phase_id`).
+
+[Role]
+Propagates 32-hex correlation identifiers (`trace_id`, `operation_id`,
+`parent_operation_id`, `phase_id`) across in-process operations, child threads
+(`wrap_context`), and subprocess environments (`MINDIE_DIAGNOSTICS_CONTEXT`).
+
+[Invariants]
+- Correlation IDs are strictly observational and never grant execution or
+  reporting authority.
+- Invalid or oversized (`> 2048` bytes) `MINDIE_DIAGNOSTICS_CONTEXT` values are
+  silently ignored (`{}`).
+
+[Timeouts & Locks]
+- Pure `contextvars` lookup/reset with zero locks or blocking I/O.
+
+[Side-Effect Policy]
+- `bind_context` resets the `ContextVar` token in `finally`.
+"""
 from __future__ import annotations
 
 from contextlib import contextmanager

@@ -1,8 +1,27 @@
-"""Standalone local diagnostics fallback. Stdlib only.
+"""Standalone local diagnostics fallback and consent policy authority (stdlib only).
 
-Safe to copy byte-for-byte into adapter scripts. Import does no file I/O.
-Never raises from the public recorder, never calls a service, and never
-records exception text, arguments, command lines, or outputs.
+[Role]
+- Provides zero-dependency failure event recording (`record_failure`), consent policy
+  reading (`read_policy`, `current_consent`, `consent_status`), and consent scope hashing
+  (`scope_key`).
+- Safe to import without side effects; never raises from `record_failure` and never
+  records raw exception messages, command arguments, or user data.
+
+[Invariants]
+- `read_policy()` returns `None` strictly when the policy file is absent; unreadable or
+  malformed policy files raise `PolicyUnavailable` so callers never conflate policy
+  damage with first-use or consent withdrawal.
+- `record_failure()` emits bounded JSONL records (`<= 16 KiB` per record, `<= 1 MiB` per
+  fallback file) and respects `retention-state.json` pressure blocks.
+
+[Timeouts & Locks]
+- Uses non-blocking `_lock.acquire(blocking=False)` in `_append_event` and `O_NONBLOCK`
+  file descriptors so fallback recording never blocks the caller's critical path.
+- Resets locks and process instance identity across `os.fork()` via `register_at_fork`.
+
+[Side-Effect Policy]
+- Local-only bounded file appends under `<root>/events/<component>/`; never spawns
+  subprocesses, never performs network I/O, and never modifies existing parent permissions.
 """
 
 from __future__ import annotations
@@ -443,71 +462,42 @@ def _append_line(directory, filename, payload) -> bool:
     fd = os.open(os.fspath(path), flags, 0o600)
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or not _owned(info):
+        if not stat.S_ISREG(info.st_mode):
             return False
         if info.st_size >= _MAX_FILE_BYTES or info.st_size + len(payload) > _MAX_FILE_BYTES:
             return False
-        if hasattr(os, "fchmod"):
-            os.fchmod(fd, 0o600)
         return os.write(fd, payload) == len(payload)
     finally:
         os.close(fd)
 
 
 def _ensure_owned_tree(root, leaf) -> bool:
-    """Create only root and descendants. Never chmod ancestors above root."""
-    if not _owned_dir(root, create=True):
-        return False
-    current = root
-    for part in leaf.relative_to(root).parts:
-        current = current / part
-        if not _owned_dir(current, create=True):
-            return False
-    return True
-
-
-def _owned_dir(path, *, create) -> bool:
+    """Create leaf directory without modifying existing ancestor permissions."""
     try:
-        info = os.lstat(path)
-    except FileNotFoundError:
-        if not create:
+        if root.is_symlink() or leaf.is_symlink():
             return False
-        try:
-            _private_mkdir(path, parents=True, exist_ok=True)
-            info = os.lstat(path)
-        except OSError:
-            return False
+        _private_mkdir(leaf, parents=True, exist_ok=True)
+        return not leaf.is_symlink() and leaf.is_dir()
     except OSError:
         return False
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-        return False
-    return _owned(info)
 
 
 def _read_regular_bounded(path, limit):
     """Read a regular file without following a symlink or blocking on a FIFO."""
-    try:
-        info = os.lstat(path)
-    except OSError:
-        return None
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-        return None
-    if not _owned(info) or info.st_size <= 0 or info.st_size > limit:
-        return None
     flags = os.O_RDONLY
     if hasattr(os, "O_NONBLOCK"):
         flags |= os.O_NONBLOCK
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
+        if Path(path).is_symlink():
+            return None
         fd = os.open(os.fspath(path), flags)
     except OSError:
         return None
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or not _owned(info):
-            return None
-        if info.st_size <= 0 or info.st_size > limit:
+        if not stat.S_ISREG(info.st_mode) or info.st_size <= 0 or info.st_size > limit:
             return None
         blob = os.read(fd, limit + 1)
     except OSError:

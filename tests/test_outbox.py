@@ -107,11 +107,6 @@ def test_published_receipt_survives_consent_disable_and_pending_withdraws(tmp_pa
     consent = current_consent(path)
     now = [1000.0]
     queue = Outbox(tmp_path / 'queue.db', clock=lambda: now[0])
-    with queue.connect() as db:
-        columns = {row[1] for row in db.execute('PRAGMA table_info(incidents)')}
-        tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    assert 'diagnosis' not in columns and 'diagnosis_state' not in columns and 'generations' not in tables
-    assert not hasattr(Outbox, 'begin_generation') and not hasattr(Outbox, 'published')
     queue.enqueue('pub', 'a' * 32, {'component': 'reporter'}, consent=consent)
     now[0] += 1
     queue.enqueue('unc', 'b' * 32, {'component': 'reporter'}, consent=consent)

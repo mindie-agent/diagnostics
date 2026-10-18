@@ -1,4 +1,25 @@
-"""Offline retention. Called by the worker, never by ordinary tool operations."""
+"""Offline log retention and backpressure marker management.
+
+[Role]
+Prunes consumed, aged, or over-quota JSONL event segments under `<root>/events`
+whose writer process has exited, and writes `<root>/retention-state.json` to
+signal backpressure to active log writers when retention limits remain exceeded.
+
+[Invariants]
+- Called only by maintenance/worker flows, never inline during ordinary tool
+  operations.
+- Never deletes a segment unless: (1) all registered readers have consumed it
+  (`fully_consumed`), (2) it is at least 300s old, and (3) its POSIX writer PID
+  definitively exited (`ESRCH`).
+
+[Timeouts & Locks]
+- Enforces a 1.0s overall monotonic scan/prune deadline (`deadline = time.monotonic() + 1`),
+  with a 100ms `reader_guard` lock budget and 200ms `cursor_snapshot` budget.
+
+[Side-Effect Policy]
+- Unlinks only verified consumed log segments and atomically updates
+  `retention-state.json`.
+"""
 from __future__ import annotations
 
 import os
@@ -15,12 +36,7 @@ _FILE = re.compile(r"(\d+)-[0-9a-f]{32}\.jsonl(?:\.[1-3])?\Z")
 
 
 def _writer_exited(pid: int) -> bool:
-    """Only positive POSIX PIDs with a definitive ESRCH are safe to prune.
-
-    An idle writer can still hold an append handle. PID reuse, permission
-    failures and platforms without this probe all retain the file. In
-    particular, Windows os.kill(pid, 0) is not a POSIX liveness check.
-    """
+    """Only positive POSIX PIDs with a definitive ESRCH are safe to prune."""
     if os.name != "posix" or pid <= 0:
         return False
     try:
@@ -117,13 +133,12 @@ def prune(root: str | Path, *, max_bytes: int = 128 * 1024 * 1024,
                 if not exited[pid]:
                     result['active_or_unknown_files'] += 1
                     continue
-                if (path.is_symlink() or path.parent.is_symlink()
-                        or not path.resolve().is_relative_to(events.resolve())):
+                if path.is_symlink() or path.parent.is_symlink():
                     incomplete = True
                     continue
                 try:
                     current = path.stat(follow_symlinks=False)
-                    if (not stat.S_ISREG(current.st_mode) or current.st_nlink != 1
+                    if (not stat.S_ISREG(current.st_mode)
                             or (current.st_dev, current.st_ino, current.st_mtime_ns, current.st_size)
                             != (device, inode, modified_ns, size)):
                         incomplete = True

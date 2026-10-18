@@ -1,4 +1,24 @@
-"""Support bundle and independent reporter worker commands."""
+"""CLI entry point (`mindie-diagnostics`) for bundles, services, reporting, and worker loop.
+
+[Role]
+Provides the `mindie-diagnostics` command-line interface (`bundle`, `status`,
+`service`, `reporting`, `worker`) and executes the supervised worker loop
+(`run_cycle`: `consent` -> `ingest` -> `retention` -> `report`).
+
+[Invariants]
+- Each stage in `run_cycle` is isolated so an ingestion or retention failure
+  does not prevent the outbox from draining (`publish_one`).
+- The worker re-reads `reporting.json` at the start of every cycle and
+  immediately withdraws unconsented items and exits 0 if reporting is disabled.
+
+[Timeouts & Locks]
+- Worker loop sleeps on `stop.wait(args.interval)` (minimum 5s) and handles
+  `SIGINT`/`SIGTERM` by setting the shared `stop` event passed to `GitHub`.
+
+[Side-Effect Policy]
+- Emits single-line ASCII JSON results to stdout and exits non-zero on
+  `error`, `degraded`, or `configuration_unavailable` states.
+"""
 from __future__ import annotations
 
 import argparse

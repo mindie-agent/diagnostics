@@ -1,4 +1,35 @@
-"""Offline event ingestion and separate, conservative GitHub publication."""
+"""Conservative GitHub issue reconciliation and publication for `Outbox` items.
+
+[Role]
+Renders sanitized diagnostic issue payloads (`issue_payload`, `render_issue`),
+communicates with GitHub via `gh api --include` (`GitHub`), reconciles existing
+issue markers (`<!-- mindie-incident:<sha256> -->`), and publishes new issues
+with strict external-effect honesty (`publish_one`).
+
+[Invariants]
+- Re-projects and re-scans every bundle via `export_issue_event` and `scan_text`
+  before rendering; never trusts a caller-supplied redaction flag.
+- Always searches existing repository issues (`find_issue`) before creating a
+  new issue; if an issue with the marker exists, transitions to `published`
+  (`status="reconciled"`) without posting a duplicate.
+- Calls `queue.begin_post(item)` BEFORE `POST repos/<repo>/issues` so any process
+  death or transport failure after process start records `state="uncertain"`.
+- Never overwrites an acknowledged external publication (`published` / `reconciled`)
+  as a remote failure if local SQLite receipt update fails (`_record_publication_outcome`).
+
+[Timeouts & Locks]
+- Leases `Outbox` items for `github.timeout + 5` seconds (`default 35s`).
+- `GitHub.begin_cycle` enforces an overall cycle deadline (`default 30s`) and an
+  `8 MiB` response byte budget across pagination, reserving up to 15s for `POST`
+  after search pagination.
+- `_run_gh` spawns `gh` in an isolated process group (`start_new_session=True` /
+  `CREATE_NEW_PROCESS_GROUP`) and reaps the entire process group on timeout/cancel
+  (`SIGTERM` -> 2.0s grace -> `SIGKILL`).
+
+[Side-Effect Policy]
+- Mutates external GitHub issues only when `reporting.json` consent is actively
+  enabled and matches the item's recorded repository and revision.
+"""
 from __future__ import annotations
 
 import hashlib

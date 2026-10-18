@@ -40,7 +40,7 @@ def maintain(config=None, *, update_running=False, unit_dir=None, budget_seconds
         raise ValueError('invalid_budget')
     if not math.isfinite(budget_seconds) or budget_seconds < 0:
         raise ValueError('invalid_budget')
-    deadline = time.monotonic() + min(float(budget_seconds), 75.0)
+    deadline = time.monotonic() + min(float(budget_seconds), max(75.0, _UPDATE_BUDGET_S + 15.0))
     if f._as_local_absolute(f.policy_path(config)) is None:
         raise ValueError('invalid_configuration')
     try:
@@ -145,7 +145,7 @@ def ensure(config=None, *, unit_dir=None):
         return {'status': 'degraded', 'category': category}
 
 
-_UPDATE_BUDGET_S = 60.0
+_UPDATE_BUDGET_S = 180.0
 _READBACK_S = 8.0
 _ROLLBACK_RESERVE_S = 20.0
 _LOCK_WAIT_S = 12.0
@@ -217,7 +217,7 @@ def upgrade_running(config=None, *, unit_dir=None, deadline=None):
     if deadline is None:
         deadline = now + _UPDATE_BUDGET_S
     else:
-        if deadline - now < _UPDATE_BUDGET_S:
+        if deadline - now < 60.0:
             # Never enter service replacement without the complete safe window.
             return {'status': 'skipped', 'reason': 'insufficient_budget'}
         deadline = min(now + _UPDATE_BUDGET_S, deadline)

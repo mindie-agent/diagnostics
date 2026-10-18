@@ -88,3 +88,17 @@ def test_missing_cursor_table_is_unread(tmp_path):
     register_reader(tmp_path, path)
     assert cursor_snapshot([str(path)]) == [{}]
     assert not fully_consumed([{}], '/log', 1, 1)
+
+
+def test_reader_guard_timeout_is_explicit_and_not_swallowed(tmp_path, monkeypatch):
+    import mindie_diagnostics.reader_registry as rr
+
+    monkeypatch.setattr(rr, '_try_lock', lambda _fd: False)
+    with reader_guard(tmp_path, timeout=0.02) as state:
+        assert state == {'status': 'unknown', 'reason': 'timeout', 'readers': []}
+    path = queue(tmp_path / 'busy.db')
+    with pytest.raises(TimeoutError, match='diagnostic reader registry is busy'):
+        register_reader(tmp_path, path, timeout=0.02)
+    with pytest.raises(TimeoutError, match='diagnostic reader registry is busy'):
+        unregister_reader(tmp_path, path, timeout=0.02)
+

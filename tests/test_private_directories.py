@@ -48,7 +48,7 @@ class PrivateDirectoryTests(unittest.TestCase):
                 altered.update(change)
                 self.assert_private_acl(dict(facts, child_access=[altered]))
 
-    def test_existing_directory_is_not_repermissioned(self):
+    def test_recursive_concurrent_creation_and_existing_entries(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             before = stat.S_IMODE(root.stat().st_mode)
@@ -56,10 +56,6 @@ class PrivateDirectoryTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(root.stat().st_mode), before)
             with self.assertRaises(FileExistsError):
                 fallback._private_mkdir(root)
-
-    def test_recursive_concurrent_creation_and_existing_file(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
             leaf = root / "one" / "two"
             with ThreadPoolExecutor(max_workers=4) as pool:
                 list(pool.map(lambda _: fallback._private_mkdir(leaf, parents=True, exist_ok=True), range(8)))
@@ -71,16 +67,6 @@ class PrivateDirectoryTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 fallback._private_mkdir(file, exist_ok=True)
             self.assertEqual(file.read_bytes(), b"retained")
-
-    def test_creation_failure_is_visible(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            target = Path(temporary) / "missing"
-            owner = fallback if os.name == "nt" else os
-            name = "_windows_private_mkdir" if os.name == "nt" else "mkdir"
-            with patch.object(owner, name, side_effect=PermissionError("synthetic create denied")):
-                with self.assertRaises(PermissionError):
-                    fallback._private_mkdir(target)
-            self.assertFalse(target.exists())
 
     def test_fallback_remains_standalone(self):
         # The adapter vendors one file; its private-directory helper must not

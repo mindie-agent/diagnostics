@@ -211,13 +211,13 @@ class Outbox:
             raise ValueError('diagnostic authority identity changed; prior outcomes cannot be reconstructed')
         # Never let sqlite create a missing authority during ordinary reads or
         # mutations. Only the locked first initialization may create this file.
-        db = sqlite3.connect(self.path.as_uri() + '?mode=rw', uri=True, timeout=0.1)
+        db = sqlite3.connect(self.path.as_uri() + '?mode=rw', uri=True, timeout=3.0)
         db.row_factory = sqlite3.Row
         try:
             if (hasattr(self, '_schema_version')
                     and db.execute('PRAGMA schema_version').fetchone()[0] != self._schema_version):
                 self._validate_schema(db)
-            db.execute("PRAGMA busy_timeout=100")
+            db.execute("PRAGMA busy_timeout=3000")
         except BaseException:
             db.close()
             raise
@@ -363,7 +363,8 @@ class Outbox:
     def _compact_terminal(self, db) -> None:
         rows = db.execute(
             "SELECT fingerprint, payload, issue_url FROM incidents WHERE state IN "
-            "('published','withdrawn','expired','exhausted','blocked','permanent-failed')"
+            "('published','withdrawn','expired','exhausted','blocked','permanent-failed') "
+            "AND (payload LIKE '%\"events\":%' OR payload NOT LIKE '%\"public_fingerprint\":%')"
         ).fetchall()
         for row in rows:
             receipt = self._receipt(row["fingerprint"], row["payload"], row["issue_url"])

@@ -128,9 +128,9 @@ def _unlock(fd: int) -> None:
 
 
 @contextmanager
-def reader_guard(root, timeout: float = .1, queue_path=None):
+def reader_guard(root, timeout: float = 2.0, queue_path=None):
     """Hold the registry lock; uncertainty is explicit and never an empty set."""
-    deadline = time.monotonic() + max(0, min(float(timeout), .2))
+    deadline = time.monotonic() + max(0, min(float(timeout), 2.0))
     fd = None
     locked = False
     state = {"status": "unknown", "readers": []}
@@ -154,6 +154,8 @@ def reader_guard(root, timeout: float = .1, queue_path=None):
                 readers.append(binding)
                 _save(folder, readers)
         state = {"status": "ok", "readers": readers}
+    except TimeoutError:
+        state = {"status": "unknown", "reason": "timeout", "readers": []}
     except (OSError, ValueError, TypeError, UnicodeError):
         pass
     try:
@@ -167,28 +169,32 @@ def reader_guard(root, timeout: float = .1, queue_path=None):
                 os.close(fd)
 
 
-def register_reader(root, queue_path) -> None:
-    with reader_guard(root, queue_path=queue_path) as state:
+def register_reader(root, queue_path, *, timeout: float = 2.0) -> None:
+    with reader_guard(root, timeout=timeout, queue_path=queue_path) as state:
         if state["status"] != "ok":
+            if state.get("reason") == "timeout":
+                raise TimeoutError("diagnostic reader registry is busy")
             raise RuntimeError("diagnostic reader registration unavailable")
 
 
-def unregister_reader(root, queue_path) -> None:
+def unregister_reader(root, queue_path, *, timeout: float = 2.0) -> None:
     # A missing queue may be deliberately unregistered after its reader stopped.
     binding = str(_real_path(queue_path))
-    with reader_guard(root) as state:
+    with reader_guard(root, timeout=timeout) as state:
         if state["status"] != "ok":
+            if state.get("reason") == "timeout":
+                raise TimeoutError("diagnostic reader registry is busy")
             raise RuntimeError("diagnostic reader registration unavailable")
         if binding in state["readers"]:
             _save(_real_path(root) / ".readers",
                   [value for value in state["readers"] if value != binding])
 
 
-def cursor_snapshot(readers, timeout: float = .1):
+def cursor_snapshot(readers, timeout: float = 2.0):
     """Read existing cursor tables; never create/migrate a reader database."""
     if not isinstance(readers, list) or len(readers) > _MAX_READERS:
         return None
-    deadline = time.monotonic() + max(0, min(float(timeout), .2))
+    deadline = time.monotonic() + max(0, min(float(timeout), 2.0))
     snapshots = []
     try:
         for binding in readers:

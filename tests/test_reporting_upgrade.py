@@ -30,8 +30,11 @@ def prepared(tmp_path, monkeypatch):
 
 
 def test_timed_out_preparation_is_visible_and_same_target_is_not_retried(prepared, monkeypatch):
+    assert commands._UPDATE_BUDGET_S == 180.0
+    assert commands._UPDATE_BUDGET_S - commands._ROLLBACK_RESERVE_S >= 160.0
     config, root, _state, calls = prepared
     preparations = []
+    started = time.monotonic()
     def timeout(*args, **kwargs):
         preparations.append(kwargs['deadline'])
         raise subprocess.TimeoutExpired(['controlled-prepare'], 0.1)
@@ -41,6 +44,7 @@ def test_timed_out_preparation_is_visible_and_same_target_is_not_retried(prepare
     assert first['status'] == 'degraded' and first['rollback'] == 'not_needed'
     assert second['status'] == 'suppressed'
     assert len(preparations) == 1 and calls == []
+    assert preparations[0] - started >= 150.0
     record = json.loads((root / ('update-' + 'b' * 64 + '.json')).read_text())
     assert record['status'] == 'failed'
 
@@ -187,3 +191,111 @@ def test_native_failure_action_and_code_are_preserved_without_raw_message(prepar
     for value in (result, record):
         assert value['failure_action'] == 'launchctl.bootstrap' and value['failure_returncode'] == 5
         assert value['rollback'] == 'restored'
+
+
+def test_collect_source_reads_real_distribution_tree_and_rejects_symlinks(tmp_path, monkeypatch):
+    import importlib.metadata as metadata
+    import mindie_diagnostics
+
+    site = tmp_path / "site-packages"
+    pkg_dir = site / "mindie_diagnostics"
+    dist_info = site / "mindie_diagnostics-0.4.2.dist-info"
+    pycache = pkg_dir / "__pycache__"
+    pkg_dir.mkdir(parents=True, mode=0o700)
+    dist_info.mkdir(parents=True, mode=0o700)
+    pycache.mkdir(parents=True, mode=0o700)
+
+    init_file = pkg_dir / "__init__.py"
+    init_file.write_text('__version__ = "0.4.2"\n', encoding="utf-8")
+    (pkg_dir / "helper.py").write_text("VALUE = 42\n", encoding="utf-8")
+    (pycache / "helper.cpython-313.pyc").write_bytes(b"\x00\x01\x02\x03")
+
+    commit = "d" * 40
+    (dist_info / "METADATA").write_text("Metadata-Version: 2.1\nName: mindie-diagnostics\nVersion: 0.4.2\n", encoding="utf-8")
+    (dist_info / "REQUESTED").write_bytes(b"")
+    (dist_info / "direct_url.json").write_text(
+        json.dumps({"url": "https://github.com/mindie-agent/diagnostics.git", "vcs_info": {"vcs": "git", "commit_id": commit}}),
+        encoding="utf-8",
+    )
+    (dist_info / "RECORD").write_text(
+        "mindie_diagnostics/__init__.py,,\n"
+        "mindie_diagnostics/helper.py,,\n"
+        "mindie_diagnostics/__pycache__/helper.cpython-313.pyc,,\n"
+        "mindie_diagnostics-0.4.2.dist-info/METADATA,,\n"
+        "mindie_diagnostics-0.4.2.dist-info/REQUESTED,,\n"
+        "mindie_diagnostics-0.4.2.dist-info/direct_url.json,,\n"
+        "mindie_diagnostics-0.4.2.dist-info/RECORD,,\n",
+        encoding="utf-8",
+    )
+
+    real_dist = metadata.PathDistribution(dist_info)
+    monkeypatch.setattr(metadata, "distribution", lambda name: real_dist)
+    monkeypatch.setattr(mindie_diagnostics, "__file__", str(init_file))
+    monkeypatch.setattr(runtime.sys, "prefix", str(tmp_path))
+
+    version, revision, files, source_hash = runtime._collect_source()
+    assert version == "0.4.2"
+    assert revision == commit
+    assert runtime._is_source_hash(source_hash)
+    keys = {k for k, _ in files}
+    assert "mindie_diagnostics/__init__.py" in keys
+    assert "mindie_diagnostics/helper.py" in keys
+    assert "mindie_diagnostics-0.4.2.dist-info/REQUESTED" in keys
+    assert not any("__pycache__" in k or k.endswith(".pyc") for k in keys)
+
+    # Replacing a package file with a symlink must be rejected by real _collect_source
+    outside = tmp_path / "outside.py"
+    outside.write_text("VALUE = 99\n", encoding="utf-8")
+    (pkg_dir / "helper.py").unlink()
+    (pkg_dir / "helper.py").symlink_to(outside)
+    with pytest.raises(RuntimeError, match="source_rejected"):
+        runtime._collect_source()
+
+
+def test_real_generation_atomic_pointer_switch_and_retire_other_generations(tmp_path):
+    config = tmp_path / "diagnostics.json"
+    configure_reporting(True, config=config, repository="owner/repo", roots=[str(tmp_path / "logs")])
+
+    def make_source(version, rev_char):
+        files = [
+            ("mindie_diagnostics/__init__.py", f'__version__ = "{version}"\n'.encode()),
+            (
+                f"mindie_diagnostics-{version}.dist-info/METADATA",
+                f"Metadata-Version: 2.1\nName: mindie-diagnostics\nVersion: {version}\n".encode(),
+            ),
+            (
+                f"mindie_diagnostics-{version}.dist-info/RECORD",
+                f"mindie_diagnostics/__init__.py,,\nmindie_diagnostics-{version}.dist-info/METADATA,,\n".encode(),
+            ),
+        ]
+        import hashlib
+        digest = hashlib.sha256()
+        digest.update(version.encode() + b"\0" + (rev_char * 40).encode() + b"\0")
+        digest.update(b"mindie_diagnostics/__init__.py\0" + files[0][1] + b"\0")
+        return version, rev_char * 40, files, digest.hexdigest()
+
+    src_v1 = make_source("0.3.0", "1")
+    src_v2 = make_source("0.4.0", "2")
+
+    with runtime.runtime_transaction(config) as root:
+        first = runtime._prepare_locked(config, publish=True, source=src_v1)
+        assert first["published"] is True and first["changed"] is True
+        current = runtime._read_current(root)
+        assert current["source_hash"] == src_v1[3] and current["version"] == "0.3.0"
+        assert (root / "generations" / src_v1[3] / "source.json").is_file()
+
+        # Prepare v2 with publish=False: v2 generation is materialized & verified,
+        # but current.json still points to v1 until explicitly published.
+        second = runtime._prepare_locked(config, publish=False, source=src_v2)
+        assert second["published"] is False and second["changed"] is True
+        assert runtime._read_current(root)["source_hash"] == src_v1[3]
+        assert (root / "generations" / src_v2[3] / "source.json").is_file()
+
+        # Atomically switch current.json pointer and retire superseded generations.
+        runtime._publish(root, {"schema": 1, "source_hash": src_v2[3], "version": src_v2[0], "revision": src_v2[1]})
+        assert runtime._read_current(root)["source_hash"] == src_v2[3]
+        retired = runtime.retire_other_generations(root, src_v2[3])
+        assert retired == [src_v1[3]]
+        assert not (root / "generations" / src_v1[3]).exists()
+        assert (root / "generations" / src_v2[3]).is_dir()
+

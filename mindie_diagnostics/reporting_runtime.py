@@ -378,6 +378,32 @@ def _generation_python(root, source_hash):
     return str(_python(dest, _owned))
 
 
+def retire_other_generations(root, keep_source_hash):
+    """Retire superseded generation directories under root/generations after handoff."""
+    from mindie_diagnostics.fallback import _owned
+
+    if not _is_source_hash(keep_source_hash):
+        _fail("runtime_untrusted")
+    root = Path(root)
+    _require_dir(root, _owned)
+    generations = root / "generations"
+    if not generations.exists() and not generations.is_symlink():
+        return []
+    _require_dir(generations, _owned)
+    retired = []
+    for entry in sorted(generations.iterdir(), key=lambda p: p.name):
+        if entry.name == keep_source_hash:
+            continue
+        if entry.is_symlink() or not _is_source_hash(entry.name) or not entry.is_dir():
+            continue
+        if not _owned(entry.lstat()):
+            continue
+        shutil.rmtree(entry, ignore_errors=True)
+        if not entry.exists():
+            retired.append(entry.name)
+    return retired
+
+
 def _update_record_name(source_hash):
     return f"update-{source_hash}.json"
 

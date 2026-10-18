@@ -154,3 +154,31 @@ def test_sanitized_issue_marker_reconciles_an_uncertain_post(tmp_path, reporting
     body = github.posts[0]['body']
     assert 'a' * 32 not in body and 'b' * 32 not in body
     assert fingerprint(payload()) in body
+
+
+def test_create_issue_guarantees_post_budget_after_slow_find_issue():
+    import time
+
+    observed_post_remaining = []
+
+    class SlowSearchGitHub(GitHub):
+        def request(self, method, path, payload=None):
+            if method == 'GET':
+                # Simulate multi-page issue listing consuming nearly all of the initial cycle window.
+                self._deadline = time.monotonic() + 0.05
+                return []
+            assert method == 'POST'
+            observed_post_remaining.append(self._deadline - time.monotonic())
+            return {'number': 42, 'html_url': f'https://github.com/{self.repository}/issues/42'}
+
+    gh = SlowSearchGitHub('owner/repo', timeout=30)
+    gh.begin_cycle()
+    try:
+        assert gh.find_issue({'payload': payload()}) is None
+        created = gh.create_issue('Title', 'Body')
+    finally:
+        gh.end_cycle()
+    assert created['number'] == 42
+    assert len(observed_post_remaining) == 1
+    assert observed_post_remaining[0] >= 14.0
+

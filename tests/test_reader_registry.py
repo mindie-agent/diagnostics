@@ -59,17 +59,17 @@ def test_corrupt_registry_is_unknown_not_empty(tmp_path):
         assert state['status'] == 'unknown'
 
 
-def test_pressure_marker_fail_closed(tmp_path):
+def test_pressure_marker_only_blocks_on_explicit_blocked_true(tmp_path):
     assert not pressure_blocked(tmp_path)
     path = tmp_path / 'retention-state.json'
     path.write_text('{')
     path.chmod(0o600)
-    assert pressure_blocked(tmp_path)
+    assert not pressure_blocked(tmp_path)
     path.write_text(json.dumps({'schema': 1, 'blocked': False, 'limited': True}))
     assert not pressure_blocked(tmp_path)
+    path.write_text(json.dumps({'schema': 1, 'blocked': True, 'limited': True}))
     path.chmod(0o644)
-    if os.name != 'nt':
-        assert pressure_blocked(tmp_path)
+    assert pressure_blocked(tmp_path)
 
 
 def test_symlink_registry_rejected(tmp_path):

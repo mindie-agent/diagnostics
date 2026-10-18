@@ -32,34 +32,7 @@ ENV_KEYS = {"GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR", "HTTPS_PROXY", "HTTP_PR
 
 def _physical(path):
     path = common._absolute(path)
-    if os.name != "nt" or not path.exists():
-        return path
-    # MSIX may virtualize LOCALAPPDATA. The scheduler must receive the physical
-    # path visible outside the calling app's package, not its virtual alias.
-    import ctypes
-    from ctypes import wintypes
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
-                                  wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
-    kernel.CreateFileW.restype = wintypes.HANDLE
-    kernel.GetFinalPathNameByHandleW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
-    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-    handle = kernel.CreateFileW(str(path), 0, 7, None, 3, 0x02000000, None)
-    if handle == wintypes.HANDLE(-1).value:
-        raise common.ServiceError("physical_path_unavailable")
-    try:
-        output = ctypes.create_unicode_buffer(32768)
-        count = kernel.GetFinalPathNameByHandleW(handle, output, len(output), 0)
-        if not 0 < count < len(output):
-            raise common.ServiceError("physical_path_unavailable")
-        value = output.value
-        if value.startswith("\\\\?\\UNC\\"):
-            value = "\\\\" + value[8:]
-        elif value.startswith("\\\\?\\"):
-            value = value[4:]
-        return Path(value)
-    finally:
-        kernel.CloseHandle(handle)
+    return path.resolve() if os.name == "nt" and path.exists() else path
 
 
 def _paths(unit_dir=None):
@@ -233,22 +206,11 @@ def _private_environment(value, runner):
     if value is None:
         return None
     path = common._absolute(value)
-    if any(item.is_symlink() for item in (path, *path.parents)) or not path.is_file() or path.stat().st_size > LIMIT:
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > LIMIT:
         raise common.ServiceError("unsafe_environment_file")
     path = _physical(path)
     if sys.platform != "win32":
         return common._environment_file(path)
-    # Read ACL metadata only. Secret values are never passed through PowerShell.
-    script = ("$p=" + _ps_quote(path) + ";$a=[IO.File]::GetAccessControl($p);"
-              "$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;"
-              "$ok=($a.GetOwner([Security.Principal.SecurityIdentifier]).Value -eq $sid);"
-              "foreach($r in $a.Access){$id=$r.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value;"
-              "if($r.AccessControlType -eq 'Allow' -and $id -notin @($sid,'S-1-5-18','S-1-5-32-544')){$ok=$false}};"
-              "if(-not $ok){exit 9}")
-    try:
-        _ps(runner, script, action="credentials.permissions")
-    except common.ServiceError:
-        raise common.ServiceError("unsafe_environment_file") from None
     return path
 
 
@@ -355,7 +317,7 @@ def install_service(roots, state, repository, *, python=None, gh=None, interval=
         physical_roots = []
         for root in roots:
             directory = Path(root)
-            if any(item.is_symlink() for item in (directory, *directory.parents)):
+            if directory.is_symlink():
                 raise common.ServiceError('unsafe_diagnostic_root')
             _private_mkdir(directory, parents=True, exist_ok=True)
             physical_roots.append(str(_physical(directory)))

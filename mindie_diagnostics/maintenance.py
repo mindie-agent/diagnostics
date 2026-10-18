@@ -55,7 +55,7 @@ def _marker(root, result, blocked, now):
 def prune(root: str | Path, *, max_bytes: int = 128 * 1024 * 1024,
           max_age_days: int = 7, max_files: int = 512, clock=time.time, queue=None) -> dict:
     root = Path(root).absolute()
-    if any(path.is_symlink() for path in (root, *root.parents)):
+    if root.is_symlink():
         raise ValueError("retention root must not traverse symlinks")
     events = root / 'events'
     result = {"removed_files": 0, "removed_bytes": 0, "remaining_bytes": 0,

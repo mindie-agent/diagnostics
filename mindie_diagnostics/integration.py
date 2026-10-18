@@ -287,6 +287,12 @@ def _write_policy(path, payload):
             return False
     except FileNotFoundError:
         pass
+    except OSError:
+        return False
+    try:
+        f._private_mkdir(path.parent, parents=True, exist_ok=True)
+    except OSError:
+        return False
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     tmp = path.parent / (".%s.%s.tmp" % (path.name, uuid.uuid4().hex))
     try:
@@ -314,7 +320,7 @@ def configure_reporting(enabled, *, repository="mindie-agent/mindie-agent", conf
         if type(enabled) is not bool or not f._valid_repo(repository):
             return _error("invalid_arguments")
         path = f._as_local_absolute(f.policy_path(config))
-        if path is None or not f._ancestors_are_real_dirs(path, create=True):
+        if path is None:
             return _error("invalid_configuration")
         existing = f.read_policy(config)
         chosen = _merge_roots(None if existing is None else existing.get("roots"), roots)
@@ -525,7 +531,7 @@ def _read_outbox(config, repository):
             return _queue_absent()
     except OSError:
         return _queue_unavailable()
-    if os.path.islink(path) or not f._ancestors_are_real_dirs(path):
+    if os.path.islink(path):
         return _queue_unavailable()
     import stat as statmod
     if not statmod.S_ISREG(info.st_mode) or not f._owned(info) or info.st_nlink != 1 or info.st_size <= 0:

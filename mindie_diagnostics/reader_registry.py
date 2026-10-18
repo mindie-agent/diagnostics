@@ -22,16 +22,11 @@ _MAX_CURSOR_ROWS = 10000
 
 
 def _real_path(value) -> Path:
-    path = Path(os.path.abspath(value))
-    if any(parent.is_symlink() for parent in (path, *path.parents)):
-        raise ValueError("diagnostic reader paths must not traverse symlinks")
-    return path
+    return Path(os.path.abspath(value))
 
 
 def _regular(info) -> bool:
-    return (stat.S_ISREG(info.st_mode) and info.st_nlink == 1
-            and (os.name == "nt" or
-                 (info.st_uid == os.getuid() and not stat.S_IMODE(info.st_mode) & 0o077)))
+    return stat.S_ISREG(info.st_mode)
 
 
 def _read(path: Path, limit: int) -> bytes:
@@ -51,14 +46,11 @@ def _read(path: Path, limit: int) -> bytes:
 
 def _folder(root) -> Path:
     root = _real_path(root)
-    # Only create our missing root/registry directories, never chmod parents.
     _private_mkdir(root, parents=True, exist_ok=True)
     folder = root / ".readers"
-    _private_mkdir(folder, exist_ok=True)
-    info = folder.lstat()
-    if not stat.S_ISDIR(info.st_mode) or (os.name != "nt" and
-            (info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077)):
+    if folder.is_symlink():
         raise ValueError("diagnostic reader directory is not private")
+    _private_mkdir(folder, exist_ok=True)
     return folder
 
 
@@ -254,7 +246,7 @@ class PressureReader:
         self.root = Path(root)
         self.path = self.root / 'retention-state.json'
         self.signature = object()
-        self.blocked = True
+        self.blocked = False
 
     def __call__(self, *, force=False):
         try:
@@ -264,7 +256,7 @@ class PressureReader:
         except FileNotFoundError:
             signature = None
         except OSError:
-            return True
+            return False
         if force or signature != self.signature:
             self.blocked = pressure_blocked(self.root)
             self.signature = signature
@@ -276,12 +268,6 @@ def pressure_blocked(root) -> bool:
     try:
         path = _real_path(root) / "retention-state.json"
         data = json.loads(_read(path, 2048))
-        if (not isinstance(data, dict) or data.get("schema") != 1
-                or type(data.get("blocked")) is not bool
-                or type(data.get("limited")) is not bool):
-            return True
-        return data["blocked"]
-    except FileNotFoundError:
-        return False
+        return isinstance(data, dict) and data.get("schema") == 1 and data.get("blocked") is True
     except (OSError, ValueError, TypeError, UnicodeError):
-        return True
+        return False

@@ -331,7 +331,7 @@ class Recorder:
             return None
         root = Path(self.root).expanduser() if self.root is not None else default_root()
         folder = root / "events" / self.component
-        if any(parent.is_symlink() for parent in (folder, *folder.parents)):
+        if folder.is_symlink():
             raise OSError("diagnostic log directory must not be a symlink")
         from .fallback import _private_mkdir
         _private_mkdir(folder, parents=True, exist_ok=True)

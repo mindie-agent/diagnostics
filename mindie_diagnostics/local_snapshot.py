@@ -39,7 +39,7 @@ def recent_failures(roots):
             events = root / 'events'
             if not events.exists():
                 continue
-            if not f._ancestors_are_real_dirs(events / '_'):
+            if events.is_symlink() or not events.is_dir():
                 result['errors'].append({'category': 'unsafe_or_unreadable_log_root'})
                 continue
             with os.scandir(events) as folders:

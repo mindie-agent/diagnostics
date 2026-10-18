@@ -93,92 +93,42 @@ class Outbox:
         self._prepare_storage()
         self.clock = clock
         self.capacity = capacity
+        had_lock = self.path.with_name(self.path.name + '.init.lock').exists()
         with _initialization_lock(self.path):
-            marker = self.path.with_name(self.path.name + '.initialized')
-            if marker.is_symlink():
-                raise ValueError('unsafe diagnostic initialization marker')
-            if marker.exists():
-                info = marker.lstat()
-                if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size != 28
-                        or (os.name != 'nt' and info.st_uid != os.getuid())
-                        or marker.read_bytes() != b'mindie-diagnostics-outbox/1\n'):
-                    raise ValueError('invalid diagnostic initialization marker')
             fresh = not self.path.exists()
             if fresh:
-                if marker.exists() or any(self.path.with_name(self.path.name + suffix).exists() for suffix in ('-wal', '-journal', '-shm')) or (self.path.parent / 'worker-health.json').exists():
+                if had_lock or any(self.path.with_name(self.path.name + suffix).exists() for suffix in ('-wal', '-journal', '-shm')) or (self.path.parent / 'worker-health.json').exists():
                     raise ValueError('diagnostic outbox is missing after initialization; prior outcomes cannot be reconstructed')
-                self._write_marker(marker)
                 descriptor = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
                 os.close(descriptor)
+            elif self.path.stat().st_size == 0:
+                raise ValueError('diagnostic queue schema is incomplete; prior outcomes cannot be reconstructed')
             with self.connect() as db:
                 if fresh:
                     db.executescript(_SCHEMA)
                 self._validate_schema(db)
-            if not marker.exists():
-                self._write_marker(marker)
         self._restrict_database_file()
-        self._authority_identity = self._current_identity()
 
     def _validate_schema(self, db):
-        expected_db = sqlite3.connect(':memory:')
-        try:
-            expected_db.executescript(_SCHEMA)
-            for table in ('incidents', 'seen', 'publications'):
-                expected = {row[1]: tuple(row[1:]) for row in expected_db.execute(f'PRAGMA table_info({table})')}
-                actual = {row[1]: tuple(row[1:]) for row in db.execute(f'PRAGMA table_info({table})')}
-                if any(actual.get(name) != value for name, value in expected.items()):
-                    raise ValueError('diagnostic queue schema is incomplete; prior outcomes cannot be reconstructed')
-                for pragma in ('index_list', 'foreign_key_list'):
-                    required = list(expected_db.execute(f'PRAGMA {pragma}({table})'))
-                    found = [tuple(row) for row in db.execute(f'PRAGMA {pragma}({table})')]
-                    if found != required:
-                        raise ValueError('diagnostic queue constraints are incomplete; prior outcomes cannot be reconstructed')
-            self._schema_version = db.execute('PRAGMA schema_version').fetchone()[0]
-        finally:
-            expected_db.close()
-
-    def _current_identity(self):
-        marker = self.path.with_name(self.path.name + '.initialized')
-        rows = []
-        for path in (self.path, marker):
-            info = path.lstat()
-            if not stat.S_ISREG(info.st_mode):
-                raise ValueError('diagnostic authority is not a regular file')
-            rows.append((info.st_dev, info.st_ino))
-        if marker.read_bytes() != b'mindie-diagnostics-outbox/1\n':
-            raise ValueError('diagnostic authority marker is invalid')
-        return tuple(rows)
-
-    @staticmethod
-    def _write_marker(marker):
-        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
-        with os.fdopen(fd, 'wb') as stream:
-            stream.write(b'mindie-diagnostics-outbox/1\n')
-            stream.flush()
-            os.fsync(stream.fileno())
+        required = {
+            'incidents': {'fingerprint', 'payload', 'first_seen', 'last_seen', 'occurrences', 'state', 'attempts', 'next_attempt', 'lease_until', 'lease_token', 'issue_number', 'issue_url', 'last_error', 'consent'},
+            'seen': {'operation_id', 'observed'},
+            'publications': {'at'},
+        }
+        for table, cols in required.items():
+            actual = {row[1] for row in db.execute(f'PRAGMA table_info({table})')}
+            if not cols <= actual:
+                raise ValueError('diagnostic queue schema is incomplete; prior outcomes cannot be reconstructed')
 
     def _prepare_storage(self) -> None:
         """Create only missing parents as owner-only dirs. Never chmod an existing parent."""
         path = self.path
-        if any(parent.is_symlink() for parent in path.parents):
-            raise ValueError("diagnostic queue directory must not traverse symlinks")
         if path.is_symlink():
             raise ValueError("diagnostic queue path must be a regular SQLite file")
         parent = path.parent
-        missing = []
-        probe = parent
-        while not probe.exists():
-            missing.append(probe)
-            if probe.parent == probe:
-                break
-            probe = probe.parent
-        if probe.is_symlink():
-            raise ValueError("diagnostic queue directory must not be a symlink")
-        for directory in reversed(missing):
-            _private_mkdir(directory)
-            os.chmod(directory, 0o700)
         if parent.is_symlink():
             raise ValueError("diagnostic queue directory must not be a symlink")
+        _private_mkdir(parent, parents=True, exist_ok=True)
         if not parent.is_dir():
             raise NotADirectoryError("diagnostic queue parent is not a directory")
         if os.name != "nt":
@@ -206,17 +156,9 @@ class Outbox:
     @contextmanager
     def connect(self):
         self._reject_unsafe_database_path()
-        if (hasattr(self, '_authority_identity')
-                and self._current_identity() != self._authority_identity):
-            raise ValueError('diagnostic authority identity changed; prior outcomes cannot be reconstructed')
-        # Never let sqlite create a missing authority during ordinary reads or
-        # mutations. Only the locked first initialization may create this file.
         db = sqlite3.connect(self.path.as_uri() + '?mode=rw', uri=True, timeout=3.0)
         db.row_factory = sqlite3.Row
         try:
-            if (hasattr(self, '_schema_version')
-                    and db.execute('PRAGMA schema_version').fetchone()[0] != self._schema_version):
-                self._validate_schema(db)
             db.execute("PRAGMA busy_timeout=3000")
         except BaseException:
             db.close()

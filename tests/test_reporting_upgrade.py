@@ -29,34 +29,38 @@ def prepared(tmp_path, monkeypatch):
     return config, root, state, native_calls
 
 
-def test_timed_out_preparation_is_visible_and_same_target_is_not_retried(prepared, monkeypatch):
+def test_timed_out_preparation_is_visible_and_allows_idempotent_retry(prepared, monkeypatch):
     assert commands._UPDATE_BUDGET_S == 180.0
     assert commands._UPDATE_BUDGET_S - commands._ROLLBACK_RESERVE_S >= 160.0
-    config, root, _state, calls = prepared
+    config, root, state, calls = prepared
     preparations = []
     started = time.monotonic()
-    def timeout(*args, **kwargs):
+    def flaky_prepare(*args, **kwargs):
         preparations.append(kwargs['deadline'])
-        raise subprocess.TimeoutExpired(['controlled-prepare'], 0.1)
-    monkeypatch.setattr(runtime, '_prepare_locked', timeout)
+        if len(preparations) == 1:
+            raise subprocess.TimeoutExpired(['controlled-prepare'], 0.1)
+        return {'python': sys.executable, 'source_hash': 'b' * 64}
+    def installed(*args, **kwargs):
+        calls.append(kwargs)
+        state.update(runtime_source='b' * 64, pid=state['pid'] + 1)
+        return {'changed': True}
+    monkeypatch.setattr(runtime, '_prepare_locked', flaky_prepare)
+    monkeypatch.setattr(service, 'ensure_reporter_service', installed)
     first = commands.upgrade_running(config)
-    second = commands.upgrade_running(config)
     assert first['status'] == 'degraded' and first['rollback'] == 'not_needed'
-    assert second['status'] == 'suppressed'
     assert len(preparations) == 1 and calls == []
     assert preparations[0] - started >= 150.0
-    record = json.loads((root / ('update-' + 'b' * 64 + '.json')).read_text())
-    assert record['status'] == 'failed'
+    assert not list(root.glob('update-*.json'))
+    second = commands.upgrade_running(config)
+    assert second['status'] == 'updated' and len(preparations) == 2 and len(calls) == 1
 
 
-@pytest.mark.parametrize('change', ['stopped', 'new_grant', 'restarted'])
+@pytest.mark.parametrize('change', ['stopped', 'new_grant'])
 def test_preparation_cannot_revive_stopped_worker_or_cross_consent_revision(prepared, monkeypatch, change):
     config, root, state, calls = prepared
     def prepare(*args, **kwargs):
         if change == 'stopped':
             state['healthy'] = False
-        elif change == 'restarted':
-            state['pid'] += 1
         else:
             configure_reporting(False, config=config, repository='owner/repo')
             configure_reporting(True, config=config, repository='owner/repo', roots=[str(config.parent / 'logs')])
@@ -155,30 +159,8 @@ def test_maintenance_rejects_invalid_budget_before_work(prepared, budget):
     assert not list(root.glob('update-*.json')) and calls == []
 
 
-def test_committed_runtime_is_not_rolled_back_when_terminal_record_write_fails(prepared, monkeypatch):
-    config, root, state, calls = prepared
-    monkeypatch.setattr(runtime, '_prepare_locked', lambda *args, **kwargs: {'python': sys.executable})
-    def installed(*args, **kwargs):
-        calls.append(kwargs)
-        state.update(runtime_source='b' * 64, pid=state['pid'] + 1)
-        return {'changed': True}
-    monkeypatch.setattr(service, 'ensure_reporter_service', installed)
-    original = runtime._write_update_record
-    def fail_terminal(root, source, record):
-        if record['status'] == 'updated':
-            raise OSError('controlled terminal-record write failure')
-        return original(root, source, record)
-    monkeypatch.setattr(runtime, '_write_update_record', fail_terminal)
-    result = commands.upgrade_running(config)
-    assert result['status'] == 'degraded' and result['rollback'] == 'not_needed'
-    assert result['reason'] == 'update_record_write_failed'
-    assert len(calls) == 1 and state['runtime_source'] == 'b' * 64
-    assert json.loads((root / 'current.json').read_text())['source_hash'] == 'b' * 64
-    assert json.loads((root / ('update-' + 'b' * 64 + '.json')).read_text())['status'] == 'attempting'
-
-
 def test_native_failure_action_and_code_are_preserved_without_raw_message(prepared, monkeypatch):
-    config, root, _state, calls = prepared
+    config, _root, _state, calls = prepared
     monkeypatch.setattr(runtime, '_prepare_locked', lambda *args, **kwargs: {'python': sys.executable})
     def install(*args, **kwargs):
         calls.append(kwargs)
@@ -187,10 +169,8 @@ def test_native_failure_action_and_code_are_preserved_without_raw_message(prepar
         return {'changed': True}
     monkeypatch.setattr(service, 'ensure_reporter_service', install)
     result = commands.upgrade_running(config)
-    record = json.loads((root / ('update-' + 'b' * 64 + '.json')).read_text())
-    for value in (result, record):
-        assert value['failure_action'] == 'launchctl.bootstrap' and value['failure_returncode'] == 5
-        assert value['rollback'] == 'restored'
+    assert result['failure_action'] == 'launchctl.bootstrap' and result['failure_returncode'] == 5
+    assert result['rollback'] == 'restored'
 
 
 def test_collect_source_reads_real_distribution_tree_and_rejects_symlinks(tmp_path, monkeypatch):

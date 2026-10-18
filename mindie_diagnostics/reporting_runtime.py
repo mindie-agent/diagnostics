@@ -120,8 +120,7 @@ def _collect(dist, read_bounded):
         if len(items) + len(infos) >= _MAX_FILES:
             _fail("source_rejected")
         loc = Path(dist.locate_file(key))
-        from .fallback import _ancestors_are_real_dirs
-        if not _ancestors_are_real_dirs(loc) or loc.is_symlink():
+        if loc.is_symlink():
             _fail("source_rejected")
         try:
             data = read_bounded(loc, _MAX_BYTES)
@@ -179,17 +178,17 @@ def _require_dir(path, owned):
         _fail("runtime_untrusted")
 
 
-def _ensure_dir(path, ancestors, absolute, owned):
+def _ensure_dir(path, absolute, owned):
     path = Path(absolute(path))
     if path.is_symlink():
         _fail("runtime_untrusted")
     if path.exists():
         _require_dir(path, owned)
         return path
-    if not ancestors(path, create=True):
+    try:
+        _private_mkdir(path, parents=True, exist_ok=True)
+    except OSError:
         _fail("runtime_untrusted")
-    if not path.exists():
-        _private_mkdir(path)
     if os.name != "nt":
         os.chmod(path, _DIR)
     _require_dir(path, owned)
@@ -404,33 +403,6 @@ def retire_other_generations(root, keep_source_hash):
     return retired
 
 
-def _update_record_name(source_hash):
-    return f"update-{source_hash}.json"
-
-
-def _read_update_record(root, source_hash):
-    from mindie_diagnostics.fallback import _read_regular_bounded
-
-    path = root / _update_record_name(source_hash)
-    if not path.exists() and not path.is_symlink():
-        return None
-    doc = _load_json(path, _read_regular_bounded, _OUT_CAP)
-    target = doc.get("target")
-    if (
-        doc.get("schema") != 1
-        or doc.get("status") not in {"attempting", "failed", "rolled_back", "updated", "aborted"}
-        or not isinstance(target, dict)
-        or target.get("source_hash") != source_hash
-    ):
-        _fail("runtime_untrusted")
-    return doc
-
-
-def _write_update_record(root, source_hash, payload):
-    """Atomically persist the durable automatic-handoff intent/result."""
-    _publish_json(root, _update_record_name(source_hash), payload)
-
-
 @contextmanager
 def _transaction_lock(root, timeout):
     """Bounded exclusive OS advisory lock at the historical .prepare.lock path.
@@ -489,11 +461,11 @@ def runtime_transaction(config=None, *, create=True, timeout=None):
     this lock. With ``create=False`` a missing root yields None instead of
     performing a first installation.
     """
-    from mindie_diagnostics.fallback import _ancestors_are_real_dirs, _as_local_absolute, _owned
+    from mindie_diagnostics.fallback import _as_local_absolute, _owned
 
     root = _root_path(config)
     if create:
-        root = _ensure_dir(root, _ancestors_are_real_dirs, _as_local_absolute, _owned)
+        root = _ensure_dir(root, _as_local_absolute, _owned)
     else:
         if root.is_symlink() or not root.is_dir():
             yield None
@@ -536,7 +508,6 @@ def _prepare_locked(config, *, publish=True, source=None, deadline=None):
     subprocess and copy step fails closed with runtime_deadline_exceeded.
     """
     from mindie_diagnostics.fallback import (
-        _ancestors_are_real_dirs,
         _as_local_absolute,
         _owned,
         _read_regular_bounded,
@@ -544,8 +515,8 @@ def _prepare_locked(config, *, publish=True, source=None, deadline=None):
 
     _remaining(deadline)
     version, revision, files, source_hash = source if source is not None else _collect_source()
-    root = _ensure_dir(_root_path(config), _ancestors_are_real_dirs, _as_local_absolute, _owned)
-    generations = _ensure_dir(root / "generations", _ancestors_are_real_dirs, _as_local_absolute, _owned)
+    root = _ensure_dir(_root_path(config), _as_local_absolute, _owned)
+    generations = _ensure_dir(root / "generations", _as_local_absolute, _owned)
     current = _read_current(root)
     if current is not None:
         old, new = _triple(current["version"]), _triple(version)

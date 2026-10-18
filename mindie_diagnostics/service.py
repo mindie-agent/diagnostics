@@ -168,7 +168,7 @@ def _environment_file(value):
     path = _absolute(value)
     if str(path) != str(path).rstrip() or any(char in str(path) for char in '*?['):
         raise ServiceError('unsupported_environment_path')
-    if any(parent.is_symlink() for parent in (path, *path.parents)):
+    if path.is_symlink():
         raise ServiceError("unsafe_environment_file")
     info = path.stat()
     if (not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600

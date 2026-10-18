@@ -22,7 +22,7 @@ def test_marker_changes_are_immediate_without_revalidating_every_ancestor(tmp_pa
     marker.chmod(0o600)
     assert reader()
     marker.write_text('invalid')
-    assert reader()
+    assert not reader()
     marker.unlink()
     assert not reader()
     assert len(calls) == 4

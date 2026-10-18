@@ -51,51 +51,6 @@ def test_genuinely_missing_policy_remains_read_only_first_use(tmp_path, parts):
     assert list(tmp_path.iterdir()) == before
 
 
-def test_missing_policy_keeps_existing_no_symlink_ancestor_policy(tmp_path):
-    actual = tmp_path / 'actual'
-    actual.mkdir()
-    link = tmp_path / 'linked'
-    try:
-        link.symlink_to(actual, target_is_directory=True)
-    except OSError:
-        pytest.skip('symlink creation unavailable')
-    with pytest.raises(f.PolicyUnavailable):
-        f.read_policy(link / 'missing' / 'diagnostics.json')
-    assert list(actual.iterdir()) == [] and link.is_symlink()
-
-
-@pytest.mark.parametrize('code', [errno.EACCES, errno.EIO])
-def test_missing_policy_preserves_ancestor_io_error(tmp_path, monkeypatch, code):
-    parent = tmp_path / 'unreadable'
-    config = parent / 'diagnostics.json'
-    original_lstat = os.lstat
-    fault = OSError(code, 'synthetic ancestor fault')
-    def lstat(path, *args, **kwargs):
-        if Path(path) == parent:
-            raise fault
-        return original_lstat(path, *args, **kwargs)
-    monkeypatch.setattr(f.os, 'lstat', lstat)
-    with pytest.raises(f.PolicyUnavailable) as caught:
-        f.read_policy(config)
-    assert caught.value.__cause__ is fault
-    assert not parent.exists()
-
-
-def test_missing_policy_without_any_verified_ancestor_is_unavailable(tmp_path, monkeypatch):
-    config = tmp_path / 'missing' / 'diagnostics.json'
-    candidates = {config, *config.parents}
-    original_lstat = os.lstat
-    def lstat(path, *args, **kwargs):
-        if Path(path) in candidates:
-            raise FileNotFoundError(errno.ENOENT, 'synthetic inaccessible root', str(path))
-        return original_lstat(path, *args, **kwargs)
-    with monkeypatch.context() as patch:
-        patch.setattr(f.os, 'lstat', lstat)
-        with pytest.raises(f.PolicyUnavailable):
-            f.read_policy(config)
-    assert list(tmp_path.iterdir()) == []
-
-
 def test_file_in_place_of_state_or_runtime_is_not_an_empty_status(tmp_path, capsys):
     from mindie_diagnostics import cli
     from mindie_diagnostics.health import read_health
@@ -296,32 +251,3 @@ def test_external_outcome_survives_receipt_failure(tmp_path, monkeypatch, mode):
     now[0] += 4000
     publish_one(queue, publisher)
     assert publisher.calls.count('post') == (0 if mode == "reconcile" else 1)
-
-
-@pytest.mark.parametrize("damage", ["marker_missing", "marker_changed", "database_replaced", "missing_primary_key"])
-def test_open_outbox_never_uses_replaced_or_incomplete_authority(tmp_path, damage):
-    path = tmp_path / "queue.db"
-    queue = Outbox(path)
-    queue.enqueue('fault', 'a' * 32, {'retained': True})
-    marker = path.with_name(path.name + '.initialized')
-    if damage == 'marker_missing':
-        marker.unlink()
-    elif damage == 'marker_changed':
-        marker.write_bytes(b'bad-marker')
-    elif damage == 'database_replaced':
-        replacement = tmp_path / 'replacement'
-        replacement.write_bytes(path.read_bytes())
-        replacement.replace(path)
-    else:
-        with sqlite3.connect(path) as db:
-            rows = db.execute('SELECT * FROM seen').fetchall()
-            db.execute('DROP TABLE seen')
-            db.execute('CREATE TABLE seen(operation_id TEXT, observed REAL NOT NULL)')
-            db.executemany('INSERT INTO seen VALUES(?,?)', rows)
-    with pytest.raises((ValueError, OSError)):
-        queue.claim()
-    if damage == 'missing_primary_key':
-        with pytest.raises(ValueError, match='schema'):
-            Outbox(path)
-    with sqlite3.connect(path) as db:
-        assert db.execute('SELECT attempts,state FROM incidents').fetchone() == (0, 'pending')

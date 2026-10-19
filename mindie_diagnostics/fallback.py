@@ -128,6 +128,14 @@ def state_path(config=None) -> Path:
     return policy_path(config).with_suffix(".state")
 
 
+def service_directory(config=None):
+    """Linked contribution profiles own separate native reporter instances."""
+    policy = read_policy(config)
+    if policy and policy.get("consent_config"):
+        return state_path(config) / "service"
+    return None
+
+
 class PolicyUnavailable(RuntimeError):
     """An existing policy cannot establish an authorization decision."""
 
@@ -175,10 +183,33 @@ def read_policy(config=None):
         policy = _validated_policy(data)
         if policy is None:
             raise PolicyUnavailable()
+        if policy.get("consent_config") and policy["decision"] == "enabled":
+            authority = contribution_authority(policy["consent_config"])
+            if authority["choice"] != "contribute" or not authority.get("choice_revision"):
+                policy["decision"] = "disabled"
+            elif authority["choice_revision"] != policy.get("consent_revision"):
+                policy["decision"] = "disabled"
         return policy
     except PolicyUnavailable:
         raise
     except (OSError, ValueError, TypeError) as exc:
+        raise PolicyUnavailable() from exc
+
+
+def contribution_authority(path):
+    """Read the shared consent contract without depending on Knowledge runtime."""
+    raw = _read_regular_bounded(Path(path), 65536)
+    try:
+        data = json.loads(raw) if raw is not None else None
+        if not isinstance(data, dict) or data.get("schema") != "mindie-consent/1":
+            raise PolicyUnavailable()
+        if data.get("choice") not in (None, "contribute", "read-only", "later", "disabled"):
+            raise PolicyUnavailable()
+        revision = data.get("choice_revision")
+        if revision is not None and not _valid_incident(revision):
+            raise PolicyUnavailable()
+        return data
+    except (TypeError, ValueError) as exc:
         raise PolicyUnavailable() from exc
 
 
@@ -533,7 +564,7 @@ def _validated_policy(data):
         if _as_local_absolute(item) is None:
             return None
         clean_roots.append(item)
-    return {
+    result = {
         "schema": _POLICY_SCHEMA,
         "purpose": _POLICY_PURPOSE,
         "decision": decision,
@@ -541,6 +572,14 @@ def _validated_policy(data):
         "revision": revision,
         "roots": clean_roots,
     }
+    if "consent_config" in data:
+        if _as_local_absolute(data["consent_config"]) is None:
+            return None
+        revision = data.get("consent_revision")
+        if revision is not None and not _valid_incident(revision):
+            return None
+        result.update(consent_config=str(data["consent_config"]), consent_revision=revision)
+    return result
 
 
 def _valid_repo(value) -> bool:

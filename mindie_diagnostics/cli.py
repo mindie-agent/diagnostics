@@ -56,7 +56,8 @@ def run_cycle(args, queue, github, recorder, health, *, since=None):
         queue.maintain()
         result['consent'] = attempt('consent', lambda: {'withdrawn': queue.withdraw_unconsented()})
         for root in args.root:
-            result['ingestion'].append(attempt('ingest', lambda: ingest(root, queue, since=since)))
+            result['ingestion'].append(attempt('ingest', lambda: ingest(
+                root, queue, since=since, config=getattr(args, "reporting_config", None))))
             result['retention'].append(attempt('retention', lambda: prune(root, queue=queue)))
         result['reporter'] = attempt('report', lambda: publish_one(queue, github))
     health.update(status='idle' if result['status'] == 'ok' else 'degraded', stage='waiting', last_cycle=result)
@@ -113,6 +114,7 @@ def parser() -> argparse.ArgumentParser:
                                  help='absolute seconds shared by offline maintenance and the optional handoff; capped at 75')
         if name == 'configure':
             command.add_argument('--enabled', choices=('true', 'false'), required=True)
+            command.add_argument('--consent-config', help='shared contribution authority for this profile')
             command.add_argument('--repository', default=DEFAULT_REPOSITORY)
             command.add_argument('--root', action='append')
     return result
@@ -128,7 +130,8 @@ def main(argv: list[str] | None = None) -> int:
                 result = reporting_status(config=args.config)
             elif args.action == 'configure':
                 result = configure_reporting(args.enabled == 'true', repository=args.repository,
-                                             config=args.config, roots=args.root)
+                                             config=args.config, roots=args.root,
+                                             consent_config=args.consent_config)
             elif args.action == 'ensure':
                 result = ensure(args.config, unit_dir=args.unit_dir)
             else:
@@ -202,13 +205,19 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 policy = f.read_policy(args.reporting_config)
             except f.PolicyUnavailable:
-                health.update(status='failed', stage='configuration')
+                health.update(status='degraded', stage='configuration')
                 print(json.dumps({'status': 'configuration_unavailable', 'category': 'reporting_policy_unavailable'}), flush=True)
-                return 1
+                if args.once:
+                    return 1
+                stop.wait(args.interval)
+                continue
             if policy is None:
-                health.update(status='failed', stage='configuration')
+                health.update(status='degraded', stage='configuration')
                 print(json.dumps({'status': 'configuration_unavailable', 'category': 'reporting_policy_missing'}), flush=True)
-                return 1
+                if args.once:
+                    return 1
+                stop.wait(args.interval)
+                continue
             if (policy is None or policy['decision'] != 'enabled' or policy['repository'] != args.repository
                     or Path(args.state).absolute() != f.state_path(args.reporting_config)):
                 queue.withdraw_unconsented()

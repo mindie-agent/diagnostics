@@ -18,7 +18,8 @@ with strict external-effect honesty (`publish_one`).
   as a remote failure if local SQLite receipt update fails (`_record_publication_outcome`).
 
 [Timeouts & Locks]
-- Leases `Outbox` items for `github.timeout + 5` seconds (`default 35s`).
+- Leases `Outbox` items for `github.timeout + 20` seconds (`default 50s`),
+  covering transport cleanup and the local receipt.
 - `GitHub.begin_cycle` enforces an overall cycle deadline (`default 30s`) and an
   `8 MiB` response byte budget across pagination, reserving up to 15s for `POST`
   after search pagination.
@@ -460,11 +461,16 @@ class GitHub:
 
     def find_issue(self, item: dict[str, Any]):
         # Listing all states avoids search-index lag; a full window is not absence.
-        marker = f"{MARKER}{fingerprint(item['payload'])} -->"
+        payload = item["payload"]
+        saved = payload.get("public_fingerprint") if not payload.get("events") else None
+        identity = saved if isinstance(saved, str) and re.fullmatch(r"[0-9a-f]{64}", saved) else fingerprint(payload)
+        marker = f"{MARKER}{identity} -->"
         standalone = self._deadline is None
         if standalone:
             self.begin_cycle()
         self._searched_in_cycle = True
+        cycle_deadline = self._deadline
+        self._deadline -= min(float(self.timeout) / 2, 15.0)
         try:
             for page in range(1, 21):
                 rows = self.request("GET", f"repos/{self.repository}/issues?state=all&sort=updated&direction=desc&per_page=100&page={page}")
@@ -480,13 +486,11 @@ class GitHub:
                     return None
             raise TransportError("github_reconciliation_window_exhausted", retry_after=3600)
         finally:
+            self._deadline = cycle_deadline
             if standalone:
                 self.end_cycle()
 
     def create_issue(self, title: str, body: str):
-        if self._deadline is not None and self._searched_in_cycle:
-            post_reserve = min(float(self.timeout), 15.0)
-            self._deadline = max(self._deadline, time.monotonic() + post_reserve)
         return self.request("POST", f"repos/{self.repository}/issues", {"title": title, "body": body})
 
 
@@ -508,11 +512,12 @@ def _record_publication_outcome(queue, item, result, **updates):
 
 
 def publish_one(queue: Outbox, github: GitHub) -> dict[str, Any]:
-    from .outbox import MAX_AUTOMATIC_CYCLES
-    item = queue.claim(lease_seconds=github.timeout + 5)
+    # Two transports may each need up to 8s cleanup, plus the SQLite receipt.
+    item = queue.claim(lease_seconds=github.timeout + 20)
     if not item:
         return {"status": "idle"}
-    exhausted = item["attempts"] >= MAX_AUTOMATIC_CYCLES
+    prior_uncertain = item["state"] == "uncertain"
+    post_invoked = False
     started = False
     try:
         require_consent(item.get("consent"))
@@ -530,15 +535,16 @@ def publish_one(queue: Outbox, github: GitHub) -> dict[str, Any]:
                 {"status": "reconciled", "issue_url": existing["html_url"], "operation_completed": True},
                 state="published", issue_number=existing["number"], issue_url=existing["html_url"], last_error=None)
         if item["state"] == "uncertain":
-            state = "exhausted" if exhausted else "uncertain"
+            state = "uncertain"
             return _record_publication_outcome(queue, item, {"status": state, "submission_state": "uncertain"},
                 state=state, next_attempt=queue.clock() + 300,
-                last_error="submission_uncertain_budget_exhausted" if exhausted else "submission_uncertain_no_match")
+                last_error="submission_uncertain_no_match")
         title, body = render_issue(item)
         require_consent(item.get("consent"))
         queue.begin_post(item)
         item["state"] = "uncertain"
         with guard_consent(item.get("consent")):
+            post_invoked = True
             reply = github.create_issue(title, body)
         if not _issue_reference(reply, github.repository):
             raise TransportError("github_invalid_create_reply", uncertain=True)
@@ -546,28 +552,29 @@ def publish_one(queue: Outbox, github: GitHub) -> dict[str, Any]:
             {"status": "published", "issue_url": reply["html_url"], "operation_completed": True},
             state="published", issue_number=reply["number"], issue_url=reply["html_url"], last_error=None)
     except ConsentWithdrawn:
-        uncertain = item["state"] == "uncertain"
+        uncertain = prior_uncertain or post_invoked
         return _record_publication_outcome(queue, item,
             {"status": "withdrawn", "submission_state": "uncertain" if uncertain else "not_sent"},
             state="withdrawn", last_error="submission_uncertain_reporting_consent_withdrawn" if uncertain else "reporting_consent_unavailable_or_withdrawn")
     except ConsentUnavailable:
-        uncertain = item["state"] == "uncertain"
-        state = "exhausted" if exhausted else "uncertain" if uncertain else "retry"
+        uncertain = prior_uncertain or post_invoked
+        state = "uncertain" if uncertain else "retry"
         code = ("submission_uncertain_" if uncertain else "") + "reporting_policy_unavailable"
         return _record_publication_outcome(queue, item,
             {"status": state, "error": code, "submission_state": "uncertain" if uncertain else "not_sent"},
             state=state, next_attempt=queue.clock() + 300, last_error=code)
     except TransportError as exc:
-        uncertain = exc.uncertain or item["state"] == "uncertain"
-        state = "permanent-failed" if exc.permanent else "exhausted" if exhausted else "uncertain" if uncertain else "retry"
+        uncertain = prior_uncertain or exc.uncertain
+        recoverable = exc.code in {"github_client_missing", "github_auth_required", "github_http_401", "github_http_403", "github_http_404", "github_http_429"}
+        state = "uncertain" if uncertain else "permanent-failed" if exc.permanent and not recoverable else "retry"
         code = "submission_uncertain_" + exc.code if uncertain and state in {"permanent-failed", "exhausted"} else exc.code
-        delay = max(exc.retry_after, 30 * 2 ** item["attempts"])
+        delay = max(exc.retry_after, min(3600, 30 * 2 ** min(item["attempts"], 7)))
         return _record_publication_outcome(queue, item,
             {"status": state, "error": code, "submission_state": "uncertain" if uncertain else "not_sent"},
             state=state, next_attempt=queue.clock() + delay, last_error=code)
     except (ValueError, TypeError, KeyError):
-        uncertain = item["state"] == "uncertain"
-        state = "exhausted" if uncertain and exhausted else "uncertain" if uncertain else "blocked"
+        uncertain = prior_uncertain or post_invoked
+        state = "uncertain" if uncertain else "blocked"
         code = "submission_uncertain_invalid_reply" if uncertain else "invalid_or_unsafe_diagnostic_payload"
         return _record_publication_outcome(queue, item,
             {"status": state, "error": code, "submission_state": "uncertain" if uncertain else "not_sent"},
@@ -577,6 +584,7 @@ def publish_one(queue: Outbox, github: GitHub) -> dict[str, Any]:
             github.end_cycle()
 
 
-def ingest(root: str | Path, queue: Outbox, *, max_files: int = 256, max_bytes: int = 8 * 1024 * 1024, since: float | None = None) -> dict[str, int]:
+def ingest(root: str | Path, queue: Outbox, *, max_files: int = 256, max_bytes: int = 8 * 1024 * 1024, since: float | None = None, config=None) -> dict[str, int]:
     from .ingestion import ingest as read_events
-    return read_events(root, queue, max_files=max_files, max_bytes=max_bytes, since=since)
+    return read_events(root, queue, max_files=max_files, max_bytes=max_bytes, since=since,
+                       config=config)

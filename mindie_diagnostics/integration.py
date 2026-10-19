@@ -326,7 +326,8 @@ def _write_policy(path, payload):
             pass
 
 
-def configure_reporting(enabled, *, repository="mindie-agent/mindie-agent", config=None, roots=None) -> dict:
+def configure_reporting(enabled, *, repository="mindie-agent/mindie-agent", config=None,
+                        roots=None, consent_config=None) -> dict:
     """Write the local reporting policy. Does not install or check a worker."""
     try:
         if type(enabled) is not bool or not f._valid_repo(repository):
@@ -335,6 +336,19 @@ def configure_reporting(enabled, *, repository="mindie-agent/mindie-agent", conf
         if path is None:
             return _error("invalid_configuration")
         existing = f.read_policy(config)
+        authority = {}
+        if consent_config is not None:
+            consent_path = f._as_local_absolute(consent_config)
+            if consent_path is None:
+                return _error("invalid_configuration")
+            saved = f.contribution_authority(consent_path)
+            authority = {"consent_config": str(consent_path),
+                         "consent_revision": saved.get("choice_revision")}
+            if enabled and (saved.get("choice") != "contribute" or not saved.get("choice_revision")):
+                return _error("contribution_not_enabled")
+        elif existing and existing.get("consent_config"):
+            # A legacy caller cannot detach a linked contribution authority.
+            authority = {key: existing[key] for key in ("consent_config", "consent_revision")}
         chosen = _merge_roots(None if existing is None else existing.get("roots"), roots)
         if chosen is None:
             return _error("invalid_configuration")
@@ -343,6 +357,7 @@ def configure_reporting(enabled, *, repository="mindie-agent/mindie-agent", conf
             existing is not None
             and existing.get("decision") == decision
             and existing.get("repository") == repository
+            and all(existing.get(key) == value for key, value in authority.items())
         ):
             revision = existing["revision"]
         else:
@@ -354,6 +369,7 @@ def configure_reporting(enabled, *, repository="mindie-agent/mindie-agent", conf
             "repository": repository,
             "revision": revision,
             "roots": chosen,
+            **authority,
         })
         if policy is None:
             return _error("invalid_configuration")

@@ -48,6 +48,18 @@ flowchart LR
 
 ## Quick Start
 
+MindIE Agent plugins use one contribution choice per installation profile for
+knowledge sharing and fault reporting. An explicit contribution choice links the
+same consent authority, configures diagnostics, and starts the native worker.
+Configuration alone does not mean that the worker is ready. Legacy choices
+without `choice_revision` require an explicit unified choice before diagnostics
+upload; an old reporting opt-out is never silently expanded. Profiles own separate
+policies, queues, and workers. Temporary network or GitHub permission failures
+retain evidence with backoff. An uncertain POST only reconciles remote markers
+and never automatically creates another issue. The lower-level CLI below also
+supports explicitly managed standalone components; plugins use their unified
+contribution entrypoint.
+
 ### Option 1: One-Sentence Setup via Your AI Agent (Recommended)
 
 Copy and paste this sentence to Claude Code, Codex, Kimi Code, or Cursor to let your agent install `mindie-diagnostics` and inspect local diagnostic status:

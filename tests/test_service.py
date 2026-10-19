@@ -70,7 +70,7 @@ def install(tmp_path, monkeypatch):
               "state": tmp_path / 'state %u $HOME', "repository": "example/repository",
               "python": python, "gh": gh, "unit_dir": tmp_path / "user units", "runner": runner,
               "since": "2026-09-13T01:02:03Z", "reporting_config": tmp_path / "reporting.json"}
-    runner.fragment = str(values['unit_dir'] / service.UNIT)
+    runner.fragment = str(service._unit_path(values['unit_dir']))
     return values, runner
 
 
@@ -90,6 +90,22 @@ def test_install_uses_literal_arguments_immutable_python_and_bounded_journal(ins
     assert result['since'] == '2026-09-13T01:02:03Z' or result['since'] == '2026-09-13T01:02:03+00:00'
 
 
+def test_legacy_migration_retires_only_the_matching_owned_policy(install):
+    values, runner = install
+    result = service.install_service(**values)
+    unit = Path(result["unit"])
+    original = unit.read_bytes()
+    runner.calls.clear()
+    other = values["reporting_config"].with_name("other-profile.json")
+    result = service.remove_service(unit_dir=values["unit_dir"], runner=runner,
+                                    expected_reporting_config=other)
+    assert result["status"] == "different_profile"
+    assert unit.read_bytes() == original and runner.calls == []
+    result = service.remove_service(unit_dir=values["unit_dir"], runner=runner,
+                                    expected_reporting_config=values["reporting_config"])
+    assert result["status"] == "removed" and not unit.exists()
+
+
 def test_reinstall_preserves_original_since_and_only_restarts_changed_config(install):
     values, runner = install
     first = service.install_service(**values)
@@ -99,10 +115,10 @@ def test_reinstall_preserves_original_since_and_only_restarts_changed_config(ins
     second = service.install_service(**{**values, 'since': '2030-01-01T00:00:00Z'})
     assert second['since'] == first['since'] and not second['changed']
     assert path.read_bytes() == previous
-    assert runner.calls[-1][0][-2:] == ['start', service.UNIT]
+    assert runner.calls[-1][0][-2:] == ['start', service._unit_path(values['unit_dir']).name]
     third = service.install_service(**{**values, 'interval': 120})
     assert third['changed'] and third['since'] == first['since']
-    assert runner.calls[-1][0][-2:] == ['restart', service.UNIT]
+    assert runner.calls[-1][0][-2:] == ['restart', service._unit_path(values['unit_dir']).name]
     previous = path.read_bytes()
     started = service.start_service(unit_dir=values['unit_dir'], runner=runner)
     assert started['since'] == first['since'] and path.read_bytes() == previous
@@ -175,7 +191,7 @@ def test_reinstall_repairs_own_invalid_unit_but_never_foreign_overrides(install)
 
 def test_personal_unit_is_never_overwritten_or_stopped(install):
     values, runner = install
-    path = values['unit_dir'] / service.UNIT
+    path = service._unit_path(values['unit_dir'])
     path.parent.mkdir(parents=True)
     original = b'[Service]\nExecStart=/personal/worker\n'
     path.write_bytes(original)
@@ -191,7 +207,7 @@ def test_editable_or_base_python_is_not_installed_in_unit(install):
     runner.editable = True
     with pytest.raises(service.ServiceError, match='installed_venv_required'):
         service.install_service(**values)
-    assert not (values['unit_dir'] / service.UNIT).exists()
+    assert not (service._unit_path(values['unit_dir'])).exists()
     assert not any(call[0][0] == 'systemctl' for call in runner.calls)
 
 
@@ -208,7 +224,7 @@ def test_remove_only_owned_unit_preserves_state_and_other_configuration(install)
     assert not Path(installed['unit']).exists()
     assert state_file.read_bytes() == b'preserved private state'
     assert other.read_bytes() == b'personal configuration'
-    assert runner.calls[1][0] == ['systemctl', '--user', 'disable', '--now', service.UNIT]
+    assert runner.calls[1][0] == ['systemctl', '--user', 'disable', '--now', service._unit_path(values['unit_dir']).name]
     assert service.remove_service(unit_dir=values['unit_dir'], runner=runner)['status'] == 'absent'
 
 
@@ -265,7 +281,7 @@ def test_loaded_personal_unit_or_dropin_is_not_started_or_stopped(install, chang
     setattr(runner, changed, '/personal/' + ('other.service' if changed == 'fragment' else 'override.conf'))
     with pytest.raises(service.ServiceError, match='unowned_'):
         service.install_service(**values)
-    assert not (values['unit_dir'] / service.UNIT).exists()
+    assert not (service._unit_path(values['unit_dir'])).exists()
     assert not any(call[0][2] in {'start', 'restart'} for call in runner.calls if call[0][0] == 'systemctl')
 
 
@@ -334,7 +350,7 @@ def test_zero_exit_parser_warning_does_not_publish_a_partially_ignored_unit(inst
     runner.verify_warning = True
     with pytest.raises(service.ServiceError, match='unit_verification_warning'):
         service.install_service(**values)
-    assert not (values['unit_dir'] / service.UNIT).exists()
+    assert not (service._unit_path(values['unit_dir'])).exists()
     assert not list(values['unit_dir'].glob('.mindie-unit-*'))
     assert not any(call[0][:3] == ['systemctl', '--user', 'daemon-reload'] for call in runner.calls)
 

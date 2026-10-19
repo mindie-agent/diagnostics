@@ -33,6 +33,7 @@ import re
 import shutil
 import stat
 import subprocess
+import hashlib
 import sys
 import tempfile
 import time
@@ -65,7 +66,10 @@ def _absolute(value):
 def _unit_path(unit_dir):
     if unit_dir is None:
         unit_dir = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "systemd/user"
-    return _absolute(unit_dir) / UNIT
+        return _absolute(unit_dir) / UNIT
+    root = _absolute(unit_dir)
+    digest = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:12]
+    return root / f"mindie-diagnostics-{digest}.service"
 
 
 def _quoted(value):
@@ -126,15 +130,15 @@ def _systemctl(runner, *args, check=True):
     return _run(runner, ["systemctl", "--user", *args], check=check, action="systemctl." + args[0])
 
 
-def _loaded_properties(runner):
-    reply = _systemctl(runner, "show", UNIT, "--no-pager",
+def _loaded_properties(runner, path):
+    reply = _systemctl(runner, "show", path.name, "--no-pager",
                        "--property=LoadState,ActiveState,SubState,UnitFileState,FragmentPath,DropInPaths", check=False)
     facts = dict(line.split("=", 1) for line in reply.stdout.splitlines() if "=" in line)
     return reply, facts
 
 
 def _check_loaded_owner(runner, path, *, allow_missing=False, creating=False, repair=False):
-    reply, facts = _loaded_properties(runner)
+    reply, facts = _loaded_properties(runner, path)
     if facts.get("DropInPaths"):
         raise ServiceError("unowned_unit_override")
     fragment = facts.get("FragmentPath")
@@ -365,7 +369,7 @@ def install_service(roots, state, repository, *, python=None, gh=None, interval=
         if start:
             # Recheck immediately before the owned stop/start mutation.
             _check_reporting_consent(reporting_config, expected_consent_revision)
-            _systemctl(runner, "restart" if existing and changed else "start", UNIT)
+            _systemctl(runner, "restart" if existing and changed else "start", path.name)
         return {"status": "installed", "unit": str(path), "since": fixed_since,
                 "changed": changed, "start_requested": start, "python": str(interpreter),
                 "package_version": version, "state": str(state), "unit_verification": verification}
@@ -390,7 +394,7 @@ def service_status(*, unit_dir=None, runner=None):
     existing = _read_owned(path)
     if existing is None:
         return {"status": "absent", "unit": str(path)}
-    reply, facts = _loaded_properties(runner or subprocess.run)
+    reply, facts = _loaded_properties(runner or subprocess.run, path)
     allowed = {key: facts.get(key) for key in ("LoadState", "ActiveState", "SubState", "UnitFileState", "FragmentPath")}
     status = facts.get("ActiveState", "unknown") if reply.returncode == 0 else "unknown"
     return {"status": status, "unit": str(path), "since": existing[1]["since"],
@@ -411,14 +415,15 @@ def start_service(*, unit_dir=None, runner=None):
             raise ServiceError("service_not_installed")
         _systemctl(runner, "daemon-reload")
         _check_loaded_owner(runner, path)
-        _systemctl(runner, "start", UNIT)
+        _systemctl(runner, "start", path.name)
         return {"status": "start_requested", "unit": str(path), "since": existing[1]["since"]}
 
 
-def remove_service(*, unit_dir=None, runner=None):
+def remove_service(*, unit_dir=None, runner=None, expected_reporting_config=None):
     if sys.platform in {"win32", "darwin"}:
         from .platform_service import remove_service as remove_native
-        return remove_native(unit_dir=unit_dir, runner=runner)
+        return remove_native(unit_dir=unit_dir, runner=runner,
+                             expected_reporting_config=expected_reporting_config)
     _linux()
     path = _unit_path(unit_dir)
     runner = runner or subprocess.run
@@ -426,8 +431,14 @@ def remove_service(*, unit_dir=None, runner=None):
         existing = _read_owned(path)
         if existing is None:
             return {"status": "absent", "unit": str(path)}
+        if expected_reporting_config is not None:
+            from .service_config import linux_worker_configuration, worker_options
+            argv, environment = linux_worker_configuration(existing[0])
+            binding = worker_options(argv, environment)
+            if binding["reporting_config"] != str(_absolute(expected_reporting_config)):
+                return {"status": "different_profile", "unit": str(path)}
         _check_loaded_owner(runner, path, allow_missing=True, repair=True)
-        _systemctl(runner, "disable", "--now", UNIT)
+        _systemctl(runner, "disable", "--now", path.name)
         if _read_owned(path) != existing:
             raise ServiceError("unit_changed_during_removal")
         path.unlink()

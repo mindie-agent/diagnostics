@@ -11,7 +11,7 @@ operation deduplication (`seen`), and hourly publication rate limits.
 - Active capacity (`capacity`, default 1000) counts only `pending`, `retry`,
   and `uncertain` rows; unpublished active evidence is never evicted by terminal
   history pruning.
-- `MAX_AUTOMATIC_CYCLES = 3` caps automatic publication attempts per fingerprint.
+- Transient failures and uncertain writes retain evidence until publication or withdrawal.
 - `begin_post` transitions leased rows to `uncertain` BEFORE any mutating GitHub
   POST so uncertain external writes are never blindly retried without
   reconciling the GitHub marker first.
@@ -41,8 +41,6 @@ from typing import Any
 from .fallback import _private_mkdir
 
 
-MAX_AUTOMATIC_CYCLES = 3
-UNSENT_TTL_SECONDS = 7 * 86400
 TERMINAL_HISTORY_LIMIT = 1000
 TERMINAL_HISTORY_SECONDS = 30 * 86400
 _ACTIVE_STATES = ("pending", "retry", "uncertain")
@@ -121,6 +119,13 @@ class Outbox:
                 if fresh:
                     db.executescript(_SCHEMA)
                 self._validate_schema(db)
+                # Older releases stopped reconciliation after three reads.
+                # Their compact receipt still identifies the remote marker.
+                db.execute(
+                    "UPDATE incidents SET state='uncertain',next_attempt=0,lease_until=0,lease_token=NULL "
+                    "WHERE state IN ('exhausted','expired','permanent-failed') "
+                    "AND last_error LIKE 'submission_uncertain%'"
+                )
         if os.name != "nt" and self.path.exists():
             os.chmod(self.path, 0o600)
 
@@ -154,6 +159,7 @@ class Outbox:
         db = sqlite3.connect(self.path.as_uri() + '?mode=rw', uri=True, timeout=3.0)
         db.row_factory = sqlite3.Row
         try:
+            db.execute("PRAGMA journal_mode=WAL")
             db.execute("PRAGMA busy_timeout=3000")
         except BaseException:
             db.close()
@@ -179,12 +185,22 @@ class Outbox:
             db.execute("BEGIN IMMEDIATE")
             db.execute("DELETE FROM seen WHERE observed < ?", (now - 30 * 86400,))
             db.execute("DELETE FROM publications WHERE at < ?", (now - 86400,))
-            self._terminalize(db, now)
             self._prune_published(db, now)
             if db.execute("SELECT 1 FROM seen WHERE operation_id=?", (operation_id,)).fetchone():
                 return False
-            existing = db.execute("SELECT payload FROM incidents WHERE fingerprint=?", (fingerprint,)).fetchone()
+            existing = db.execute("SELECT payload,state,last_error FROM incidents WHERE fingerprint=?", (fingerprint,)).fetchone()
             if existing:
+                if (existing["state"] in ("exhausted", "expired", "permanent-failed")
+                        and not (existing["last_error"] or "").startswith("submission_uncertain")):
+                    # A fresh authorized event restores evidence discarded by
+                    # the old read-attempt budget. Never replay unknown writes.
+                    db.execute(
+                        "UPDATE incidents SET payload=?,state='pending',attempts=0,next_attempt=0,"
+                        "first_seen=?,last_seen=?,occurrences=occurrences+1 WHERE fingerprint=?",
+                        (body, now, now, fingerprint),
+                    )
+                    db.execute("INSERT INTO seen VALUES (?,?)", (operation_id, now))
+                    return True
                 # Same consent+fault does not reset attempts, state, or payload.
                 kept = json.loads(existing["payload"])
                 if isinstance(kept, dict) and self._incident_id(operation_id):
@@ -205,47 +221,11 @@ class Outbox:
         return True
 
     def maintain(self) -> None:
-        """Expire over-budget or over-age unsent rows and compact terminal history. No timer."""
+        """Compact completed history without discarding unpublished evidence."""
         now = self.clock()
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            self._terminalize(db, now)
             self._prune_published(db, now)
-
-    def _terminalize(self, db, now: float) -> None:
-        """Close expired leases at the cycle budget, then age out unsent work."""
-        leased_out = db.execute(
-            "SELECT fingerprint, payload, state, issue_url FROM incidents "
-            "WHERE state IN ('pending','retry','uncertain') AND attempts>=? AND lease_until<=?",
-            (MAX_AUTOMATIC_CYCLES, now),
-        ).fetchall()
-        for row in leased_out:
-            fields = ["state='exhausted'", "payload=?", "lease_until=0", "lease_token=NULL"]
-            values = [self._receipt(row["fingerprint"], row["payload"], row["issue_url"])]
-            if row["state"] == "uncertain":
-                fields.append("last_error=?")
-                values.append("submission_uncertain_budget_exhausted")
-            values.append(row["fingerprint"])
-            db.execute(
-                "UPDATE incidents SET " + ",".join(fields) + " WHERE fingerprint=?",
-                values,
-            )
-        aged = db.execute(
-            "SELECT fingerprint, payload, state, issue_url FROM incidents "
-            "WHERE state IN ('pending','retry','uncertain') AND first_seen<? AND lease_until<=?",
-            (now - UNSENT_TTL_SECONDS, now),
-        ).fetchall()
-        for row in aged:
-            fields = ["state='expired'", "payload=?", "lease_until=0", "lease_token=NULL"]
-            values = [self._receipt(row["fingerprint"], row["payload"], row["issue_url"])]
-            if row["state"] == "uncertain":
-                fields.append("last_error=?")
-                values.append("submission_uncertain_expired")
-            values.append(row["fingerprint"])
-            db.execute(
-                "UPDATE incidents SET " + ",".join(fields) + " WHERE fingerprint=?",
-                values,
-            )
 
     @staticmethod
     def _incident_id(value):
@@ -327,13 +307,12 @@ class Outbox:
         now, token = self.clock(), uuid.uuid4().hex
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            self._terminalize(db, now)
             self._prune_published(db, now)
             row = db.execute(
                 """SELECT * FROM incidents WHERE state IN ('pending','retry','uncertain')
-                AND attempts < ? AND next_attempt <= ? AND lease_until <= ?
+                AND next_attempt <= ? AND lease_until <= ?
                 ORDER BY first_seen LIMIT 1""",
-                (MAX_AUTOMATIC_CYCLES, now, now),
+                (now, now),
             ).fetchone()
             if row is None:
                 return None
@@ -437,8 +416,7 @@ class Outbox:
     def begin_post(self, item: dict[str, Any], *, hourly_limit: int | None = None) -> bool:
         """Persist uncertainty BEFORE a mutating request, including process death.
 
-        The automatic cycle was already consumed by claim. This does not spend
-        another attempt, and an hourly allowance cannot open a fourth cycle.
+        The claim count is diagnostic, never a permanent delivery cutoff.
         """
         now = self.clock()
         with self.connect() as db:
@@ -449,8 +427,8 @@ class Outbox:
                     return False
             cursor = db.execute(
                 "UPDATE incidents SET state='uncertain' WHERE fingerprint=? AND lease_token=? "
-                "AND lease_until>? AND attempts BETWEEN 1 AND ? AND state IN ('pending','retry')",
-                (item["fingerprint"], item["lease_token"], now, MAX_AUTOMATIC_CYCLES),
+                "AND lease_until>? AND state IN ('pending','retry')",
+                (item["fingerprint"], item["lease_token"], now),
             )
             if cursor.rowcount != 1:
                 raise RuntimeError("diagnostic worker lease expired before publication")

@@ -108,6 +108,25 @@ def test_install_reuse_status_start_and_remove_preserve_data(installation):
     assert service.service_status(unit_dir=values["unit_dir"], runner=runner)["status"] == "absent"
 
 
+def test_native_migration_preserves_other_profiles(installation):
+    values, runner = installation
+    installed = service.install_service(**values)
+    manifest = Path(installed["manifest"])
+    original = manifest.read_bytes()
+    runner.calls.clear()
+    other = values["reporting_config"].with_name("other-profile.json")
+    assert service.remove_service(
+        unit_dir=values["unit_dir"], runner=runner,
+        expected_reporting_config=other,
+    )["status"] == "different_profile"
+    assert manifest.read_bytes() == original and runner.calls == []
+    assert service.remove_service(
+        unit_dir=values["unit_dir"], runner=runner,
+        expected_reporting_config=values["reporting_config"],
+    )["status"] == "removed"
+    assert not manifest.exists()
+
+
 def test_reporter_policy_roundtrip_and_binding_protection(installation):
     from mindie_diagnostics.service_config import worker_options
     values, runner = installation

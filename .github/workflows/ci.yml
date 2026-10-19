@@ -41,3 +41,5 @@ jobs:
           cd /tmp
           /tmp/diagnostics-wheel/bin/python -c "import importlib.metadata as m; assert not [x for x in m.requires('mindie-diagnostics') or [] if 'extra ==' not in x]"
           /tmp/diagnostics-wheel/bin/mindie-diagnostics --help
+          /tmp/diagnostics-wheel/bin/mindie-profiler --help
+          /tmp/diagnostics-wheel/bin/mindie-profiler --version

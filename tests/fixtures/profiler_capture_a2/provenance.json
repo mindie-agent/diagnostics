@@ -1,0 +1,9 @@
+{
+  "source": "Actual A2 Ascend910B4 torch_npu 2.10.0.post4 capture",
+  "run_id": "profiler-baseline-a5519b3a7d6c48a79898157480cfca96",
+  "source_db_sha256": "adb931778fd1759dd2bf39e9b0ec725602536402363ce274da7d1fb3ede6ef22",
+  "source_capture_sha256": "43f46d734e4b3a788d4adc6998bf71dd2e7c781e3872575bdbd88c75486ab082",
+  "projection": "Exact TASK schema and all rows; other tables omitted for clock/window test",
+  "task_rows": 1801,
+  "original_capture_status": "missing_db_export due old ranked-filename glob; original raw status preserved"
+}

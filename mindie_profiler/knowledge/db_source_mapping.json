@@ -1,0 +1,395 @@
+{
+  "version": 1,
+  "parser_version": "mindie_profiler/0.0.3",
+  "description": "Verified torch_npu/CANN profiler sqlite and kernel_details.csv field map. Columns come from real 1.2.0 captures; aliases cover the legacy Block Num spelling without inventing fields.",
+  "exporter_schema": {
+    "supported_versions": [
+      "1.2.0"
+    ],
+    "supported_prefixes": [
+      "1.2."
+    ],
+    "unversioned_columns_verified": true
+  },
+  "tables": {
+    "task": "TASK",
+    "compute": "COMPUTE_TASK_INFO",
+    "strings": "STRING_IDS",
+    "comm": "COMMUNICATION_OP",
+    "comm_sched": "COMMUNICATION_SCHEDULE_TASK_INFO",
+    "meta": "META_DATA",
+    "pmu": "TASK_PMU_INFO"
+  },
+  "db_columns": {
+    "task_required": [
+      "globalTaskId",
+      "startNs",
+      "endNs",
+      "deviceId",
+      "streamId",
+      "taskId",
+      "modelId",
+      "contextId",
+      "taskType"
+    ],
+    "compute_required": [
+      "name",
+      "globalTaskId",
+      "opType",
+      "taskType"
+    ],
+    "compute_optional": [
+      "inputShapes",
+      "inputDataTypes",
+      "inputFormats",
+      "waitNs"
+    ],
+    "compute_alias_groups": {
+      "block_dim": [
+        "blockDim",
+        "blockNum"
+      ],
+      "mix_block_dim": [
+        "mixBlockDim",
+        "mixBlockNum"
+      ]
+    },
+    "comm_required": [
+      "opName",
+      "opType",
+      "startNs",
+      "endNs",
+      "deviceId"
+    ],
+    "comm_sched_required": [
+      "name",
+      "globalTaskId",
+      "taskType",
+      "opType"
+    ],
+    "compute_wait_columns": [
+      "waitNs"
+    ],
+    "pmu_required": [
+      "globalTaskId",
+      "name",
+      "value"
+    ]
+  },
+  "sentinels": {
+    "invalid_id": 4294967295,
+    "not_available": "N/A"
+  },
+  "time_units": {
+    "database": "nanoseconds",
+    "kernel_details_csv": "microseconds",
+    "report": "milliseconds",
+    "database_wait": "nanoseconds",
+    "kernel_details_csv_wait": "microseconds",
+    "pmu_time": "nanoseconds",
+    "pmu_ratio": "fraction 0..1"
+  },
+  "csv": {
+    "required_fields": [
+      "name",
+      "start_us"
+    ],
+    "duration_or_end": [
+      "duration_us",
+      "end_us"
+    ],
+    "aliases": {
+      "name": [
+        "Name",
+        "Op Name",
+        "Kernel Name",
+        "Operation Name"
+      ],
+      "start_us": [
+        "Start Time(us)",
+        "Start Time",
+        "Start(us)",
+        "Start",
+        "ts"
+      ],
+      "duration_us": [
+        "Duration(us)",
+        "Duration",
+        "dur"
+      ],
+      "end_us": [
+        "End Time(us)",
+        "End Time",
+        "End(us)",
+        "End"
+      ],
+      "stream_id": [
+        "Stream ID",
+        "StreamId",
+        "Stream",
+        "stream_id"
+      ],
+      "task_id": [
+        "Task ID",
+        "TaskId",
+        "task_id"
+      ],
+      "device_id": [
+        "Device_id",
+        "Device ID",
+        "device_id"
+      ],
+      "core": [
+        "Accelerator Core",
+        "Core Type",
+        "Task Type",
+        "Kernel Type",
+        "Type"
+      ],
+      "type": [
+        "Type",
+        "Task Type",
+        "Kernel Type"
+      ],
+      "op_state": [
+        "OP State",
+        "Op State"
+      ],
+      "block_dim": [
+        "Block Dim",
+        "Block Num",
+        "blockDim",
+        "block_dim"
+      ],
+      "mix_block_dim": [
+        "Mix Block Dim",
+        "Mix Block Num",
+        "mixBlockDim",
+        "mix_block_dim"
+      ],
+      "input_shapes": [
+        "Input Shapes",
+        "Input Shape",
+        "Input"
+      ],
+      "input_dtypes": [
+        "Input Data Types",
+        "Input DataType",
+        "Input Dtypes"
+      ],
+      "input_formats": [
+        "Input Formats",
+        "Input Format"
+      ],
+      "wait_us": [
+        "Wait Time(us)",
+        "Wait Time",
+        "Wait(us)",
+        "wait"
+      ],
+      "context_id": [
+        "Context ID",
+        "ContextId",
+        "context_id"
+      ],
+      "model_id": [
+        "Model ID",
+        "ModelId",
+        "model_id"
+      ]
+    }
+  },
+  "semantic_blocks": [
+    "Attention",
+    "MoE",
+    "Comm",
+    "Norm",
+    "Copy_Layout",
+    "Host_Gap",
+    "Unclassified"
+  ],
+  "mapping_rules": {
+    "Attention": "op_name_prefix+layer_scope",
+    "MoE": "grouped_matmul+dispatch_combine",
+    "Comm": "hccl_communication_op",
+    "Norm": "rmsnorm+layernorm",
+    "Copy_Layout": "transdata+cast+d2d",
+    "Host_Gap": "stream_idle_gap",
+    "Unclassified": "residual_unmapped"
+  },
+  "pmu_metrics": {
+    "aic_total_time": {
+      "db_metric": "aic_total_time",
+      "unit": "ns",
+      "csv_column": "aicore_time(us)",
+      "csv_scale": 1000.0
+    },
+    "aic_total_cycles": {
+      "db_metric": "aic_total_cycles",
+      "unit": "cycles",
+      "csv_column": "aic_total_cycles",
+      "csv_scale": 1.0
+    },
+    "aic_mac_time": {
+      "db_metric": "aic_mac_time",
+      "unit": "ns",
+      "csv_column": "aic_mac_time(us)",
+      "csv_scale": 1000.0
+    },
+    "aic_mac_ratio": {
+      "db_metric": "aic_mac_ratio",
+      "unit": "ratio",
+      "csv_column": "aic_mac_ratio",
+      "csv_scale": 1.0
+    },
+    "aic_scalar_time": {
+      "db_metric": "aic_scalar_time",
+      "unit": "ns",
+      "csv_column": "aic_scalar_time(us)",
+      "csv_scale": 1000.0
+    },
+    "aic_scalar_ratio": {
+      "db_metric": "aic_scalar_ratio",
+      "unit": "ratio",
+      "csv_column": "aic_scalar_ratio",
+      "csv_scale": 1.0
+    },
+    "aic_mte1_time": {
+      "db_metric": "aic_mte1_time",
+      "unit": "ns",
+      "csv_column": "aic_mte1_time(us)",
+      "csv_scale": 1000.0
+    },
+    "aic_mte1_ratio": {
+      "db_metric": "aic_mte1_ratio",
+      "unit": "ratio",
+      "csv_column": "aic_mte1_ratio",
+      "csv_scale": 1.0
+    },
+    "aic_mte2_time": {
+      "db_metric": "aic_mte2_time",
+      "unit": "ns",
+      "csv_column": "aic_mte2_time(us)",
+      "csv_scale": 1000.0
+    },
+    "aic_mte2_ratio": {
+      "db_metric": "aic_mte2_ratio",
+      "unit": "ratio",
+      "csv_column": "aic_mte2_ratio",
+      "csv_scale": 1.0
+    },
+    "aic_fixpipe_time": {
+      "db_metric": "aic_fixpipe_time",
+      "unit": "ns",
+      "csv_column": "aic_fixpipe_time(us)",
+      "csv_scale": 1000.0
+    },
+    "aic_fixpipe_ratio": {
+      "db_metric": "aic_fixpipe_ratio",
+      "unit": "ratio",
+      "csv_column": "aic_fixpipe_ratio",
+      "csv_scale": 1.0
+    },
+    "aic_icache_miss_rate": {
+      "db_metric": "aic_icache_miss_rate",
+      "unit": "ratio",
+      "csv_column": "aic_icache_miss_rate",
+      "csv_scale": 1.0
+    },
+    "aiv_total_time": {
+      "db_metric": "aiv_total_time",
+      "unit": "ns",
+      "csv_column": "aiv_time(us)",
+      "csv_scale": 1000.0
+    },
+    "aiv_total_cycles": {
+      "db_metric": "aiv_total_cycles",
+      "unit": "cycles",
+      "csv_column": "aiv_total_cycles",
+      "csv_scale": 1.0
+    },
+    "aiv_vec_time": {
+      "db_metric": "aiv_vec_time",
+      "unit": "ns",
+      "csv_column": "aiv_vec_time(us)",
+      "csv_scale": 1000.0
+    },
+    "aiv_vec_ratio": {
+      "db_metric": "aiv_vec_ratio",
+      "unit": "ratio",
+      "csv_column": "aiv_vec_ratio",
+      "csv_scale": 1.0
+    },
+    "aiv_mac_time": {
+      "db_metric": "aiv_mac_time",
+      "unit": "ns"
+    },
+    "aiv_mac_ratio": {
+      "db_metric": "aiv_mac_ratio",
+      "unit": "ratio"
+    },
+    "aiv_scalar_time": {
+      "db_metric": "aiv_scalar_time",
+      "unit": "ns",
+      "csv_column": "aiv_scalar_time(us)",
+      "csv_scale": 1000.0
+    },
+    "aiv_scalar_ratio": {
+      "db_metric": "aiv_scalar_ratio",
+      "unit": "ratio",
+      "csv_column": "aiv_scalar_ratio",
+      "csv_scale": 1.0
+    },
+    "aiv_mte1_time": {
+      "db_metric": "aiv_mte1_time",
+      "unit": "ns"
+    },
+    "aiv_mte1_ratio": {
+      "db_metric": "aiv_mte1_ratio",
+      "unit": "ratio"
+    },
+    "aiv_mte2_time": {
+      "db_metric": "aiv_mte2_time",
+      "unit": "ns",
+      "csv_column": "aiv_mte2_time(us)",
+      "csv_scale": 1000.0
+    },
+    "aiv_mte2_ratio": {
+      "db_metric": "aiv_mte2_ratio",
+      "unit": "ratio",
+      "csv_column": "aiv_mte2_ratio",
+      "csv_scale": 1.0
+    },
+    "aiv_mte3_time": {
+      "db_metric": "aiv_mte3_time",
+      "unit": "ns",
+      "csv_column": "aiv_mte3_time(us)",
+      "csv_scale": 1000.0
+    },
+    "aiv_mte3_ratio": {
+      "db_metric": "aiv_mte3_ratio",
+      "unit": "ratio",
+      "csv_column": "aiv_mte3_ratio",
+      "csv_scale": 1.0
+    },
+    "aiv_icache_miss_rate": {
+      "db_metric": "aiv_icache_miss_rate",
+      "unit": "ratio",
+      "csv_column": "aiv_icache_miss_rate",
+      "csv_scale": 1.0
+    },
+    "cube_utilization_pct": {
+      "db_metric": "cube_utilization_pct",
+      "unit": "percent",
+      "csv_column": "cube_utilization(%)",
+      "csv_scale": 1.0
+    }
+  },
+  "pmu_units": {
+    "ns": "nanoseconds, full-event values",
+    "cycles": "cycles, full-event values",
+    "ratio": "fraction 0..1, full-event values",
+    "percent": "percent 0..100, full-event values",
+    "unknown": "unmapped metric unit"
+  }
+}

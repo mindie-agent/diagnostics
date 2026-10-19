@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mindie-diagnostics"
-version = "0.4.3"
-description = "Bounded structured diagnostics and safe support bundles for MindIE owners"
+version = "0.5.0"
+description = "Bounded diagnostics, support bundles, and Ascend profiler analysis for MindIE owners"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []
@@ -15,6 +15,10 @@ test = ["pytest>=8,<10"]
 
 [project.scripts]
 mindie-diagnostics = "mindie_diagnostics.cli:main"
+mindie-profiler = "mindie_profiler.__main__:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["mindie_diagnostics"]
+packages = ["mindie_diagnostics", "mindie_profiler"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/mindie_diagnostics", "/mindie_profiler", "/tests", "/benchmarks", "/docs", "/README.md", "/README.en.md", "/AGENTS.md", "/LICENSE", "/pyproject.toml"]

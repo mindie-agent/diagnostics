@@ -13,6 +13,17 @@
         "{python}",
         "benchmarks/release.py"
       ]
+    },
+    {
+      "id": "profiler-analysis-and-attribution",
+      "kind": "microbenchmark",
+      "required": true,
+      "repetitions": 5,
+      "timeout_seconds": 20,
+      "command": [
+        "{python}",
+        "benchmarks/profiler.py"
+      ]
     }
   ]
 }

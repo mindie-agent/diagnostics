@@ -1,0 +1,2 @@
+Name,Size(KB),Allocation Time(us),Release Time(us),Active Release Time(us),Duration(us),Active Duration(us),Allocation Total Allocated(MB),Allocation Total Reserved(MB),Allocation Total Active(MB),Release Total Allocated(MB),Release Total Reserved(MB),Release Total Active(MB),Stream Ptr,Device Type
+npu::npu_fused_infer_attention_score,12888321.5,1792445431798596.230	,1792445431798615.100	,1792445431798614.020	,18.870	,17.790	,25100.70068359375,25122.0,25100.70068359375,12514.44921875,25122.0,12514.44921875,47,NPU:0

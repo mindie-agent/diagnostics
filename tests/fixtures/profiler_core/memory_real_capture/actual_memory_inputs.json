@@ -1,0 +1,188 @@
+{
+  "schema_version": "mindie-real-memory-inputs/1",
+  "run_id": "profiler-baseline-a5519b3a7d6c48a79898157480cfca96",
+  "label": "baseline",
+  "memory_snapshots": {
+    "baseline": {
+      "schema_version": "mindie-runtime-memory-snapshot/1",
+      "phase": "baseline",
+      "device": 0,
+      "unit": "byte",
+      "source": "torch_npu.npu.memory_allocated/memory_reserved/max_*/mem_get_info",
+      "observed_at": "2026-10-19T20:32:12.624164Z",
+      "allocator": {
+        "allocated_bytes": 0,
+        "reserved_bytes": 0,
+        "max_allocated_bytes": 0,
+        "max_reserved_bytes": 0
+      },
+      "device_memory": {
+        "free_bytes": 31285747712,
+        "total_bytes": 31662800896,
+        "used_bytes": 377053184
+      },
+      "derived": {
+        "reserved_minus_allocated_bytes": 0,
+        "device_used_minus_allocator_allocated_bytes": 377053184,
+        "device_used_minus_allocator_reserved_bytes": 377053184,
+        "note": "derived difference; not a direct driver measurement"
+      }
+    },
+    "ready": {
+      "schema_version": "mindie-runtime-memory-snapshot/1",
+      "phase": "ready",
+      "device": 0,
+      "unit": "byte",
+      "source": "torch_npu.npu.memory_allocated/memory_reserved/max_*/mem_get_info",
+      "observed_at": "2026-10-19T20:32:12.983999Z",
+      "allocator": {
+        "allocated_bytes": 1062400,
+        "reserved_bytes": 2097152,
+        "max_allocated_bytes": 1096192,
+        "max_reserved_bytes": 2097152
+      },
+      "device_memory": {
+        "free_bytes": 31283650560,
+        "total_bytes": 31662800896,
+        "used_bytes": 379150336
+      },
+      "derived": {
+        "reserved_minus_allocated_bytes": 1034752,
+        "device_used_minus_allocator_allocated_bytes": 378087936,
+        "device_used_minus_allocator_reserved_bytes": 377053184,
+        "note": "derived difference; not a direct driver measurement"
+      }
+    },
+    "inference_peak": {
+      "schema_version": "mindie-runtime-memory-snapshot/1",
+      "phase": "inference_peak",
+      "device": 0,
+      "unit": "byte",
+      "source": "torch_npu.npu.memory_allocated/memory_reserved/max_*/mem_get_info",
+      "observed_at": "2026-10-19T20:32:18.229818Z",
+      "allocator": {
+        "allocated_bytes": 1062400,
+        "reserved_bytes": 2097152,
+        "max_allocated_bytes": 1096192,
+        "max_reserved_bytes": 2097152
+      },
+      "device_memory": {
+        "free_bytes": 31274213376,
+        "total_bytes": 31662800896,
+        "used_bytes": 388587520
+      },
+      "derived": {
+        "reserved_minus_allocated_bytes": 1034752,
+        "device_used_minus_allocator_allocated_bytes": 387525120,
+        "device_used_minus_allocator_reserved_bytes": 386490368,
+        "note": "derived difference; not a direct driver measurement"
+      }
+    }
+  },
+  "weight_manifest": {
+    "schema_version": "mindie-weight-inspection/1",
+    "status": "ok",
+    "source": "safetensors_file_headers",
+    "read_only": true,
+    "unit": "byte",
+    "tp": 1,
+    "dp": 1,
+    "enable_expert_parallel": false,
+    "tensors": [
+      {
+        "name": "0.bias",
+        "dtype": "F32",
+        "shape": [
+          512
+        ],
+        "numel": 512,
+        "data_offsets": [
+          0,
+          2048
+        ],
+        "byte_size": 2048,
+        "bytes_per_element": 4,
+        "expected_byte_size": 2048,
+        "size_matches_dtype": true,
+        "source": "safetensors_header",
+        "unit": "byte",
+        "source_file": "model.safetensors",
+        "category": "other",
+        "shard_strategy": "replicated"
+      },
+      {
+        "name": "0.weight",
+        "dtype": "F32",
+        "shape": [
+          512,
+          256
+        ],
+        "numel": 131072,
+        "data_offsets": [
+          2048,
+          526336
+        ],
+        "byte_size": 524288,
+        "bytes_per_element": 4,
+        "expected_byte_size": 524288,
+        "size_matches_dtype": true,
+        "source": "safetensors_header",
+        "unit": "byte",
+        "source_file": "model.safetensors",
+        "category": "other",
+        "shard_strategy": "replicated"
+      },
+      {
+        "name": "2.bias",
+        "dtype": "F32",
+        "shape": [
+          256
+        ],
+        "numel": 256,
+        "data_offsets": [
+          526336,
+          527360
+        ],
+        "byte_size": 1024,
+        "bytes_per_element": 4,
+        "expected_byte_size": 1024,
+        "size_matches_dtype": true,
+        "source": "safetensors_header",
+        "unit": "byte",
+        "source_file": "model.safetensors",
+        "category": "other",
+        "shard_strategy": "replicated"
+      },
+      {
+        "name": "2.weight",
+        "dtype": "F32",
+        "shape": [
+          256,
+          512
+        ],
+        "numel": 131072,
+        "data_offsets": [
+          527360,
+          1051648
+        ],
+        "byte_size": 524288,
+        "bytes_per_element": 4,
+        "expected_byte_size": 524288,
+        "size_matches_dtype": true,
+        "source": "safetensors_header",
+        "unit": "byte",
+        "source_file": "model.safetensors",
+        "category": "other",
+        "shard_strategy": "replicated"
+      }
+    ]
+  },
+  "kv_cache_applicable": false,
+  "architecture_note": "Caller-explicit not-applicable KV scope for the actual MLP-only model; absence of KV is not treated as verified zero bytes.",
+  "provenance": {
+    "source_result_path": "private-source/result.json",
+    "source_result_sha256": "9aea7fe76b5458baf70cf38a096681f314eebe30e8e8965931fa41394eba634a",
+    "source_db_path": "private-source/ascend_pytorch_profiler.db",
+    "source_db_sha256": "adb931778fd1759dd2bf39e9b0ec725602536402363ce274da7d1fb3ede6ef22"
+  }
+}

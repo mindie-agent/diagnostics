@@ -1,0 +1,55 @@
+{
+  "schema_version": "mindie-memory-online-a3-fixture-provenance/1",
+  "source_result_path": "private-source/result.json",
+  "source_result_sha256": "e094b3afd63aee5632decd13718cb619d419fff1b41db3bcd3b72be91abdb7f1",
+  "source_db_path": "private-source/ascend_pytorch_profiler_0.db",
+  "source_db_sha256": "93583dae3f1ead65c0af76bdfe0b55b74a896cde491cc433a5424616344325f6",
+  "source_db_size_bytes": 1896448,
+  "source_log_path": "private-source/server.stdout.log",
+  "source_log_sha256": "3ac9fdb07744c350e3cc168d1821734a8c6f857344d2e1ca3a7c6fd7a77586f9",
+  "source_config_path": "private-source/config.json",
+  "source_config_sha256": "0d3b3ff119d6d2f0e110c4c98cd07dff0355a3e78a57c7a631f8a3503de26354",
+  "source_memory_record_path": "private-source/memory_record.csv",
+  "source_memory_record_sha256": "c528a6eb5450d5b09a0af3881c8f629704c2f8d2e268d1cd24e78b43d0132aec",
+  "slice_db_path": "tests/fixtures/profiler_core/memory_online_a3/npu_mem_slice.db",
+  "slice_db_sha256": "42b730f36d0ade53866cf320e89a27bb4ecfa75779199a2f28503b78d69b086e",
+  "slice_db_size_bytes": 16384,
+  "slice_log_path": "tests/fixtures/profiler_core/memory_online_a3/server_stdout_memory_lines.log",
+  "slice_log_sha256": "9142f8b1a36836457f204dd58cc318aaa70210b7d9a1f5a1aa5a37c508a09039",
+  "slice_lines": {
+    "server_stdout": [
+      62,
+      66,
+      67,
+      75
+    ]
+  },
+  "table_rows": {
+    "NPU_MEM": 40,
+    "STRING_IDS": 2,
+    "NPU_INFO": 1,
+    "MEMORY_RECORD": 4368,
+    "OP_MEMORY": 728,
+    "STRING_IDS_full": 365
+  },
+  "unit_basis": "NPU_MEM.hbm bytes cross-checked with memory_record.csv APP Total Reserved(MB) * 1048576 at matching timestamp",
+  "raw_immutable": true,
+  "note": "Exact read-only slices for pure parsing; no NPU/remote call.",
+  "slice_config_path": "tests/fixtures/profiler_core/memory_online_a3/config.json",
+  "slice_config_sha256": "0d3b3ff119d6d2f0e110c4c98cd07dff0355a3e78a57c7a631f8a3503de26354",
+  "slice_memory_record_path": "tests/fixtures/profiler_core/memory_online_a3/memory_record_first_app.csv",
+  "slice_memory_record_sha256": "b2cca4b813f855aa52bddfdc09f3dbcc66b92c669af8c4dfab8985e2796bea87",
+  "slice_memory_record_lines": [
+    1,
+    2
+  ],
+  "slice_memory_record_op_db_path": "tests/fixtures/profiler_core/memory_online_a3/memory_record_op_slice.db",
+  "slice_memory_record_op_db_sha256": "feaec19e4ae79d1f0e4301cc21f7b373a0e488e95f64fd385c45f8da4b86e99f",
+  "slice_memory_record_op_db_size_bytes": 294912,
+  "slice_operator_memory_path": "tests/fixtures/profiler_core/memory_online_a3/operator_memory_large.csv",
+  "slice_operator_memory_sha256": "b75c4db6b68b6403ab465afaf52ab0a786e938c049b5c969d7aac014b1441030",
+  "slice_operator_memory_lines": [
+    1,
+    2
+  ]
+}

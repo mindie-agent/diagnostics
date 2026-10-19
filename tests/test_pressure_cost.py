@@ -33,7 +33,18 @@ def test_marker_changes_are_immediate_without_revalidating_every_ancestor(tmp_pa
 def test_existing_writer_stops_growth_on_new_pressure_and_resumes(tmp_path):
     recorder = configure('pressure-cost', root=tmp_path)
     try:
+        # Cold registry/segment setup may consume the nonblocking writer budget.
+        # Warm it once before measuring an existing writer's pressure response.
+        recorder.event('INFO', 'warmup')
+        warmup_drops = recorder.dropped_records
+        if warmup_drops:
+            assert recorder.logging_failed
         recorder.event('INFO', 'first')
+        assert recorder.dropped_records == warmup_drops, (
+            f"existing writer did not admit the first measured event: "
+            f"logging_failed={recorder.logging_failed}, "
+            f"dropped_records={recorder.dropped_records}, warmup_drops={warmup_drops}"
+        )
         log = Path(recorder.record_ref)
         before = log.stat().st_size
         marker = tmp_path / 'retention-state.json'

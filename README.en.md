@@ -171,6 +171,37 @@ result = record_failure(
 
 ---
 
+## NPU Profiling & Cross-Run Comparison (`mindie-profiler`)
+
+Starting in `0.5.0`, this package also ships the `mindie-profiler` CLI (equivalent to `python3 -m mindie_profiler`) for in-place Ascend profiler accounting (`mindie-profile-summary/1` C7 JSON) and cross-run comparison:
+
+```bash
+# 1. Analyze an Ascend SQLite DB (or kernel_details.csv) in place with explicit labeled or unlabeled windows
+mindie-profiler \
+  --root /path/to/ascend_pytorch_profiler_dir \
+  --step-window 1=100000:250000 \
+  --time-window 260000:400000 \
+  --unit us --source auto \
+  --mode inference --framework vllm-ascend --phase decode --tp 8 \
+  --input-signature "qwen2.5-7b-bs16-in1024-out128" \
+  --output /tmp/baseline-c7.json
+
+# 2. Compare two C7 summaries (or pass --{baseline,candidate}-root with --*-steps-file)
+#    Exits 0 when comparable, or 3 when not_comparable (missing workload identity or incompatible scope)
+mindie-profiler compare \
+  --baseline-summary /tmp/baseline-c7.json \
+  --candidate-summary /tmp/candidate-c7.json \
+  --output /tmp/compare-receipt.json
+```
+
+**Scope & Limitations:**
+- **In-Place SQLite Direct Read & Explicit Windows**: Reads `ascend_pytorch_profiler_*.db` (preferred by `--source auto`) or `kernel_details.csv` in place under bounded query timeouts (`--query-timeout-s`, default `20s`). Requires explicit `--step-window`, `--time-window`, `--steps-file`, or `--full-range` — **it never infers step IDs from kernel rows**. Unverified Wait-Anchor `wait_ns` and absent PMU counters are reported explicitly in `limitations`.
+- **Dual Collection & Honest Outcome Accounting**: Supports explicit online HTTP profile-window control (single `POST /start_profile` and `POST /stop_profile` requests that distinguish `completed`, `failed`, and non-retried `unknown` outcomes) alongside offline `torch_npu.profiler` / `msprof` artifact analysis.
+- **Model Provider (`TensorCastAnalyticProvider`)**: `mindie_profiler/tensor_cast_provider.py::TensorCastAnalyticProvider` invokes the pinned upstream `msmodeling` / `tensor_cast` (`0.2.0` / `1adde03`) `AnalyticPerformanceModel` and joins explicit operator `shapes`, `dtypes`, and `weights` with measured `TASK` durations (alongside `roofline-max-v1` local per-operator lower bounds). Limitations: the `Ascend910B4` to `ATLAS_800_A2_280T_32G_PCIE` hardware spec mapping remains marked `caller_explicit_unverified`, PMU data reports raw counters only without causal bottleneck attribution, and `Wait-Anchor` provenance remains unverified.
+- **HBM Memory Attribution (`P0–P4`) Scope**: Performs tiered attribution over observed finite sampled peaks only; `P2` log values are rounded approximations, device and allocator reads are non-atomic, and **no continuous absolute device peak is claimed**.
+
+---
+
 ## Configuration Reference
 
 | Variable / Path | Default | Description |

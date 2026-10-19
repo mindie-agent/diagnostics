@@ -1,0 +1,246 @@
+{
+  "schema_version": "mindie-framework-capture/1",
+  "status": "missing_db_export",
+  "clock_domain": "unix_wall",
+  "wall_clock": "time.time_ns",
+  "monotonic_clock": "time.perf_counter_ns",
+  "phase_units": "ms",
+  "plan": {
+    "schema_version": "mindie-framework-capture-plan/1",
+    "caller_window": {
+      "start_step": 1,
+      "end_step": 4,
+      "end_exclusive": true,
+      "step_count": 3
+    },
+    "schedule": {
+      "skip_first": 0,
+      "wait": 0,
+      "warmup": 1,
+      "active": 3,
+      "repeat": 1
+    },
+    "capture": {
+      "start_step": 1,
+      "end_step": 4,
+      "captured_step_ids": [
+        1,
+        2,
+        3
+      ],
+      "step_identity_source": "caller_declared_range"
+    },
+    "inequality": {
+      "expression": "skip_first + wait + warmup + active*repeat + terminal_flush",
+      "skip_first": 0,
+      "wait": 0,
+      "warmup": 1,
+      "active": 3,
+      "repeat": 1,
+      "scheduled_steps": 4,
+      "terminal_flush_calls": 1,
+      "required_prof_step_calls": 5,
+      "declared_model_steps": 4,
+      "declared_prof_step_calls": 5,
+      "capture_start_step": 1,
+      "capture_end_step": 4,
+      "capture_within_declared": true,
+      "capture_matches_declared": true,
+      "calls_match_declared": true,
+      "satisfied": true
+    },
+    "execution": {
+      "model_step_ids": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "terminal_flush_step_id": 4,
+      "terminal_flush_is_model_step": false
+    },
+    "experimental_config": {
+      "profiler_level": "Level1",
+      "aic_metrics": "PipeUtilization",
+      "export_type": "Db"
+    },
+    "activities": [
+      "CPU",
+      "NPU"
+    ]
+  },
+  "output_dir": "/tmp/mindie-npu-test-profiler-baseline-a5519b3a7d6c48a79898157480cfca96/result/profile",
+  "device": 0,
+  "phases": {
+    "import": 0.075351,
+    "build": 3.165364,
+    "start": 107.94531,
+    "loop": 5037.864683,
+    "collect": 5037.864683,
+    "active": 132.72074,
+    "terminal_flush": 0.252154,
+    "export_and_analysis": 0.051921,
+    "stop_and_export": 0.051921,
+    "capture_total": 5146.168769,
+    "artifact_scan": 16.508173,
+    "run_total": 5166.045728,
+    "total": 5146.168769
+  },
+  "steps": {
+    "model_step_calls": 4,
+    "skipped": null,
+    "warmup": {
+      "count": 1,
+      "total_ms": 31.23244,
+      "min_ms": 31.23244,
+      "max_ms": 31.23244,
+      "mean_ms": 31.23244
+    },
+    "active": {
+      "count": 3,
+      "total_ms": 132.72074,
+      "min_ms": 43.848768,
+      "max_ms": 44.869282,
+      "mean_ms": 44.24024666666667
+    },
+    "active_sample_ms": [
+      43.848768,
+      44.00269,
+      44.869282
+    ],
+    "captured_step_ids": [
+      1,
+      2,
+      3
+    ],
+    "terminal_flush_executed": true,
+    "step_identity_source": "caller_declared_range"
+  },
+  "step_records": [
+    {
+      "step": 0,
+      "segment": "warmup",
+      "wall_start_ns": 1792441933171443916,
+      "wall_end_ns": 1792441933202678076,
+      "wall_start_ts": 1792441933.171444,
+      "wall_end_ts": 1792441933.202678,
+      "perf_start_ns": 1366413947477845,
+      "perf_end_ns": 1366413978710285,
+      "duration_ms": 31.23244,
+      "profiler_step_wall_start_ns": 1792441933202682476,
+      "profiler_step_wall_end_ns": 1792441933203551758,
+      "profiler_step_perf_start_ns": 1366413978716065,
+      "profiler_step_perf_end_ns": 1366413979584247,
+      "profiler_step_duration_ms": 0.868182,
+      "clock_domain": "unix_wall"
+    },
+    {
+      "step": 1,
+      "segment": "active",
+      "wall_start_ns": 1792441933203572218,
+      "wall_end_ns": 1792441933247423356,
+      "wall_start_ts": 1792441933.2035723,
+      "wall_end_ts": 1792441933.2474232,
+      "perf_start_ns": 1366413979605947,
+      "perf_end_ns": 1366414023454715,
+      "duration_ms": 43.848768,
+      "profiler_step_wall_start_ns": 1792441933247427676,
+      "profiler_step_wall_end_ns": 1792441933247641269,
+      "profiler_step_perf_start_ns": 1366414023461305,
+      "profiler_step_perf_end_ns": 1366414023673768,
+      "profiler_step_duration_ms": 0.212463,
+      "clock_domain": "unix_wall"
+    },
+    {
+      "step": 2,
+      "segment": "active",
+      "wall_start_ns": 1792441933247646849,
+      "wall_end_ns": 1792441933291650639,
+      "wall_start_ts": 1792441933.247647,
+      "wall_end_ts": 1792441933.2916505,
+      "perf_start_ns": 1366414023680388,
+      "perf_end_ns": 1366414067683078,
+      "duration_ms": 44.00269,
+      "profiler_step_wall_start_ns": 1792441933291652109,
+      "profiler_step_wall_end_ns": 1792441933291856862,
+      "profiler_step_perf_start_ns": 1366414067685618,
+      "profiler_step_perf_end_ns": 1366414067889691,
+      "profiler_step_duration_ms": 0.204073,
+      "clock_domain": "unix_wall"
+    },
+    {
+      "step": 3,
+      "segment": "active",
+      "wall_start_ns": 1792441933291861412,
+      "wall_end_ns": 1792441933336732014,
+      "wall_start_ts": 1792441933.2918615,
+      "wall_end_ts": 1792441933.336732,
+      "perf_start_ns": 1366414067894901,
+      "perf_end_ns": 1366414112764183,
+      "duration_ms": 44.869282,
+      "profiler_step_wall_start_ns": 1792441933336734834,
+      "profiler_step_wall_end_ns": 1792441938209288359,
+      "profiler_step_perf_start_ns": 1366414112768343,
+      "profiler_step_perf_end_ns": 1366418985320298,
+      "profiler_step_duration_ms": 4872.551955,
+      "clock_domain": "unix_wall"
+    }
+  ],
+  "artifacts": {
+    "ok": true,
+    "root": "/tmp/mindie-npu-test-profiler-baseline-a5519b3a7d6c48a79898157480cfca96/result/profile",
+    "artifacts": [],
+    "by_kind": {},
+    "error": null
+  },
+  "success_requirements": {
+    "stop_acknowledged": true,
+    "artifact_scan_ok": true,
+    "non_empty_db_present": false,
+    "capture_contains_active": true,
+    "export_within_budget": true
+  },
+  "profiler_output": {
+    "stdout": "",
+    "stderr": "",
+    "truncated": false,
+    "error_lines": []
+  },
+  "error": {
+    "code": "missing_db_export",
+    "message": "no non-empty ascend_pytorch_profiler_*.db artifact found"
+  },
+  "export_budget_s": 60.0,
+  "export_budget_ms": 60000.0,
+  "run_wall_start_ns": 1792441933060179919,
+  "run_wall_start_ts": 1792441933.06018,
+  "perf_start_ns": 1366413836214258,
+  "environment": {
+    "torch_version": "2.10.0+cpu",
+    "torch_npu_version": "2.10.0.post4",
+    "device": 0,
+    "profile_memory": true
+  },
+  "capture_wall_start_ns": 1792441933063468765,
+  "capture_wall_start_ts": 1792441933.0634687,
+  "capture_perf_start_ns": 1366413839510985,
+  "analysis_included_in_export": true,
+  "analysis_timing": {
+    "status": "included_in_export_and_analysis",
+    "export_and_analysis_ms": 0.051921,
+    "separately_measured": false
+  },
+  "export_budget_exceeded": false,
+  "stop_acknowledged": true,
+  "capture_wall_end_ns": 1792441938209637534,
+  "capture_wall_end_ts": 1792441938.2096376,
+  "capture_perf_end_ns": 1366418985671353,
+  "active_wall_start_ns": 1792441933203572218,
+  "active_wall_end_ns": 1792441933336732014,
+  "active_wall_start_ts": 1792441933.2035723,
+  "active_wall_end_ts": 1792441933.336732,
+  "capture_contains_active": true,
+  "run_wall_end_ns": 1792441938226229488,
+  "run_wall_end_ts": 1792441938.2262294,
+  "perf_end_ns": 1366419002263807
+}

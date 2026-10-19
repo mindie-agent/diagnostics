@@ -1,0 +1,2 @@
+Component,Timestamp(us),Total Allocated(MB),Total Reserved(MB),Total Active(MB),Stream Ptr,Device Type
+APP,1792445431714962.944	,,25389.1640625,,,NPU:0

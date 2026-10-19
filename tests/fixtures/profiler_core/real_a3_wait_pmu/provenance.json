@@ -1,0 +1,32 @@
+{
+  "schema_version": "mindie-profiler-public-csv-slice/1",
+  "source": {
+    "artifact": "online-v7-a3 kernel_details.csv",
+    "sha256": "7380711ab7b67df88d58b40be128ba16d649b74b4c430ddfc70d8e68abb82b62",
+    "size_bytes": 6225233,
+    "data_rows": 18688,
+    "header_sha256": "a30226723e48a30a6e87281bf53ec4be171adc87837dff50d1605bbcdf3923e5"
+  },
+  "selection": {
+    "row_indices": [
+      15767,
+      15768
+    ],
+    "task_ids": [
+      "23606",
+      "23612"
+    ],
+    "row_count": 2,
+    "method": "exact_rows_copied"
+  },
+  "transformation": {
+    "values_modified": false,
+    "description": "Header and two exact data rows copied into a newline-normalized public CSV; no timestamp, wait, PMU, shape, or identity values were edited."
+  },
+  "privacy": {
+    "contains_host": false,
+    "contains_credentials": false,
+    "contains_private_path": false
+  },
+  "known_scope": "Two-row public regression fixture, not full capture acceptance. Source is an actual preserved A3 kernel_details.csv; row 23612 has a high wait and no exact overlapping event, row 23606 ends at its wait start."
+}

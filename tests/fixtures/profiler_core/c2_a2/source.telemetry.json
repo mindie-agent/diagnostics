@@ -1,0 +1,19 @@
+{
+  "coverage_ratio": 1.0,
+  "devices": [
+    0
+  ],
+  "evidence_ref": "private-source/source.raw-window.json",
+  "freq_mhz_min": 1650,
+  "host": "173.125.1.2",
+  "measurement_limitations": [],
+  "power_max_w": 99.4,
+  "resource_interference_detected": false,
+  "run_id": "stage1-034f88c590b746a4b381830336a1e24a-source",
+  "temp_max_c": 44,
+  "throttling_detected": false,
+  "window": {
+    "end_ts": 1792434029.1188078,
+    "start_ts": 1792434027.4364674
+  }
+}

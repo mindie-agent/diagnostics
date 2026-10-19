@@ -1,0 +1,4 @@
+(EngineCore pid=211007) INFO 10-19 21:30:02 [model_runner_v1.py:4484] Loading model weights took 0.0001 GB
+(EngineCore pid=211007) INFO 10-19 21:30:06 [worker.py:650] Available KV cache memory: 12.22 GiB
+(EngineCore pid=211007) INFO 10-19 21:30:06 [kv_cache_utils.py:2395] NPU KV cache size: 102,483,968 tokens, Maximum concurrency for 128 tokens per request: 800656.00x
+(EngineCore pid=211007) INFO 10-19 21:30:13 [worker.py:933] Free memory on device (60.88/61.27 GiB) on startup. Desired GPU memory utilization is (0.2, 12.25 GiB). Actual usage: 0.0 GiB for weights, 0.02 GiB for peak activation, 0.02 GiB for non-torch memory, 0.0 GiB for NPU graph memory. Replace gpu_memory_utilization with `--kv-cache-memory=12960670720` (12.07 GiB) to fit into requested memory, or `--kv-cache-memory=65173402624` (60.7 GiB) to fully utilize NPU free memory. Current KV cache memory: 12.22 GiB. After warmup: torch reserved memory 12.23 GiB, torch allocated memory 12.22 GiB.

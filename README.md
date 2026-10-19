@@ -166,6 +166,37 @@ result = record_failure(
 
 ---
 
+## NPU 性能剖析与跨运行对比（`mindie-profiler`）
+
+`0.5.0` 起，本包同时提供 `mindie-profiler`（等价于 `python3 -m mindie_profiler`）命令行入口，用于原地读取昇腾 Profiler 产物并输出结构化 `mindie-profile-summary/1`（C7 JSON）及跨运行对比回执：
+
+```bash
+# 1. 原地分析 SQLite DB（或 kernel_details.csv），使用显式 step 窗口或无标签时间窗口
+mindie-profiler \
+  --root /path/to/ascend_pytorch_profiler_dir \
+  --step-window 1=100000:250000 \
+  --time-window 260000:400000 \
+  --unit us --source auto \
+  --mode inference --framework vllm-ascend --phase decode --tp 8 \
+  --input-signature "qwen2.5-7b-bs16-in1024-out128" \
+  --output /tmp/baseline-c7.json
+
+# 2. 对比两次导出的 C7 摘要（或直接指定两侧 --{baseline,candidate}-root 与 --*-steps-file）
+#    可比时返回 exit 0，缺少工作负载签名或测量口径不兼容时返回 not_comparable (exit 3)
+mindie-profiler compare \
+  --baseline-summary /tmp/baseline-c7.json \
+  --candidate-summary /tmp/candidate-c7.json \
+  --output /tmp/compare-receipt.json
+```
+
+**能力范围与边界限制：**
+- **SQLite 直读与显式窗口核算**：原地只读解析 `ascend_pytorch_profiler_*.db`（默认优先 `db`，可选 `csv`），受查询超时预算（`--query-timeout-s` 默认 `20s`）保护；必须提供显式 `--step-window`、`--time-window`、`--steps-file` 或 `--full-range`，**绝不从 Kernel 行猜测或隐式推断 Step 边界**；缺失 `wait_ns` 的 Wait-Anchor 或缺失硬件 PMU 计数器均在 `limitations` 中诚实标注。
+- **双路径采集与状态诚实性**：支持在线显式窗口控制（向已注入 Profiler 配置的服务发送单次 `POST /start_profile` 与 `POST /stop_profile`，严格区分 `completed`、`failed` 与不可盲目重试的 `unknown` 状态）与离线 `torch_npu.profiler` / `msprof` 产物解析。
+- **理论容量建模 Provider（`TensorCastAnalyticProvider`）**：通过 `mindie_profiler/tensor_cast_provider.py::TensorCastAnalyticProvider` 调用固定版本的上游 `msmodeling` / `tensor_cast`（`0.2.0` / `1adde03`）`AnalyticPerformanceModel`，将算子显式 `shapes`、`dtypes`、`weights` 与实测 `TASK` 耗时连接核算（同时提供 `roofline-max-v1` 单算子理论下界）。限制边界：`Ascend910B4` 到 `ATLAS_800_A2_280T_32G_PCIE` 的硬件规格映射仍标为 `caller_explicit_unverified`，PMU 仅输出原始硬件计数而不做因果瓶颈推断，`Wait-Anchor` 来源亦未做因果验证。
+- **HBM 显存归因（`P0–P4`）边界**：仅对已观测的有限采样峰值（`finite sampled peak`）做分层归因；其中 `P2` 运行时日志值为近似舍入值，设备侧与分配器侧读数非原子同步，**不声称捕获连续绝对显存峰值**。
+
+---
+
 ## 环境变量与配置路径
 
 | 环境变量 | 默认值 | 作用说明 |

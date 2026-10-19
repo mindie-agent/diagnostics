@@ -1,0 +1,34 @@
+{
+  "schema_version": "mindie-real-memory-slice/1",
+  "source_db": {
+    "path": "private-source/ascend_pytorch_profiler.db",
+    "sha256": "adb931778fd1759dd2bf39e9b0ec725602536402363ce274da7d1fb3ede6ef22",
+    "size_bytes": 3772416
+  },
+  "source_result": {
+    "path": "private-source/result.json",
+    "sha256": "9aea7fe76b5458baf70cf38a096681f314eebe30e8e8965931fa41394eba634a",
+    "size_bytes": 39808
+  },
+  "slice": {
+    "db_path": "tests/fixtures/profiler_core/memory_real_capture/npu_module_mem_slice.db",
+    "db_sha256": "722744310cbdb96392c7d0e861913c1a7c0c8f2ebc12c6dd82d7b620a37ad3ed",
+    "db_size_bytes": 28672,
+    "inputs_path": "tests/fixtures/profiler_core/memory_real_capture/actual_memory_inputs.json",
+    "inputs_sha256": "d0f5c65ca8550ebd47f32662a420c2deb8d9f5eeab4c984eb30f3a339a8ef1d7",
+    "inputs_size_bytes": 5675
+  },
+  "selection": {
+    "enum_module_rows": 65,
+    "npu_module_mem_rows": 847,
+    "components_nonzero": [
+      "APP",
+      "RUNTIME"
+    ],
+    "timestamps_ns": [
+      1792441933207981905,
+      1792441933395243115
+    ],
+    "note": "Read-only copy of ENUM_MODULE and NPU_MODULE_MEM only; raw capture was not modified."
+  }
+}

@@ -69,3 +69,38 @@ def test_legacy_choice_does_not_authorize_new_reporting(tmp_path):
                                    "reporting": "disabled"}))
     assert configure_reporting(True, config=config, consent_config=consent)["category"] == "contribution_not_enabled"
     assert policy.current_consent(config) is None
+
+
+def test_first_worker_includes_authorized_failures_during_runtime_preparation(tmp_path, monkeypatch):
+    import sys
+    import time
+    from datetime import datetime
+    from mindie_diagnostics import reporting_commands as commands, reporting_runtime, service
+
+    consent, config, root = tmp_path / "consent.json", tmp_path / "diagnostics.json", tmp_path / "logs"
+    authority(consent)
+    configure_reporting(True, config=config, consent_config=consent, roots=[str(root)])
+    monkeypatch.setenv("MINDIE_DIAGNOSTICS_CONFIG", str(config))
+    monkeypatch.setattr(commands.shutil, "which", lambda _: sys.executable)
+    source = "b" * 64
+    monkeypatch.setattr(commands, "_worker_view", lambda _: {"healthy": True, "runtime_source": source})
+    monkeypatch.setattr(service, "service_status", lambda **_: {"status": "active"})
+    monkeypatch.setattr(service, "remove_service", lambda **_: {"status": "absent"})
+
+    def prepare(*args, **kwargs):
+        assert record_failure("remote-dev", "prepare.fixture", stage="prepare",
+                              category="internal_exception", root=root)["recorded"]
+        return {"python": sys.executable, "source_hash": source}
+
+    observed = []
+
+    def install(roots, state, repository, **options):
+        since = options.get("since")
+        cutoff = datetime.fromisoformat(since.replace("Z", "+00:00")).timestamp() if since else time.time()
+        observed.append(ingest(root, Outbox(state / "reporter.sqlite3"), config=config, since=cutoff))
+        return {"status": "installed"}
+
+    monkeypatch.setattr(reporting_runtime, "_prepare_locked", prepare)
+    monkeypatch.setattr(service, "ensure_reporter_service", install)
+    assert commands.ensure(config)["status"] == "running"
+    assert observed[0]["enqueued"] == 1 and observed[0]["before_start"] == 0

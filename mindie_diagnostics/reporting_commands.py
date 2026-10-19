@@ -151,7 +151,8 @@ def ensure(config=None, *, unit_dir=None):
                 migration = remove_service(expected_reporting_config=config, runner=runner)
             native = ensure_reporter_service(policy['roots'], state, policy['repository'],
                 python=runtime['python'], gh=gh, reporting_config=str(f.policy_path(config)), unit_dir=unit_dir,
-                expected_consent_revision=consent_revision, runner=runner)
+                expected_consent_revision=consent_revision, runner=runner,
+                since="1970-01-01T00:00:00Z")
             readback_deadline = min(deadline - 5, time.monotonic() + 8)
             worker = _worker_view(config)
             while time.monotonic() < readback_deadline and not (worker.get('healthy') and worker.get('runtime_source') == runtime['source_hash']):

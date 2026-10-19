@@ -26,7 +26,7 @@ from mindie_profiler.collect import (
 
 
 class _Handler(BaseHTTPRequestHandler):
-    def do_POST(self) -> None:  # noqa: N802 - http.server API
+    def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length) if length else b""
         self.server.requests.append({
@@ -196,26 +196,28 @@ def test_http_rejection_is_failed_and_never_opens_window(control_server):
     assert len(control_server.requests) == 1
 
 
-def test_connection_refused_is_failed_before_send():
-    probe = socket.socket()
-    probe.bind(("127.0.0.1", 0))
-    port = probe.getsockname()[1]
-    probe.close()
-    injection = ProfileWindowInjection(
-        enabled=True,
-        framework="vllm",
-        profiler="torch",
-        profile_dir="./vllm_profile",
-        endpoint=f"http://127.0.0.1:{port}",
-        execution_id="exec-refused",
-        source="serve_args",
-    )
-    controller = ProfileController(injection, timeout=0.5)
-    result = controller.start()
+def test_unavailable_endpoint_is_failed_before_send():
+    # Reserve the port without listening so another process cannot take it.
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        injection = ProfileWindowInjection(
+            enabled=True,
+            framework="vllm",
+            profiler="torch",
+            profile_dir="./vllm_profile",
+            endpoint=f"http://127.0.0.1:{port}",
+            execution_id="exec-refused",
+            source="serve_args",
+        )
+        controller = ProfileController(injection, timeout=0.5)
+        result = controller.start()
     assert result["status"] == "failed"
     assert result["sent"] is False
     assert result["external_effect"] == "none"
-    assert result["error"]["code"] == "connect_failed"
+    # Winsock may exhaust the connect budget before returning refusal. Both
+    # outcomes prove that no profiling request reached an external service.
+    assert result["error"]["code"] in {"connect_failed", "connect_timeout"}
 
 
 def test_missing_framework_injection_never_contacts_endpoint(control_server):

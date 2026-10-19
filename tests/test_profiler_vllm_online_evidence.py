@@ -8,6 +8,7 @@ classification, and process-tree cleanup semantics.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -61,16 +62,16 @@ def test_tiny_llama_config_rejects_inconsistent_heads():
 
 
 def test_budget_must_cover_all_stages_and_cleanup():
-    kwargs = dict(
-        readiness_timeout=300.0,
-        control_timeout=180.0,
-        request_timeout=60.0,
-        profile_requests=2,
-        db_export_timeout=300.0,
-        cleanup_grace=10.0,
-        cleanup_kill_timeout=5.0,
-        overhead=30.0,
-    )
+    kwargs = {
+        "readiness_timeout": 300.0,
+        "control_timeout": 180.0,
+        "request_timeout": 60.0,
+        "profile_requests": 2,
+        "db_export_timeout": 300.0,
+        "cleanup_grace": 10.0,
+        "cleanup_kill_timeout": 5.0,
+        "overhead": 30.0,
+    }
     with pytest.raises(OnlineEvidenceError) as caught:
         validate_budget(total_timeout=100.0, **kwargs)
     assert caught.value.code == "budget_too_small"
@@ -311,7 +312,7 @@ def test_clean_source_pair_requires_ascend_symbol_and_native_hashes(tmp_path: Pa
     assert pair["source_commits_equal_verified_pin"] is True
     assert pair["vllm_ascend"]["required_symbol_present"] is True
     assert pair["vllm_ascend"]["native_libraries"][0]["sha256"] == native_sha
-    assert pair["env"]["PYTHONPATH"].split(":") == [str(vllm), str(ascend)]
+    assert pair["env"]["PYTHONPATH"].split(os.pathsep) == [str(vllm), str(ascend)]
 
     (ascend / "vllm_ascend" / "ops" / "layernorm.py").write_text("pass\n", encoding="utf-8")
     with pytest.raises(OnlineEvidenceError) as caught:
@@ -334,12 +335,18 @@ def test_harness_refuses_to_start_server_when_budget_is_too_small(tmp_path: Path
     assert not (output / "server.stderr.log").exists()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="NPU server cleanup uses POSIX process groups")
 def test_terminate_process_group_owns_only_its_child():
     process = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(30)"],
         start_new_session=True,
     )
-    cleanup = terminate_process_group(process, grace_s=0.2, kill_timeout_s=0.5)
-    assert cleanup["term_sent"] is True
-    assert cleanup["exit_code"] is not None
-    assert cleanup["cleanup_error"] is None
+    try:
+        cleanup = terminate_process_group(process, grace_s=0.2, kill_timeout_s=0.5)
+        assert cleanup["term_sent"] is True
+        assert cleanup["exit_code"] is not None
+        assert cleanup["cleanup_error"] is None
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=2)

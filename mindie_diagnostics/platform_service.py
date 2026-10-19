@@ -472,13 +472,18 @@ def start_service(*, unit_dir=None, runner=None):
         return {"status": "start_requested", "unit": str(unit), "since": config["since"]}
 
 
-def remove_service(*, unit_dir=None, runner=None):
+def remove_service(*, unit_dir=None, runner=None, expected_reporting_config=None):
     runner = runner or subprocess.run
     manifest, label, unit = _paths(unit_dir)
     with _locked(manifest):
         config = _read(manifest)
         if config is None:
             return {"status": "absent", "unit": str(unit)}
+        if expected_reporting_config is not None:
+            from .service_config import worker_options
+            binding = worker_options(config["argv"], config["environment_file"])
+            if binding["reporting_config"] != str(common._absolute(expected_reporting_config)):
+                return {"status": "different_profile", "unit": str(unit)}
         _verify_unit(unit, config)
         if sys.platform == "win32":
             loaded = _task(runner, label)

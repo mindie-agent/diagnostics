@@ -153,7 +153,7 @@ def test_post_phase_stays_uncertain_and_never_reposts(tmp_path, mode):
         publish_one(queue, publisher)
     row = queue.rows()[0]
     assert publisher.calls.count('post') == 1
-    assert row['state'] == 'exhausted' and row['attempts'] == 3
+    assert row['state'] == 'uncertain' and row['attempts'] == 4
     assert 'uncertain' in row['last_error']
 
 

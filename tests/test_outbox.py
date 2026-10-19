@@ -45,45 +45,33 @@ def test_rate_limit_and_unwritable_database(tmp_path):
         Outbox(file / 'queue.db')
 
 
-def test_three_crashed_leases_exhaust_and_new_occurrence_does_not_reset(tmp_path):
-    now = [1000.0]
-    queue = Outbox(tmp_path / 'queue.db', clock=lambda: now[0])
-    queue.enqueue('a', 'a' * 32, {})
-    for expected in (1, 2, 3):
-        assert queue.claim(lease_seconds=1)['attempts'] == expected
-        now[0] += 2
-    assert queue.claim() is None
-    queue.enqueue('a', 'b' * 32, {})
-    assert queue.claim() is None
-    row = queue.rows()[0]
-    assert row['state'] == 'exhausted' and row['attempts'] == 3
-    assert row['incident_ids'] == ['a' * 32, 'b' * 32]
-
-
-def test_expired_uncertain_receipt_does_not_occupy_active_capacity(tmp_path):
-    from mindie_diagnostics.outbox import UNSENT_TTL_SECONDS
+def test_repeated_crashes_and_old_unsent_work_retain_payload(tmp_path):
     now = [1000.0]
     queue = Outbox(tmp_path / 'queue.db', capacity=1, clock=lambda: now[0])
-    queue.enqueue('a', 'a' * 32, {'events': []})
-    item = queue.claim(lease_seconds=1)
+    queue.enqueue('a', 'a' * 32, {'evidence': 'retained'})
+    for expected in range(1, 6):
+        item = queue.claim(lease_seconds=1)
+        assert item['attempts'] == expected
+        assert item['payload']['evidence'] == 'retained'
+        now[0] += 2
+    item = queue.claim()
     queue.begin_post(item)
-    now[0] += UNSENT_TTL_SECONDS + 1
+    now[0] += 31 * 86400
     queue.maintain()
-    assert queue.rows()[0]['state'] == 'expired'
-    assert 'uncertain' in queue.rows()[0]['last_error']
-    queue.enqueue('b', 'b' * 32, {})
-    assert queue.claim()['fingerprint'] == 'b'
+    retained = queue.claim()
+    assert retained['state'] == 'uncertain'
+    assert retained['payload']['evidence'] == 'retained'
+    with pytest.raises(QueueFull):
+        queue.enqueue('b', 'b' * 32, {})
 
 
-def test_valid_lease_protects_evidence_from_expiry(tmp_path):
-    from mindie_diagnostics.outbox import UNSENT_TTL_SECONDS
-    now = [1000.0]
-    queue = Outbox(tmp_path / 'queue.db', clock=lambda: now[0])
-    queue.enqueue('a', 'a' * 32, {'evidence': True})
-    queue.claim(lease_seconds=2 * UNSENT_TTL_SECONDS)
-    now[0] += UNSENT_TTL_SECONDS + 1
-    queue.maintain()
-    assert queue.rows()[0]['state'] == 'pending'
+def test_new_occurrence_restores_legacy_known_unsent_failure(tmp_path):
+    queue = Outbox(tmp_path / "queue.db")
+    queue.enqueue("fault", "a" * 32, {"evidence": "old"})
+    queue.update(queue.claim(), state="exhausted", last_error="github_timeout")
+    queue.enqueue("fault", "b" * 32, {"evidence": "new"})
+    item = queue.claim()
+    assert item["state"] == "pending" and item["payload"]["evidence"] == "new"
 
 
 def test_withdrawal_preserves_unknown_submission_fact(tmp_path):

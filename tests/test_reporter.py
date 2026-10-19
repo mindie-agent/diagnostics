@@ -48,10 +48,10 @@ def queue_at(tmp_path, consent):
 
 @pytest.mark.parametrize('mode,final,reads,writes', [
     ('success', 'published', 1, 1), ('lost_found', 'published', 2, 1),
-    ('lost_missing', 'exhausted', 3, 1), ('read_error', 'exhausted', 3, 0),
-    ('auth', 'permanent-failed', 1, 0),
+    ('lost_missing', 'uncertain', 4, 1), ('read_error', 'retry', 4, 0),
+    ('auth', 'retry', 4, 0),
 ])
-def test_publication_budget_and_unknown_post(tmp_path, reporting_consent, mode, final, reads, writes):
+def test_recoverable_reads_retain_work_and_unknown_post_never_replays(tmp_path, reporting_consent, mode, final, reads, writes):
     queue, now = queue_at(tmp_path, reporting_consent)
     github = FakeGitHub(reporting_consent['repository'], mode=mode)
     for _ in range(4):
@@ -69,6 +69,84 @@ def test_repository_mismatch_stops_before_remote_action(tmp_path, reporting_cons
     github = FakeGitHub('other/repository')
     assert publish_one(queue, github)['status'] == 'permanent-failed'
     assert github.reads == github.writes == 0
+
+
+@pytest.mark.parametrize("mode", ["not_started", "http_rejection", "read_error"])
+def test_proven_not_sent_failure_recovers_to_one_publication(tmp_path, reporting_consent, monkeypatch, mode):
+    from mindie_diagnostics import reporter
+
+    queue, now = queue_at(tmp_path, reporting_consent)
+    github = GitHub(reporting_consent["repository"])
+    monkeypatch.setattr(GitHub, "request", reporter_request)
+    posts = []
+    broken = [True]
+
+    def transport(command, data, **kwargs):
+        method = command[command.index("--method") + 1]
+        if method == "GET":
+            if broken[0] and mode == "read_error":
+                raise TransportError("github_timeout")
+            return 0, b"HTTP/2 200 OK\r\n\r\n[]", 22
+        if broken[0]:
+            if mode == "not_started":
+                raise TransportError("github_client_missing", permanent=True)
+            return 1, b'HTTP/2 403 Forbidden\r\n\r\n{"message":"Forbidden"}', 48
+        posts.append(json.loads(data))
+        body = json.dumps({"number": 5, "html_url": f"https://github.com/{github.repository}/issues/5"}).encode()
+        return 0, b"HTTP/2 201 Created\r\n\r\n" + body, len(body) + 24
+
+    monkeypatch.setattr(reporter, "_run_gh", transport)
+    for _ in range(5):
+        assert publish_one(queue, github)["status"] == "retry"
+        now[0] += 4000
+    broken[0] = False
+    assert publish_one(queue, github)["status"] == "published"
+    assert len(posts) == 1
+
+
+# The autouse fixture disables network by replacing this method for every test.
+reporter_request = GitHub.request
+
+
+def test_search_and_post_share_the_original_cycle_deadline(monkeypatch):
+    from mindie_diagnostics import reporter
+
+    clock = [100.0]
+    monkeypatch.setattr(reporter.time, "monotonic", lambda: clock[0])
+    github = GitHub("example/project", timeout=30)
+    deadlines = []
+
+    def transport(command, data, **options):
+        deadlines.append(options["deadline"])
+        clock[0] += 10
+        return 0, b"HTTP/2 200 OK\n\n[]", 18
+
+    monkeypatch.setattr(reporter, "_run_gh", transport)
+    monkeypatch.setattr(GitHub, "request", reporter_request)
+    github.begin_cycle()
+    assert github.find_issue({"payload": payload()}) is None
+    github.create_issue("synthetic", "synthetic")
+    assert deadlines == [115.0, 130.0]
+    assert github._deadline == 130.0
+    github.end_cycle()
+
+
+def test_legacy_unknown_receipt_resumes_reconciliation_without_post(tmp_path, reporting_consent, monkeypatch):
+    queue, _ = queue_at(tmp_path, reporting_consent)
+    item = queue.claim()
+    queue.update(item, state="exhausted", last_error="submission_uncertain_budget_exhausted")
+    reopened = Outbox(queue.path)
+    marker = f"<!-- mindie-incident:{fingerprint(payload())} -->"
+    calls = []
+
+    def existing(self, method, path, data=None):
+        calls.append(method)
+        return [{"number": 4, "html_url": f"https://github.com/{self.repository}/issues/4",
+                 "body": marker}]
+
+    monkeypatch.setattr(GitHub, "request", existing)
+    assert publish_one(reopened, GitHub(reporting_consent["repository"]))["status"] == "reconciled"
+    assert calls == ["GET"]
 
 
 def test_missing_policy_after_read_blocks_post_without_claiming_revocation(tmp_path, reporting_consent):

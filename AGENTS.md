@@ -31,17 +31,18 @@ This repository implements the shared local failure recorder, privacy redaction 
    - `publish_one` always queries existing repository issues (`find_issue`) for `<!-- mindie-incident:<sha256> -->` before creating an issue.
    - `Outbox.begin_post` transitions leased items to `state='uncertain'` **before** spawning a mutating `POST repos/<repo>/issues` request.
    - If a `POST` fails after process start or times out, the item remains `uncertain` and will reconcile against GitHub markers on the next cycle before ever attempting another `POST`.
-   - `MAX_AUTOMATIC_CYCLES = 3` strictly bounds total automatic attempts per fingerprint.
+   - Transient network, authentication, and authority-read failures retain pending evidence with capped backoff; read attempts never permanently exhaust an incident. Unknown POSTs only reconcile and never replay.
    - `_record_publication_outcome` never turns an acknowledged external GitHub publication (`published` / `reconciled`) into a remote failure if the local SQLite receipt update fails (`status="recording_failed"`, `publication_status="published"`).
 2. **Consent Gate & Non-Backfill Guarantee**:
    - Local fault logging (`record_failure`, `Recorder`) works without network or reporting consent.
    - Events recorded while reporting is disabled carry `reporting=None` and are never backfilled if reporting is enabled later.
-   - `ConsentUnavailable` (missing or corrupt `reporting.json`) pauses ingestion/publication without advancing byte cursors or discarding queued evidence; `ConsentWithdrawn` (disabled policy or revision mismatch) immediately transitions queued items to `withdrawn` and compacts their payloads into minimal receipts.
+   - `ConsentUnavailable` (missing or corrupt policy/linked contribution authority) pauses ingestion/publication without advancing byte cursors or discarding queued evidence; `ConsentWithdrawn` (disabled choice or revision mismatch) immediately transitions queued items to `withdrawn` and compacts their payloads into minimal receipts.
+   - A plugin policy links its profile's `mindie-consent/1` authority. Only an explicit `contribute` choice carrying `choice_revision` authorizes reporting. Events, ingestion and every remote action recheck this same authority. Each profile owns its service, queue and policy; shared log roots are filtered by policy path.
 3. **Timeout & Lock Budgets**:
    - **Hot Path (`record_failure` / `Recorder._emit`)**: Non-blocking locks (`blocking=False`); segment rotation uses a `100ms` deadline (`50ms` `reader_guard`).
    - **Read-Only Status (`reporting_status` / `local_snapshot`)**: `150ms` SQLite read-only progress-handler deadline (`busy_timeout=100`) and `150ms` local log tail scan deadline (`<= 256` entries, `<= 8` 16KiB tails).
    - **Outbox SQLite (`Outbox.connect`)**: `timeout=3.0s`, `PRAGMA busy_timeout=3000`, `BEGIN IMMEDIATE` write transactions.
-   - **GitHub Transport (`GitHub` / `_run_gh`)**: `30s` default cycle timeout (`lease_seconds = timeout + 5`), reserving up to `15s` for `POST` after search pagination; process-group reaping uses `SIGTERM` -> `2.0s` grace -> `SIGKILL`.
+   - **GitHub Transport (`GitHub` / `_run_gh`)**: `30s` default cycle timeout (`lease_seconds = timeout + 20`), reserving up to `15s` inside that same deadline for `POST`; process-group reaping uses `SIGTERM` -> `2.0s` grace -> `SIGKILL`. Explicit worker ensure shares one `75s` deadline across preparation and native service commands.
    - **Runtime Handoff (`maintain` / `upgrade_running`)**: Shared monotonic budget capped at `75s` in `maintain` (requires `>= 61s` remaining to enter `upgrade_running`), with `_LOCK_WAIT_S = 12.0s`, `_READBACK_S = 8.0s`, and `_ROLLBACK_RESERVE_S = 20.0s` reserved for rollback to the previous generation on failed readback.
 
 ## 3. Verification Commands

@@ -90,7 +90,8 @@ def maintain(config=None, *, update_running=False, unit_dir=None, budget_seconds
             break
         try:
             if queue is not None:
-                result['ingestion'].append(ingest(root, queue, max_files=32, max_bytes=1024*1024))
+                result['ingestion'].append(ingest(root, queue, max_files=32, max_bytes=1024*1024,
+                                                 config=config))
             result['retention'].append(prune(root, queue=queue))
         except (OSError, ValueError, RuntimeError) as exc:
             result['status'] = 'degraded'
@@ -110,6 +111,8 @@ def maintain(config=None, *, update_running=False, unit_dir=None, budget_seconds
 
 def ensure(config=None, *, unit_dir=None):
     """Explicitly choose installed source and start the one owned pure reporter."""
+    deadline = time.monotonic() + 75
+    runner = _bounded_runner(deadline - 5)
     try:
         policy = f.read_policy(config)
     except f.PolicyUnavailable:
@@ -118,6 +121,8 @@ def ensure(config=None, *, unit_dir=None):
         return {'status': 'configuration_unavailable', 'category': 'reporting_not_configured'}
     if policy['decision'] != 'enabled':
         return {'status': 'disabled', 'worker': _worker_view(config)}
+    if unit_dir is None:
+        unit_dir = f.service_directory(config)
     consent_revision = policy.get('revision')
     gh = shutil.which('gh')
     if not gh:
@@ -125,13 +130,13 @@ def ensure(config=None, *, unit_dir=None):
     from .reporting_runtime import _prepare_locked, runtime_transaction
     from .outbox import Outbox
     from .reader_registry import register_reader
-    from .service import ensure_reporter_service, service_status, ServiceError
+    from .service import ensure_reporter_service, service_status, remove_service, ServiceError
     try:
         # The explicit path cooperates with the same runtime transaction lock
         # as an automatic handoff: preparation, replacement and readback are
         # never interleaved with another runtime transaction.
-        with runtime_transaction(config) as root:
-            runtime = _prepare_locked(config)
+        with runtime_transaction(config, timeout=min(12, max(0, deadline - time.monotonic()))) as root:
+            runtime = _prepare_locked(config, deadline=deadline - 13)
             if _enabled_policy(config, consent_revision) is None:
                 # Withdrawn or regranted during preparation: never start up.
                 return {'status': 'degraded', 'category': 'reporting_authorization_changed'}
@@ -139,18 +144,25 @@ def ensure(config=None, *, unit_dir=None):
             queue = Outbox(state / 'reporter.sqlite3')
             for root_dir in policy['roots']:
                 register_reader(root_dir, queue.path)
+            migration = None
+            if policy.get("consent_config"):
+                # Only the legacy owned instance bound to this exact policy
+                # may retire. Another profile's service remains untouched.
+                migration = remove_service(expected_reporting_config=config, runner=runner)
             native = ensure_reporter_service(policy['roots'], state, policy['repository'],
                 python=runtime['python'], gh=gh, reporting_config=str(f.policy_path(config)), unit_dir=unit_dir,
-                expected_consent_revision=consent_revision)
-            deadline = time.monotonic() + 8
+                expected_consent_revision=consent_revision, runner=runner,
+                since="1970-01-01T00:00:00Z")
+            readback_deadline = min(deadline - 5, time.monotonic() + 8)
             worker = _worker_view(config)
-            while time.monotonic() < deadline and not (worker.get('healthy') and worker.get('runtime_source') == runtime['source_hash']):
+            while time.monotonic() < readback_deadline and not (worker.get('healthy') and worker.get('runtime_source') == runtime['source_hash']):
                 time.sleep(.1)
                 worker = _worker_view(config)
-            native_status = service_status(unit_dir=unit_dir)
+            native_status = service_status(unit_dir=unit_dir, runner=runner)
             ready = worker.get('healthy') and worker.get('runtime_source') == runtime['source_hash'] and native_status.get('status') == 'active'
             return {'status': 'running' if ready else 'degraded',
                     'runtime': runtime, 'service': native, 'service_status': native_status, 'worker': worker,
+                    'legacy_service': migration,
                     'recovery_hint': 'Inspect reporting status; an explicit reporting ensure may restart a stopped worker.'}
     except ServiceError as exc:
         return {'status': 'degraded', 'category': exc.category}
@@ -230,6 +242,8 @@ def upgrade_running(config=None, *, unit_dir=None, deadline=None):
             return {'status': 'skipped', 'reason': 'reporting_not_configured'}
         if policy['decision'] != 'enabled':
             return {'status': 'skipped', 'reason': 'reporting_off'}
+        if unit_dir is None:
+            unit_dir = f.service_directory(config)
         consent_revision = policy['revision']
         gh = shutil.which('gh')
         if not gh:

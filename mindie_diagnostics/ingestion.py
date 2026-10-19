@@ -68,7 +68,8 @@ def _candidates(root, counts):
     return files
 
 
-def ingest(root, queue: Outbox, *, max_files=256, max_bytes=8 * 1024 * 1024, since=None):
+def ingest(root, queue: Outbox, *, max_files=256, max_bytes=8 * 1024 * 1024, since=None,
+           config=None):
     from .reporter import fingerprint, issue_payload
     root = Path(root).absolute()
     if root.is_symlink():
@@ -133,6 +134,12 @@ def ingest(root, queue: Outbox, *, max_files=256, max_bytes=8 * 1024 * 1024, sin
                         counts['before_start'] += 1
                         continue
                     consent = raw.get('reporting')
+                    if config is not None and (
+                        not isinstance(consent, dict)
+                        or consent.get("config_file") != str(Path(config).absolute())
+                    ):
+                        counts['consent_skipped'] += 1
+                        continue
                     # Older unscoped logs stay local. Enabling a workspace later
                     # must never backfill logs produced without that consent.
                     recent.append((event, consent))

@@ -1,4 +1,22 @@
-"""Fresh consent gate for the diagnostics reporting policy. Stdlib only."""
+"""Fresh consent gate for outbound diagnostics reporting actions.
+
+[Role]
+Re-validates a saved consent reference against the live `reporting.json` policy
+file before and during outbound GitHub operations (`require_consent`,
+`guard_consent`, `check_remote_action`).
+
+[Invariants]
+- Distinguishes `ConsentUnavailable` (missing/corrupt policy file; preserve
+  evidence and retry later) from `ConsentWithdrawn` (explicit user disable or
+  revision/repository mismatch; withdraw immediately).
+
+[Timeouts & Locks]
+- Synchronous bounded file read (`<= 16 KiB`) via `fallback.read_policy` with no
+  locks.
+
+[Side-Effect Policy]
+- Strictly read-only policy verification + `ContextVar` guard binding.
+"""
 
 from __future__ import annotations
 

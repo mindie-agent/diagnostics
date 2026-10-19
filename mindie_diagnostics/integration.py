@@ -1,6 +1,24 @@
-"""Installed-metadata enrichment for the local failure recorder.
+"""Installed-metadata enrichment and status reader for the local failure recorder.
 
-Stdlib only. Import does no file I/O. Never raises and never starts a service.
+[Role]
+Enriches local failure events with installed package version/revision and stack
+frames, configures `reporting.json` consent policy, and provides a read-only
+status view (`reporting_status`) over local events, worker health, and outbox.
+
+[Invariants]
+- Stdlib only; module import performs zero file I/O.
+- `record_failure` and `reporting_status` never raise and never start a worker
+  or retry publication.
+- Existing `incident_id` values are passed through without duplicate writes.
+
+[Timeouts & Locks]
+- `_meta_lock` is acquired non-blocking (`blocking=False`) to avoid lock queues.
+- `_read_outbox` opens SQLite in read-only URI mode (`?mode=ro`) with a 150ms
+  progress-handler deadline and `busy_timeout=100`.
+
+[Side-Effect Policy]
+- `configure_reporting` atomically writes `reporting.json` via temp file + `os.replace`.
+- `reporting_status` is strictly read-only and creates no directories or files.
 """
 
 from __future__ import annotations
@@ -281,12 +299,12 @@ def _merge_roots(existing, supplied):
 
 
 def _write_policy(path, payload):
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        return False
     try:
-        old = os.lstat(path)
-        if not stat.S_ISREG(old.st_mode) or old.st_nlink != 1 or not f._owned(old):
-            return False
-    except FileNotFoundError:
-        pass
+        f._private_mkdir(path.parent, parents=True, exist_ok=True)
+    except OSError:
+        return False
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     tmp = path.parent / (".%s.%s.tmp" % (path.name, uuid.uuid4().hex))
     try:
@@ -314,7 +332,7 @@ def configure_reporting(enabled, *, repository="mindie-agent/mindie-agent", conf
         if type(enabled) is not bool or not f._valid_repo(repository):
             return _error("invalid_arguments")
         path = f._as_local_absolute(f.policy_path(config))
-        if path is None or not f._ancestors_are_real_dirs(path, create=True):
+        if path is None:
             return _error("invalid_configuration")
         existing = f.read_policy(config)
         chosen = _merge_roots(None if existing is None else existing.get("roots"), roots)
@@ -525,10 +543,7 @@ def _read_outbox(config, repository):
             return _queue_absent()
     except OSError:
         return _queue_unavailable()
-    if os.path.islink(path) or not f._ancestors_are_real_dirs(path):
-        return _queue_unavailable()
-    import stat as statmod
-    if not statmod.S_ISREG(info.st_mode) or not f._owned(info) or info.st_nlink != 1 or info.st_size <= 0:
+    if os.path.islink(path) or not stat.S_ISREG(info.st_mode) or info.st_size <= 0:
         return _queue_unavailable()
     deadline = time.monotonic() + _QUERY_DEADLINE
     try:
@@ -546,15 +561,14 @@ def _read_outbox(config, repository):
         columns = {row[1] for row in conn.execute("PRAGMA table_info(incidents)")}
         if not set(_OUTBOX_COLUMNS) <= columns:
             return _queue_unavailable()
-        table = "incidents"
         counts = {}
-        for state, count in conn.execute("SELECT state, COUNT(*) FROM %s GROUP BY state" % table):
+        for state, count in conn.execute("SELECT state, COUNT(*) FROM incidents GROUP BY state"):
             label = _safe_label(state)
             if label is None or type(count) is not int or count < 0:
                 continue
             counts[label] = count
         selected = ", ".join(_OUTBOX_COLUMNS[:-1]) + ", CASE WHEN length(CAST(payload AS BLOB))<=48000 THEN payload ELSE NULL END"
-        query = "SELECT %s FROM %s ORDER BY last_seen DESC LIMIT 5" % (selected, table)
+        query = "SELECT %s FROM incidents ORDER BY last_seen DESC LIMIT 5" % selected
         recent = [_recent_row(row, repository) for row in conn.execute(query)]
         return {"counts": counts, "recent": recent}
     except Exception:

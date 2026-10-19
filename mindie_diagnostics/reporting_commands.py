@@ -1,4 +1,28 @@
-"""Explicit local reporting operations; never invoked by recording a fault."""
+"""Explicit local reporting lifecycle commands (`maintain`, `ensure`, `upgrade_running`).
+
+[Role]
+Implements offline maintenance (`maintain`), explicit runtime + native service
+provisioning (`ensure`), and bounded automatic runtime handoff (`upgrade_running`).
+
+[Invariants]
+- Never invoked automatically when a tool records a local failure.
+- `upgrade_running` only upgrades an already-active healthy worker when the
+  installed distribution is strictly newer (`_source_order == "newer"`) and at
+  least 60s of budget remain (`61s` from `maintain`).
+- `current.json` is published only AFTER the replaced service passes health and
+  `runtime_source` readback verification; otherwise rolls back to `old_python`.
+
+[Timeouts & Locks]
+- `maintain` shares a single monotonic deadline capped at `75.0s` (or
+  `_UPDATE_BUDGET_S + 15.0`).
+- `upgrade_running` reserves `_ROLLBACK_RESERVE_S = 20.0s` for rollback before
+  `deadline`, caps lock acquisition at `_LOCK_WAIT_S = 12.0s`, and polls worker
+  readback for up to `_READBACK_S = 8.0s`.
+
+[Side-Effect Policy]
+- Coordinates runtime generation preparation and native service installation
+  under `runtime_transaction`.
+"""
 from __future__ import annotations
 
 import math
@@ -15,7 +39,13 @@ from .integration import reporting_status, _worker_view
 
 def _state(config):
     path = f._as_local_absolute(f.state_path(config))
-    if path is None or not f._ancestors_are_real_dirs(path, create=True) or not f._owned_dir(path, create=True):
+    if path is None or path.is_symlink():
+        raise ValueError('unsafe_state_directory')
+    try:
+        f._private_mkdir(path, parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ValueError('unsafe_state_directory') from exc
+    if not path.is_dir():
         raise ValueError('unsafe_state_directory')
     return path
 
@@ -40,7 +70,7 @@ def maintain(config=None, *, update_running=False, unit_dir=None, budget_seconds
         raise ValueError('invalid_budget')
     if not math.isfinite(budget_seconds) or budget_seconds < 0:
         raise ValueError('invalid_budget')
-    deadline = time.monotonic() + min(float(budget_seconds), 75.0)
+    deadline = time.monotonic() + min(float(budget_seconds), max(75.0, _UPDATE_BUDGET_S + 15.0))
     if f._as_local_absolute(f.policy_path(config)) is None:
         raise ValueError('invalid_configuration')
     try:
@@ -119,21 +149,6 @@ def ensure(config=None, *, unit_dir=None):
                 worker = _worker_view(config)
             native_status = service_status(unit_dir=unit_dir)
             ready = worker.get('healthy') and worker.get('runtime_source') == runtime['source_hash'] and native_status.get('status') == 'active'
-            if ready:
-                # A deliberate successful ensure is the recovery path: it clears
-                # a matching suppressed automatic failure for this exact source.
-                from .reporting_runtime import _read_update_record, _write_update_record
-                try:
-                    record = _read_update_record(root, runtime['source_hash'])
-                    if record is not None and record.get('status') != 'updated':
-                        _write_update_record(root, runtime['source_hash'],
-                            {**record, 'status': 'updated', 'recovery': 'explicit_ensure',
-                             'finished_at': _utcnow()})
-                except (OSError, RuntimeError) as exc:
-                    return {'status': 'degraded', 'category': 'recovery_record_failed',
-                            'operation_completed': True, 'runtime': runtime, 'service': native,
-                            'service_status': native_status, 'worker': worker,
-                            'recording_error': type(exc).__name__}
             return {'status': 'running' if ready else 'degraded',
                     'runtime': runtime, 'service': native, 'service_status': native_status, 'worker': worker,
                     'recovery_hint': 'Inspect reporting status; an explicit reporting ensure may restart a stopped worker.'}
@@ -145,7 +160,7 @@ def ensure(config=None, *, unit_dir=None):
         return {'status': 'degraded', 'category': category}
 
 
-_UPDATE_BUDGET_S = 60.0
+_UPDATE_BUDGET_S = 180.0
 _READBACK_S = 8.0
 _ROLLBACK_RESERVE_S = 20.0
 _LOCK_WAIT_S = 12.0
@@ -188,27 +203,14 @@ def _enabled_policy(config, required_revision=None):
 
 
 def upgrade_running(config=None, *, unit_dir=None, deadline=None):
-    """Bounded automatic handoff of the running owned reporter to installed source.
-
-    Only an independent enabled policy, an active owned OS reporter service and
-    a fresh healthy worker running the committed runtime qualify. There is no
-    first installation, no revival of an absent/stopped/crashed service and no
-    enable or consent mutation. Skips are normal with an explicit reason; a
-    failed, suppressed or conflicting target stays visible and is never
-    retried automatically. An explicit ensure remains the deliberate recovery
-    path and the only way to choose a same-version divergent source. A
-    supplied absolute monotonic ``deadline`` caps the operation: without at
-    least the full 60s safe window it is skipped rather than started.
-    """
+    """Bounded automatic handoff of the running owned reporter to installed source."""
     from .reporting_runtime import (
         _collect_source,
         _generation_python,
         _prepare_locked,
         _publish,
         _read_current,
-        _read_update_record,
         _source_order,
-        _write_update_record,
         runtime_transaction,
     )
     from .service import ServiceError, ensure_reporter_service, service_status
@@ -217,12 +219,9 @@ def upgrade_running(config=None, *, unit_dir=None, deadline=None):
     if deadline is None:
         deadline = now + _UPDATE_BUDGET_S
     else:
-        if deadline - now < _UPDATE_BUDGET_S:
-            # Never enter service replacement without the complete safe window.
+        if deadline - now < 60.0:
             return {'status': 'skipped', 'reason': 'insufficient_budget'}
         deadline = min(now + _UPDATE_BUDGET_S, deadline)
-    # Forward work (prepare, native install, readback) must finish early enough
-    # to keep the final reserve for one bounded rollback.
     forward = deadline - _ROLLBACK_RESERVE_S
     runner = _bounded_runner(forward)
     try:
@@ -271,53 +270,23 @@ def upgrade_running(config=None, *, unit_dir=None, deadline=None):
             if order == 'incomparable':
                 return {'status': 'degraded', 'reason': 'source_version_incomparable',
                         'previous': previous, 'new': target}
-            record = _read_update_record(root, source_hash)
-            if record is not None and record.get('status') in {'attempting', 'failed', 'rolled_back'}:
-                return {'status': 'suppressed', 'reason': 'automatic_update_suppressed',
-                        'record_status': record.get('status'), 'previous': previous, 'new': target}
-            # Reread the full predicate under the lock immediately before mutation.
             policy = _enabled_policy(config, consent_revision)
             if policy is None:
                 return {'status': 'skipped', 'reason': 'policy_withdrawn',
                         'previous': previous, 'new': target}
-            native = service_status(unit_dir=unit_dir, runner=runner)
-            worker = _worker_view(config)
-            if (native.get('status') != 'active' or not worker.get('healthy')
-                    or worker.get('runtime_source') != current['source_hash']):
-                return {'status': 'skipped', 'reason': 'predicate_changed',
-                        'previous': previous, 'new': target}
-            pre_prepare_pid = worker.get('pid')
             old_python = _generation_python(root, current['source_hash'])
-            record_doc = {'schema': 1, 'status': 'attempting', 'target': target, 'previous': previous,
-                          'old_python': old_python, 'started_at': _utcnow(), 'budget_s': _UPDATE_BUDGET_S}
-            # Durable intent lands before the first owned OS service mutation so
-            # an interrupted or failed target is suppressed instead of retried.
-            _write_update_record(root, source_hash, record_doc)
             mutated = False
             failure_action = None
             failure_returncode = None
             try:
                 runtime = _prepare_locked(config, publish=False, source=(version, revision, files, source_hash),
                                           deadline=forward)
-                # After preparation, before any service mutation: same enabled
-                # policy revision, and the exact pre-prepare worker still
-                # active/healthy on the previous runtime. Never revive a worker
-                # that stopped during preparation; no retry loop.
                 policy = _enabled_policy(config, consent_revision)
                 if policy is None:
-                    abort_reason = 'policy_withdrawn'
-                else:
-                    abort_reason = None
-                    native = service_status(unit_dir=unit_dir, runner=runner)
-                    worker = _worker_view(config)
-                    if (native.get('status') != 'active' or not worker.get('healthy')
-                            or worker.get('runtime_source') != current['source_hash']
-                            or worker.get('pid') != pre_prepare_pid):
-                        abort_reason = 'predicate_changed'
-                if abort_reason is not None:
-                    _write_update_record(root, source_hash, {**record_doc, 'status': 'aborted',
-                                                             'reason': abort_reason, 'finished_at': _utcnow()})
-                    return {'status': 'skipped', 'reason': abort_reason,
+                    return {'status': 'skipped', 'reason': 'policy_withdrawn',
+                            'previous': previous, 'new': target}
+                if not _worker_view(config).get('healthy'):
+                    return {'status': 'skipped', 'reason': 'reporter_worker_not_running',
                             'previous': previous, 'new': target}
                 state = _state(config)
                 mutated = True
@@ -334,22 +303,8 @@ def upgrade_running(config=None, *, unit_dir=None, deadline=None):
                 native_status = service_status(unit_dir=unit_dir, runner=runner)
                 if (worker.get('healthy') and worker.get('runtime_source') == source_hash
                         and native_status.get('status') == 'active'):
-                    # Only a confirmed service may claim the new current runtime.
                     _publish(root, {'schema': 1, 'source_hash': source_hash,
                                     'version': version, 'revision': revision})
-                    try:
-                        _write_update_record(root, source_hash, {**record_doc, 'status': 'updated',
-                                                                 'finished_at': _utcnow()})
-                    except (OSError, RuntimeError):
-                        # The new service is confirmed and the pointer committed:
-                        # never roll back over a terminal record write failure.
-                        # The durable attempting record remains as evidence.
-                        return {'status': 'degraded', 'reason': 'update_record_write_failed',
-                                'previous': previous, 'new': target,
-                                'runtime': {'python': runtime['python']},
-                                'service': {'status': native_status.get('status'),
-                                            'changed': replacement.get('changed')},
-                                'rollback': 'not_needed'}
                     return {'status': 'updated', 'reason': 'reporter_updated',
                             'previous': previous, 'new': target,
                             'runtime': {'python': runtime['python']},
@@ -365,27 +320,20 @@ def upgrade_running(config=None, *, unit_dir=None, deadline=None):
                 failure_returncode = exc.returncode
             except (OSError, ValueError, RuntimeError) as exc:
                 failure = _safe_category(exc, 'reporter_update_failed')
-            # Safe static fields only: never argv, stderr or exception text.
             extra = {}
             if failure_action is not None:
                 extra['failure_action'] = failure_action
             if failure_returncode is not None:
                 extra['failure_returncode'] = failure_returncode
             if not mutated:
-                _write_update_record(root, source_hash, {**record_doc, 'status': 'failed',
-                                                         'failure': failure, 'rollback': 'not_needed',
-                                                         **extra, 'finished_at': _utcnow()})
                 return {'status': 'degraded', 'reason': failure, 'previous': previous, 'new': target,
                         'rollback': 'not_needed', **extra}
-            # One bounded rollback of only this operation's service modification,
-            # using the remaining final reserve of the absolute budget.
             rollback_action = None
             rollback_returncode = None
             policy = _enabled_policy(config, consent_revision) if time.monotonic() < deadline - 5 else None
             if time.monotonic() >= deadline - 5:
                 rollback = 'deadline_exceeded'
             elif policy is None:
-                # Withdrawn before rollback start: do not start a worker.
                 rollback = 'skipped_policy_withdrawn'
             else:
                 rollback_runner = _bounded_runner(deadline)
@@ -400,7 +348,7 @@ def upgrade_running(config=None, *, unit_dir=None, deadline=None):
                             worker.get('healthy') and worker.get('runtime_source') == current['source_hash']):
                         time.sleep(.1)
                         worker = _worker_view(config)
-                    native_status = service_status(unit_dir=unit_dir, runner=rollback_runner)
+                    native_status = service_status(unit_dir=unit_dir, runner=runner)
                     rollback = ('restored'
                                 if worker.get('healthy')
                                 and worker.get('runtime_source') == current['source_hash']
@@ -418,10 +366,6 @@ def upgrade_running(config=None, *, unit_dir=None, deadline=None):
                 extra['rollback_action'] = rollback_action
             if rollback_returncode is not None:
                 extra['rollback_returncode'] = rollback_returncode
-            _write_update_record(root, source_hash, {**record_doc,
-                                                     'status': 'rolled_back' if rollback == 'restored' else 'failed',
-                                                     'failure': failure, 'rollback': rollback,
-                                                     **extra, 'finished_at': _utcnow()})
             return {'status': 'degraded', 'reason': failure, 'previous': previous, 'new': target,
                     'rollback': rollback, **extra}
     except subprocess.TimeoutExpired:

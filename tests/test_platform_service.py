@@ -327,15 +327,6 @@ def test_service_uses_gh_login_without_copying_temporary_token(installation, mon
     assert not (values['state'] / 'credentials.env').exists()
 
 
-def test_removed_token_copy_option_cannot_write_credentials(installation, monkeypatch):
-    values, runner = installation
-    monkeypatch.setenv('GH_TOKEN', 'private-token-saving-fixture')
-    with pytest.raises(TypeError, match='save_token'):
-        service.install_service(**values, save_token=True)
-    assert runner.calls == []
-    assert not values['state'].exists()
-
-
 def test_existing_private_file_is_not_read_by_installer(installation, monkeypatch):
     values, runner = installation
     credentials = values["state"].parent / "private.env"

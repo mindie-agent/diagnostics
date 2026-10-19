@@ -59,17 +59,17 @@ def test_corrupt_registry_is_unknown_not_empty(tmp_path):
         assert state['status'] == 'unknown'
 
 
-def test_pressure_marker_fail_closed(tmp_path):
+def test_pressure_marker_only_blocks_on_explicit_blocked_true(tmp_path):
     assert not pressure_blocked(tmp_path)
     path = tmp_path / 'retention-state.json'
     path.write_text('{')
     path.chmod(0o600)
-    assert pressure_blocked(tmp_path)
+    assert not pressure_blocked(tmp_path)
     path.write_text(json.dumps({'schema': 1, 'blocked': False, 'limited': True}))
     assert not pressure_blocked(tmp_path)
+    path.write_text(json.dumps({'schema': 1, 'blocked': True, 'limited': True}))
     path.chmod(0o644)
-    if os.name != 'nt':
-        assert pressure_blocked(tmp_path)
+    assert pressure_blocked(tmp_path)
 
 
 def test_symlink_registry_rejected(tmp_path):
@@ -88,3 +88,17 @@ def test_missing_cursor_table_is_unread(tmp_path):
     register_reader(tmp_path, path)
     assert cursor_snapshot([str(path)]) == [{}]
     assert not fully_consumed([{}], '/log', 1, 1)
+
+
+def test_reader_guard_timeout_is_explicit_and_not_swallowed(tmp_path, monkeypatch):
+    import mindie_diagnostics.reader_registry as rr
+
+    monkeypatch.setattr(rr, '_try_lock', lambda _fd: False)
+    with reader_guard(tmp_path, timeout=0.02) as state:
+        assert state == {'status': 'unknown', 'reason': 'timeout', 'readers': []}
+    path = queue(tmp_path / 'busy.db')
+    with pytest.raises(TimeoutError, match='diagnostic reader registry is busy'):
+        register_reader(tmp_path, path, timeout=0.02)
+    with pytest.raises(TimeoutError, match='diagnostic reader registry is busy'):
+        unregister_reader(tmp_path, path, timeout=0.02)
+

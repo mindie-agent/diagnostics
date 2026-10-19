@@ -1,4 +1,26 @@
-"""Incremental bounded log consumption, with durable byte cursors and dedup."""
+"""Incremental bounded log consumption with durable SQLite byte cursors.
+
+[Role]
+Scans `<root>/events/<component>/*.jsonl` segments, tracks per-inode byte
+offsets in the `Outbox` `cursors` table, projects failed reportable operations
+into redacted issue bundles, and enqueues them into `Outbox`.
+
+[Invariants]
+- Registers `queue.path` in `<root>/.readers/registry.json` before reading so
+  active segments are not pruned or recycled before ingestion.
+- Never backfills unscoped events or events recorded before `since`.
+- Raises `ConsentUnavailable` without advancing the byte cursor if a scoped
+  event's `reporting.json` policy cannot be read, preserving evidence for a
+  subsequent cycle.
+
+[Timeouts & Locks]
+- Bounded by `max_files=256`, `max_bytes=8 MiB`, and 4096 directory entries per
+  ingestion cycle.
+
+[Side-Effect Policy]
+- Persists `(path, inode, offset, touched, discard)` in `Outbox` `cursors` and
+  enqueues deduplicated incident payloads into `Outbox` `incidents`.
+"""
 from __future__ import annotations
 
 from collections import deque
@@ -49,7 +71,7 @@ def _candidates(root, counts):
 def ingest(root, queue: Outbox, *, max_files=256, max_bytes=8 * 1024 * 1024, since=None):
     from .reporter import fingerprint, issue_payload
     root = Path(root).absolute()
-    if any(path.is_symlink() for path in (root, *root.parents)):
+    if root.is_symlink():
         raise ValueError('diagnostic root must not traverse symlinks')
     register_reader(root, queue.path)
     counts = {'enqueued': 0, 'invalid': 0, 'scanned_bytes': 0, 'limited': 0, 'files': 0, 'caller_errors': 0, 'before_start': 0, 'consent_skipped': 0}

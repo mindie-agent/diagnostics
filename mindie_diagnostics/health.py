@@ -1,4 +1,24 @@
-"""Local, atomic worker liveness and progress; no network or workload authority."""
+"""Atomic local worker liveness and progress heartbeat (`worker-health.json`).
+
+[Role]
+Maintains `<state>/worker-health.json` with a background 15s daemon heartbeat
+thread and stage progress timestamps, and provides `read_health` for local
+status inspection.
+
+[Invariants]
+- A worker is considered `stale` if `now - heartbeat_at > 60s` and
+  `progress_stalled` if `status == "running"` for `> max(1200s, interval * 3)`.
+- Records `runtime_source` (generation SHA-256) and `process_created` (on Windows)
+  to prevent PID-reuse false positives and verify runtime handoffs.
+
+[Timeouts & Locks]
+- `self.lock` (`threading.RLock`) serializes concurrent heartbeat and stage
+  updates; `__exit__` joins the heartbeat thread with a 2.0s timeout.
+
+[Side-Effect Policy]
+- Writes `worker-health.json` atomically via `_write_output`; write failures log
+  a warning event without crashing the worker.
+"""
 from __future__ import annotations
 
 import json

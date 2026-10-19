@@ -1,4 +1,22 @@
-"""Bounded read-only local faults, independent of reporting consent."""
+"""Bounded read-only local fault tail reader, independent of reporting consent.
+
+[Role]
+Scans recent local JSONL event logs under `<root>/events/<component>/` to
+extract the latest 5 failed operations (`event="operation.end"`, `status="error"`)
+for `reporting_status`.
+
+[Invariants]
+- Strictly read-only; never creates directories or modifies files.
+- Operates independently of `reporting.json` consent so local diagnostics remain
+  visible even when remote reporting is disabled.
+
+[Timeouts & Locks]
+- Enforces a 150ms monotonic scan deadline (`deadline = time.monotonic() + 0.15`),
+  visiting at most 256 directory entries and reading at most eight 16KiB file tails.
+
+[Side-Effect Policy]
+- None (pure read-only local filesystem inspection).
+"""
 import json
 import os
 import re
@@ -15,7 +33,7 @@ def _tail(path):
     fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or not f._owned(info) or info.st_nlink != 1:
+        if not stat.S_ISREG(info.st_mode):
             return None, False
         start = max(0, info.st_size - 16384)
         os.lseek(fd, start, os.SEEK_SET)
@@ -39,7 +57,7 @@ def recent_failures(roots):
             events = root / 'events'
             if not events.exists():
                 continue
-            if not f._ancestors_are_real_dirs(events / '_'):
+            if events.is_symlink() or not events.is_dir():
                 result['errors'].append({'category': 'unsafe_or_unreadable_log_root'})
                 continue
             with os.scandir(events) as folders:
@@ -59,8 +77,7 @@ def recent_failures(roots):
                             if not _FILE.fullmatch(entry.name) or not entry.is_file(follow_symlinks=False):
                                 continue
                             info = entry.stat(follow_symlinks=False)
-                            if f._owned(info):
-                                files.append((info.st_mtime_ns, entry.path))
+                            files.append((info.st_mtime_ns, entry.path))
                     if result['truncated']:
                         break
             if result['truncated']:

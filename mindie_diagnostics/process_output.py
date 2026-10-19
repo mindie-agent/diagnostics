@@ -1,4 +1,25 @@
-"""Capture service-process FDs for its own lifetime, never the MCP parent's."""
+"""Scoped FD 1/2 output capture for long-lived service processes.
+
+[Role]
+Redirects POSIX/Windows file descriptors 1 (`stdout`) and 2 (`stderr`) of the
+current service process into background drain threads that emit bounded
+`process.output` and `process.output.gap` events on an active `Operation`.
+
+[Invariants]
+- Captures at most one active scope per process (`_CAPTURE_LOCK` acquired
+  non-blocking); nested/concurrent scopes emit `capture_already_active` and
+  pass through.
+- Lines exceeding `MAX_LINE_BYTES = 16384` are discarded and recorded as
+  `process.output.gap` (`reason="oversized_line"`).
+
+[Timeouts & Locks]
+- `_CAPTURE_LOCK` is non-blocking (`blocking=False`); drain threads are joined
+  with `timeout=2` seconds on exit after restoring the saved FDs.
+
+[Side-Effect Policy]
+- Duplicates and restores process-level file descriptors 1 and 2 (`os.dup` /
+  `os.dup2`); resets `_CAPTURE_LOCK` across `fork` via PID comparison.
+"""
 from contextlib import contextmanager
 import os
 import re

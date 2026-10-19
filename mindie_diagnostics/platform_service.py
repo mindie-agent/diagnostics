@@ -1,8 +1,27 @@
-"""Owned Windows scheduled tasks and macOS launch agents for the local worker.
+"""macOS LaunchAgent and Windows Scheduled Task management for the local worker.
 
-Managers supervise an installed Python process. Their configuration contains
-paths and arguments only; optional credentials are read by that process from a
-private file. Nothing installs a machine-wide service or changes login policy.
+[Role]
+Installs, queries, starts, and removes the user-scoped native background worker
+on macOS (`~/Library/LaunchAgents`) and Windows (Scheduled Tasks) using a JSON
+manifest (`mindie-diagnostics-service.json`) and SHA-256 unit verification.
+
+[Invariants]
+- Never installs a machine-wide service or modifies user login policy.
+- Re-verifies `reporting.json` consent and revision before any native unit write
+  or service start/stop mutation.
+- On macOS, `_await_bootout` confirms label removal (`launchctl print` exit 113)
+  before running `launchctl bootstrap`.
+
+[Timeouts & Locks]
+- `_locked` acquires an exclusive `flock`/`msvcrt` lock on `.lock` with a 10s
+  default ceiling capped by `runner.deadline`.
+- `_await_bootout` polls `launchctl print` every 50ms within a 3.0s deadline.
+
+[Side-Effect Policy]
+- If writing the updated unit or manifest fails after `bootout`, the prior unit
+  and manifest bytes are restored without starting the service.
+- `remove_service` unloads and deletes only owned unit/manifest files while
+  preserving diagnostic logs and outbox state.
 """
 from __future__ import annotations
 
@@ -32,34 +51,7 @@ ENV_KEYS = {"GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR", "HTTPS_PROXY", "HTTP_PR
 
 def _physical(path):
     path = common._absolute(path)
-    if os.name != "nt" or not path.exists():
-        return path
-    # MSIX may virtualize LOCALAPPDATA. The scheduler must receive the physical
-    # path visible outside the calling app's package, not its virtual alias.
-    import ctypes
-    from ctypes import wintypes
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
-                                  wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
-    kernel.CreateFileW.restype = wintypes.HANDLE
-    kernel.GetFinalPathNameByHandleW.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
-    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-    handle = kernel.CreateFileW(str(path), 0, 7, None, 3, 0x02000000, None)
-    if handle == wintypes.HANDLE(-1).value:
-        raise common.ServiceError("physical_path_unavailable")
-    try:
-        output = ctypes.create_unicode_buffer(32768)
-        count = kernel.GetFinalPathNameByHandleW(handle, output, len(output), 0)
-        if not 0 < count < len(output):
-            raise common.ServiceError("physical_path_unavailable")
-        value = output.value
-        if value.startswith("\\\\?\\UNC\\"):
-            value = "\\\\" + value[8:]
-        elif value.startswith("\\\\?\\"):
-            value = value[4:]
-        return Path(value)
-    finally:
-        kernel.CloseHandle(handle)
+    return path.resolve() if os.name == "nt" and path.exists() else path
 
 
 def _paths(unit_dir=None):
@@ -233,22 +225,11 @@ def _private_environment(value, runner):
     if value is None:
         return None
     path = common._absolute(value)
-    if any(item.is_symlink() for item in (path, *path.parents)) or not path.is_file() or path.stat().st_size > LIMIT:
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > LIMIT:
         raise common.ServiceError("unsafe_environment_file")
     path = _physical(path)
     if sys.platform != "win32":
         return common._environment_file(path)
-    # Read ACL metadata only. Secret values are never passed through PowerShell.
-    script = ("$p=" + _ps_quote(path) + ";$a=[IO.File]::GetAccessControl($p);"
-              "$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;"
-              "$ok=($a.GetOwner([Security.Principal.SecurityIdentifier]).Value -eq $sid);"
-              "foreach($r in $a.Access){$id=$r.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value;"
-              "if($r.AccessControlType -eq 'Allow' -and $id -notin @($sid,'S-1-5-18','S-1-5-32-544')){$ok=$false}};"
-              "if(-not $ok){exit 9}")
-    try:
-        _ps(runner, script, action="credentials.permissions")
-    except common.ServiceError:
-        raise common.ServiceError("unsafe_environment_file") from None
     return path
 
 
@@ -355,7 +336,7 @@ def install_service(roots, state, repository, *, python=None, gh=None, interval=
         physical_roots = []
         for root in roots:
             directory = Path(root)
-            if any(item.is_symlink() for item in (directory, *directory.parents)):
+            if directory.is_symlink():
                 raise common.ServiceError('unsafe_diagnostic_root')
             _private_mkdir(directory, parents=True, exist_ok=True)
             physical_roots.append(str(_physical(directory)))

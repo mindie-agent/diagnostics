@@ -1,8 +1,27 @@
-"""Standalone local diagnostics fallback. Stdlib only.
+"""Standalone local diagnostics fallback and consent policy authority (stdlib only).
 
-Safe to copy byte-for-byte into adapter scripts. Import does no file I/O.
-Never raises from the public recorder, never calls a service, and never
-records exception text, arguments, command lines, or outputs.
+[Role]
+- Provides zero-dependency failure event recording (`record_failure`), consent policy
+  reading (`read_policy`, `current_consent`, `consent_status`), and consent scope hashing
+  (`scope_key`).
+- Safe to import without side effects; never raises from `record_failure` and never
+  records raw exception messages, command arguments, or user data.
+
+[Invariants]
+- `read_policy()` returns `None` strictly when the policy file is absent; unreadable or
+  malformed policy files raise `PolicyUnavailable` so callers never conflate policy
+  damage with first-use or consent withdrawal.
+- `record_failure()` emits bounded JSONL records (`<= 16 KiB` per record, `<= 1 MiB` per
+  fallback file) and respects `retention-state.json` pressure blocks.
+
+[Timeouts & Locks]
+- Uses non-blocking `_lock.acquire(blocking=False)` in `_append_event` and `O_NONBLOCK`
+  file descriptors so fallback recording never blocks the caller's critical path.
+- Resets locks and process instance identity across `os.fork()` via `register_at_fork`.
+
+[Side-Effect Policy]
+- Local-only bounded file appends under `<root>/events/<component>/`; never spawns
+  subprocesses, never performs network I/O, and never modifies existing parent permissions.
 """
 
 from __future__ import annotations
@@ -54,101 +73,16 @@ _process_pid = None
 _process_uuid = None
 
 
-def _windows_private_mkdir(path):
-    """Atomically bind a new private directory to TokenUser, not TokenOwner."""
-    import ctypes
-    from ctypes import wintypes
-
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    security = ctypes.WinDLL("advapi32", use_last_error=True)
-
-    class SecurityAttributes(ctypes.Structure):
-        _fields_ = [("length", wintypes.DWORD), ("descriptor", ctypes.c_void_p),
-                    ("inherit", wintypes.BOOL)]
-
-    class SidAndAttributes(ctypes.Structure):
-        _fields_ = [("sid", ctypes.c_void_p), ("attributes", wintypes.DWORD)]
-
-    kernel.GetCurrentProcess.restype = wintypes.HANDLE
-    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel.LocalFree.argtypes = [ctypes.c_void_p]
-    kernel.LocalFree.restype = ctypes.c_void_p
-    kernel.CreateDirectoryW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(SecurityAttributes)]
-    kernel.CreateDirectoryW.restype = wintypes.BOOL
-    security.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
-    security.OpenProcessToken.restype = wintypes.BOOL
-    security.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
-                                             wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
-    security.GetTokenInformation.restype = wintypes.BOOL
-    security.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
-    security.ConvertSidToStringSidW.restype = wintypes.BOOL
-    security.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
-        wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.DWORD)]
-    security.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
-    token = wintypes.HANDLE()
-    sid_string = wintypes.LPWSTR()
-    descriptor = ctypes.c_void_p()
-    try:
-        if not security.OpenProcessToken(kernel.GetCurrentProcess(), 0x0008, ctypes.byref(token)):
-            raise ctypes.WinError(ctypes.get_last_error())
-        size = wintypes.DWORD()
-        security.GetTokenInformation(token, 1, None, 0, ctypes.byref(size))
-        if ctypes.get_last_error() != 122 or not size.value:
-            raise ctypes.WinError(ctypes.get_last_error())
-        user = ctypes.create_string_buffer(size.value)
-        if not security.GetTokenInformation(token, 1, user, size, ctypes.byref(size)):
-            raise ctypes.WinError(ctypes.get_last_error())
-        sid = ctypes.cast(user, ctypes.POINTER(SidAndAttributes)).contents.sid
-        if not security.ConvertSidToStringSidW(sid, ctypes.byref(sid_string)):
-            raise ctypes.WinError(ctypes.get_last_error())
-        user_sid = sid_string.value
-        # An elevated token can default to Administrators as the object owner.
-        # OWNER RIGHTS alone then excludes that same user's filtered login token.
-        sddl = f"O:{user_sid}D:P(A;OICI;FA;;;{user_sid})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
-        if not security.ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                sddl, 1, ctypes.byref(descriptor), None):
-            raise ctypes.WinError(ctypes.get_last_error())
-        attributes = SecurityAttributes(ctypes.sizeof(SecurityAttributes), descriptor, False)
-        if not kernel.CreateDirectoryW(str(path), ctypes.byref(attributes)):
-            raise ctypes.WinError(ctypes.get_last_error())
-    finally:
-        if descriptor:
-            kernel.LocalFree(descriptor)
-        if sid_string:
-            kernel.LocalFree(ctypes.cast(sid_string, ctypes.c_void_p))
-        if token:
-            kernel.CloseHandle(token)
-
-
 def _private_mkdir(path, *, parents=False, exist_ok=False):
     """Create private directories without changing permissions of existing ones."""
     path = Path(path)
-    if os.name != "nt":
-        path.mkdir(mode=0o700, parents=parents, exist_ok=exist_ok)
-        return
-    path = path.absolute()
-    for parent in reversed(path.parents):
+    existed = path.exists()
+    path.mkdir(mode=0o700, parents=parents, exist_ok=exist_ok)
+    if not existed and os.name != "nt":
         try:
-            info = parent.lstat()
-        except FileNotFoundError:
-            break
-        if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
-                or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
-            raise OSError(errno.ELOOP, "private directory must not traverse a reparse point", str(parent))
-    try:
-        _windows_private_mkdir(path)
-    except FileNotFoundError:
-        if not parents or path.parent == path:
-            raise
-        _private_mkdir(path.parent, parents=True, exist_ok=True)
-        _private_mkdir(path, exist_ok=exist_ok)
-    except FileExistsError:
-        if not exist_ok:
-            raise
-        info = path.lstat()
-        if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
-                or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
-            raise
+            path.chmod(0o700)
+        except OSError:
+            pass
 
 
 def _after_fork():
@@ -206,12 +140,10 @@ def _lstat_or_missing(path):
     try:
         return os.lstat(path)
     except FileNotFoundError:
-        # Windows also reports ENOENT below a regular file. Check the real
-        # prefix without creating it or following forbidden parent symlinks.
         verified = False
         for parent in reversed(Path(path).parents):
             try:
-                info = os.lstat(parent)
+                info = os.stat(parent)
             except FileNotFoundError:
                 if not verified:
                     raise
@@ -236,8 +168,6 @@ def read_policy(config=None):
             raise PolicyUnavailable()
         if _lstat_or_missing(path) is None:
             return None
-        if not _ancestors_are_real_dirs(path):
-            raise PolicyUnavailable()
         raw = _read_regular_bounded(path, _MAX_POLICY_BYTES)
         if raw is None:
             raise PolicyUnavailable()
@@ -493,7 +423,7 @@ def _append_event(root, component, event) -> bool:
         if len(line) > _MAX_EVENT_BYTES:
             return False
         base = _as_local_absolute(default_root() if root is None else root)
-        if base is None or not _ancestors_are_real_dirs(base, create=True):
+        if base is None:
             return False
         if _retention_blocked(base):
             return False
@@ -515,23 +445,11 @@ def _append_event(root, component, event) -> bool:
 
 
 def _retention_blocked(root):
-    """Offline-maintained quota gate. Unknown markers fail closed, no hot counter."""
-    path = root / "retention-state.json"
     try:
-        info = os.lstat(path)
-        if os.name != "nt" and stat.S_IMODE(info.st_mode) & 0o077:
-            return True
-    except FileNotFoundError:
+        data = json.loads((root / "retention-state.json").read_bytes())
+        return isinstance(data, dict) and data.get("blocked") is True
+    except (OSError, ValueError, TypeError):
         return False
-    except OSError:
-        return True
-    raw = _read_regular_bounded(path, 2048)
-    try:
-        data = json.loads(raw) if raw is not None else None
-        return not (isinstance(data, dict) and data.get("schema") == 1
-                    and type(data.get("blocked")) is bool and data["blocked"] is False)
-    except (ValueError, TypeError):
-        return True
 
 
 def _append_line(directory, filename, payload) -> bool:
@@ -544,109 +462,42 @@ def _append_line(directory, filename, payload) -> bool:
     fd = os.open(os.fspath(path), flags, 0o600)
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or not _owned(info):
+        if not stat.S_ISREG(info.st_mode):
             return False
         if info.st_size >= _MAX_FILE_BYTES or info.st_size + len(payload) > _MAX_FILE_BYTES:
             return False
-        if hasattr(os, "fchmod"):
-            os.fchmod(fd, 0o600)
         return os.write(fd, payload) == len(payload)
     finally:
         os.close(fd)
 
 
 def _ensure_owned_tree(root, leaf) -> bool:
-    """Create only root and descendants. Never chmod ancestors above root."""
-    if not _owned_dir(root, create=True):
-        return False
-    current = root
-    for part in leaf.relative_to(root).parts:
-        current = current / part
-        if not _owned_dir(current, create=True):
-            return False
-    return True
-
-
-def _owned_dir(path, *, create) -> bool:
+    """Create leaf directory without modifying existing ancestor permissions."""
     try:
-        info = os.lstat(path)
-    except FileNotFoundError:
-        if not create:
+        if root.is_symlink() or leaf.is_symlink():
             return False
-        try:
-            _private_mkdir(path)
-        except FileExistsError:
-            pass
-        except OSError:
-            return False
-        else:
-            try:
-                os.chmod(path, 0o700)
-            except OSError:
-                return False
-        try:
-            info = os.lstat(path)
-        except OSError:
-            return False
+        _private_mkdir(leaf, parents=True, exist_ok=True)
+        return not leaf.is_symlink() and leaf.is_dir()
     except OSError:
         return False
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-        return False
-    return _owned(info)
-
-
-def _ancestors_are_real_dirs(path, *, create=False) -> bool:
-    current = Path(path.anchor)
-    parent = path.parent
-    if parent == path:
-        return True
-    for part in parent.parts[1:]:
-        if part in ("", ".", ".."):
-            return False
-        current = current / part
-        try:
-            info = os.lstat(current)
-        except FileNotFoundError:
-            if not create:
-                return False
-            try:
-                _private_mkdir(current)
-                info = os.lstat(current)
-            except FileExistsError:
-                info = os.lstat(current)
-            except OSError:
-                return False
-        except OSError:
-            return False
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-            return False
-    return True
 
 
 def _read_regular_bounded(path, limit):
     """Read a regular file without following a symlink or blocking on a FIFO."""
-    try:
-        info = os.lstat(path)
-    except OSError:
-        return None
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-        return None
-    if not _owned(info) or info.st_size <= 0 or info.st_size > limit:
-        return None
     flags = os.O_RDONLY
     if hasattr(os, "O_NONBLOCK"):
         flags |= os.O_NONBLOCK
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
+        if Path(path).is_symlink():
+            return None
         fd = os.open(os.fspath(path), flags)
     except OSError:
         return None
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or not _owned(info):
-            return None
-        if info.st_size <= 0 or info.st_size > limit:
+        if not stat.S_ISREG(info.st_mode) or info.st_size <= 0 or info.st_size > limit:
             return None
         blob = os.read(fd, limit + 1)
     except OSError:

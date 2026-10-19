@@ -1,4 +1,22 @@
-"""Read current owned worker arguments without shell interpretation or secrets."""
+"""Strict parser for owned worker CLI arguments and systemd `ExecStart` lines.
+
+[Role]
+Validates worker `argv` and systemd `ExecStart`/`EnvironmentFile` directives
+without shell interpretation so `service ensure` can verify authorization
+bindings before updating an existing unit.
+
+[Invariants]
+- Explicitly rejects legacy paid-model worker flags (`--central-bot`, `--grok`,
+  `--grok-home`, `--grok-work`) with `legacy_worker_requires_explicit_removal`.
+- Requires `state`, `repository`, `gh`, `since`, `interval`, `reporting_config`,
+  and at least one `--root`.
+
+[Timeouts & Locks]
+- Pure in-memory string parsing; no locks or subprocess calls.
+
+[Side-Effect Policy]
+- None (pure validation).
+"""
 from __future__ import annotations
 
 import re

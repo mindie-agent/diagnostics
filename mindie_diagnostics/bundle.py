@@ -1,4 +1,28 @@
-"""Offline, bounded public projection of diagnostics events, never raw state."""
+"""Offline, bounded public projection of diagnostics events.
+
+[Role]
+Projects local JSONL event records into a strict allowlist-only schema for
+offline support bundles (`export_public_event`, `collect_bundle`) and automatic
+GitHub issue evidence (`export_issue_event`), stripping free-form messages,
+paths, commands, environment variables, and unapproved attributes.
+
+[Invariants]
+- Allowlist-only projection (`_NUMERIC`, `_BOOLEAN`, `_LABELS`, `_HASHES`);
+  any record failing `scan_text` redaction verification is dropped (`None`).
+- `export_issue_event` strips local correlation keys (`operation_id`, `trace_id`,
+  `monotonic_ns`, `process_instance_id`) before external publication.
+- Output size is strictly bounded by `max_bytes` (default `1 MiB`); older events
+  are clipped from the front rather than emitting partial JSON.
+
+[Timeouts & Locks]
+- Bounded by file count (`MAX_FILES = 128`), input byte budget (`MAX_INPUT_BYTES = 8 MiB`),
+  and event count (`MAX_EVENTS = 1000`).
+
+[Side-Effect Policy]
+- `collect_bundle` reads existing event segments without live probes or service
+  mutations; optional file output is written atomically via `tempfile.mkstemp`
+  + `os.replace` and refuses to overwrite `<root>/events`.
+"""
 from __future__ import annotations
 
 from datetime import datetime
@@ -185,14 +209,10 @@ def export_issue_event(record):
 def _safe_open(path):
     if any(parent.is_symlink() for parent in (path, *path.parents)):
         raise ValueError("symlink diagnostics input refused")
-    before = path.stat()
-    if not stat.S_ISREG(before.st_mode):
-        raise ValueError("non-file diagnostics input refused")
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
-    after = os.fstat(fd)
-    if not stat.S_ISREG(after.st_mode) or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
         os.close(fd)
-        raise ValueError("diagnostic input changed while opening")
+        raise ValueError("non-file diagnostics input refused")
     return os.fdopen(fd, "rb")
 
 

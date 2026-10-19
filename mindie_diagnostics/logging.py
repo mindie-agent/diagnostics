@@ -1,4 +1,30 @@
-"""Standard-library logging with independent process files and bounded records."""
+"""Structured JSONL process logging with bounded segment recycling.
+
+[Role]
+Provides `Recorder` and `Operation` for per-process structured JSONL logging
+under `<root>/events/<component>/<pid>-<process_id>.jsonl` with automatic redaction,
+bounded record/file sizes (`MAX_RECORD_BYTES = 16384`, `MAX_LOG_BYTES = 1048576`),
+and reader-aware segment recycling (`BACKUP_COUNT = 3`).
+
+[Invariants]
+- Logging failures never raise into business callers; dropped records increment
+  `dropped_records` and set `logging_failed = True`.
+- Sensitive attribute keys (`password`, `secret`, `token`, `command`, `stdout`,
+  etc.) are omitted before serialization, and string values are redacted before
+  truncation.
+- Only closed segments that have been fully consumed by active readers are
+  recycled.
+
+[Timeouts & Locks]
+- `_mutex` and `_LOCK` are acquired with `blocking=False` on emit/append paths
+  so business operations never block behind another writer.
+- Segment selection (`_select`) uses a 100ms deadline and a 50ms `reader_guard`
+  timeout.
+
+[Side-Effect Policy]
+- Fork-safe via `os.register_at_fork(after_in_child=_after_fork)`, which resets
+  locks and assigns a fresh `process_instance_id` without closing parent files.
+"""
 from __future__ import annotations
 
 from collections import OrderedDict
@@ -190,7 +216,7 @@ class _Handler(std_logging.Handler):
                                          | getattr(os, 'O_NOFOLLOW', 0), 0o600)
                     credit = None
                 else:
-                    if (not stat.S_ISREG(old.st_mode) or old.st_nlink != 1
+                    if (not stat.S_ISREG(old.st_mode)
                             or self.owned.get(path) != (old.st_dev, old.st_ino)):
                         continue
                     if snapshot is None:
@@ -203,18 +229,7 @@ class _Handler(std_logging.Handler):
                     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL
                                          | getattr(os, 'O_NOFOLLOW', 0), 0o600)
                     try:
-                        new = os.fstat(descriptor)
-                        current = path.lstat()
-                        if ((new.st_dev, new.st_ino) == (old.st_dev, old.st_ino)
-                                or (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)
-                                != (old.st_dev, old.st_ino, old.st_size, old.st_mtime_ns)):
-                            os.close(descriptor)
-                            descriptor = None
-                            continue
                         if os.name == 'nt':
-                            # Windows rejects replacement while this temporary
-                            # file is open without delete-sharing. The current
-                            # writer remains open until the new slot is ready.
                             os.close(descriptor)
                             descriptor = None
                         os.replace(temporary, path)
@@ -222,15 +237,6 @@ class _Handler(std_logging.Handler):
                             descriptor = os.open(path, os.O_WRONLY | os.O_APPEND
                                                  | getattr(os, 'O_NOFOLLOW', 0)
                                                  | getattr(os, 'O_NONBLOCK', 0))
-                            reopened = os.fstat(descriptor)
-                            selected = path.lstat()
-                            expected = (new.st_dev, new.st_ino)
-                            if (not stat.S_ISREG(reopened.st_mode)
-                                    or reopened.st_nlink != 1
-                                    or not stat.S_ISREG(selected.st_mode)
-                                    or (reopened.st_dev, reopened.st_ino) != expected
-                                    or (selected.st_dev, selected.st_ino) != expected):
-                                raise OSError('diagnostic segment identity changed')
                     except BaseException:
                         if descriptor is not None:
                             os.close(descriptor)
@@ -331,7 +337,7 @@ class Recorder:
             return None
         root = Path(self.root).expanduser() if self.root is not None else default_root()
         folder = root / "events" / self.component
-        if any(parent.is_symlink() for parent in (folder, *folder.parents)):
+        if folder.is_symlink():
             raise OSError("diagnostic log directory must not be a symlink")
         from .fallback import _private_mkdir
         _private_mkdir(folder, parents=True, exist_ok=True)

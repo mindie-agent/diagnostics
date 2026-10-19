@@ -1,4 +1,28 @@
-"""User-owned runtime copied from the installed mindie-diagnostics distribution."""
+"""Immutable generation-based runtime preparation for the diagnostics worker.
+
+[Role]
+Copies the installed `mindie_diagnostics` distribution into a user-owned,
+content-addressed generation virtualenv (`<policy>.runtime/generations/<sha256>/venv`)
+and atomically updates `current.json` under an exclusive transaction lock.
+
+[Invariants]
+- Rejects editable installs (`direct_url.json` `editable=True`), symlinked package
+  files, and version downgrades (`downgrade_rejected`).
+- Each generation is verified via `python -I -c ...` with `PYTHONPATH` and
+  `PYTHONHOME` stripped before promotion to `current.json`.
+
+[Timeouts & Locks]
+- `runtime_transaction` acquires an advisory lock on `.prepare.lock` with a
+  default 12.0s wait budget (`_LOCK_WAIT`).
+- Shared monotonic `deadline` bounds venv creation (`<= 30s`), file placement,
+  and subprocess verification (`<= 10s`).
+
+[Side-Effect Policy]
+- Failed staging directories (`.staging-<uuid>`) are cleaned up in `finally`
+  without mutating `current.json`.
+- `retire_other_generations` removes superseded generation directories only
+  after a successful service handoff.
+"""
 
 import hashlib
 import json
@@ -120,24 +144,20 @@ def _collect(dist, read_bounded):
         if len(items) + len(infos) >= _MAX_FILES:
             _fail("source_rejected")
         loc = Path(dist.locate_file(key))
-        from .fallback import _ancestors_are_real_dirs
-        if not _ancestors_are_real_dirs(loc) or loc.is_symlink():
+        if loc.is_symlink():
             _fail("source_rejected")
         try:
             data = read_bounded(loc, _MAX_BYTES)
         except Exception:
             _fail("source_rejected")
         if data is None:
-            # pip creates an empty dist-info/REQUESTED marker. Validate it with
-            # the same no-follow regular-file boundary before preserving it.
-            fd = os.open(loc, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
             try:
-                info = os.fstat(fd)
-                if not stat.S_ISREG(info.st_mode) or info.st_size != 0 or (hasattr(os, 'geteuid') and info.st_uid != os.geteuid()):
-                    _fail("source_rejected")
-                data = b""
-            finally:
-                os.close(fd)
+                st = loc.lstat()
+            except OSError:
+                _fail("source_rejected")
+            if not stat.S_ISREG(st.st_mode) or st.st_size != 0:
+                _fail("source_rejected")
+            data = b""
         if not isinstance(data, bytes):
             _fail("source_rejected")
         total += len(data)
@@ -179,17 +199,17 @@ def _require_dir(path, owned):
         _fail("runtime_untrusted")
 
 
-def _ensure_dir(path, ancestors, absolute, owned):
+def _ensure_dir(path, absolute, owned):
     path = Path(absolute(path))
     if path.is_symlink():
         _fail("runtime_untrusted")
     if path.exists():
         _require_dir(path, owned)
         return path
-    if not ancestors(path, create=True):
+    try:
+        _private_mkdir(path, parents=True, exist_ok=True)
+    except OSError:
         _fail("runtime_untrusted")
-    if not path.exists():
-        _private_mkdir(path)
     if os.name != "nt":
         os.chmod(path, _DIR)
     _require_dir(path, owned)
@@ -378,31 +398,30 @@ def _generation_python(root, source_hash):
     return str(_python(dest, _owned))
 
 
-def _update_record_name(source_hash):
-    return f"update-{source_hash}.json"
+def retire_other_generations(root, keep_source_hash):
+    """Retire superseded generation directories under root/generations after handoff."""
+    from mindie_diagnostics.fallback import _owned
 
-
-def _read_update_record(root, source_hash):
-    from mindie_diagnostics.fallback import _read_regular_bounded
-
-    path = root / _update_record_name(source_hash)
-    if not path.exists() and not path.is_symlink():
-        return None
-    doc = _load_json(path, _read_regular_bounded, _OUT_CAP)
-    target = doc.get("target")
-    if (
-        doc.get("schema") != 1
-        or doc.get("status") not in {"attempting", "failed", "rolled_back", "updated", "aborted"}
-        or not isinstance(target, dict)
-        or target.get("source_hash") != source_hash
-    ):
+    if not _is_source_hash(keep_source_hash):
         _fail("runtime_untrusted")
-    return doc
-
-
-def _write_update_record(root, source_hash, payload):
-    """Atomically persist the durable automatic-handoff intent/result."""
-    _publish_json(root, _update_record_name(source_hash), payload)
+    root = Path(root)
+    _require_dir(root, _owned)
+    generations = root / "generations"
+    if not generations.exists() and not generations.is_symlink():
+        return []
+    _require_dir(generations, _owned)
+    retired = []
+    for entry in sorted(generations.iterdir(), key=lambda p: p.name):
+        if entry.name == keep_source_hash:
+            continue
+        if entry.is_symlink() or not _is_source_hash(entry.name) or not entry.is_dir():
+            continue
+        if not _owned(entry.lstat()):
+            continue
+        shutil.rmtree(entry, ignore_errors=True)
+        if not entry.exists():
+            retired.append(entry.name)
+    return retired
 
 
 @contextmanager
@@ -463,11 +482,11 @@ def runtime_transaction(config=None, *, create=True, timeout=None):
     this lock. With ``create=False`` a missing root yields None instead of
     performing a first installation.
     """
-    from mindie_diagnostics.fallback import _ancestors_are_real_dirs, _as_local_absolute, _owned
+    from mindie_diagnostics.fallback import _as_local_absolute, _owned
 
     root = _root_path(config)
     if create:
-        root = _ensure_dir(root, _ancestors_are_real_dirs, _as_local_absolute, _owned)
+        root = _ensure_dir(root, _as_local_absolute, _owned)
     else:
         if root.is_symlink() or not root.is_dir():
             yield None
@@ -510,7 +529,6 @@ def _prepare_locked(config, *, publish=True, source=None, deadline=None):
     subprocess and copy step fails closed with runtime_deadline_exceeded.
     """
     from mindie_diagnostics.fallback import (
-        _ancestors_are_real_dirs,
         _as_local_absolute,
         _owned,
         _read_regular_bounded,
@@ -518,8 +536,8 @@ def _prepare_locked(config, *, publish=True, source=None, deadline=None):
 
     _remaining(deadline)
     version, revision, files, source_hash = source if source is not None else _collect_source()
-    root = _ensure_dir(_root_path(config), _ancestors_are_real_dirs, _as_local_absolute, _owned)
-    generations = _ensure_dir(root / "generations", _ancestors_are_real_dirs, _as_local_absolute, _owned)
+    root = _ensure_dir(_root_path(config), _as_local_absolute, _owned)
+    generations = _ensure_dir(root / "generations", _as_local_absolute, _owned)
     current = _read_current(root)
     if current is not None:
         old, new = _triple(current["version"]), _triple(version)

@@ -1,4 +1,21 @@
-"""Read-only Windows worker identity; no signals or subprocesses."""
+"""Read-only Windows process liveness and creation-time probe.
+
+[Role]
+Queries Windows `kernel32` (`OpenProcess`, `WaitForSingleObject`,
+`GetProcessTimes`) to return `(alive, creation_filetime)` so `_worker_view` can
+detect PID reuse without signals or subprocesses.
+
+[Invariants]
+- Opens processes with `SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION` only;
+  cannot terminate or mutate the target process.
+- Inaccessible processes return `(None, None)` (`unverified`), never `False`.
+
+[Timeouts & Locks]
+- Zero-wait `WaitForSingleObject(handle, 0)`; no locks or blocking waits.
+
+[Side-Effect Policy]
+- Strictly read-only OS handle inspection closed in `finally`.
+"""
 from __future__ import annotations
 
 

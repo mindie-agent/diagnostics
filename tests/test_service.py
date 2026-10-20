@@ -50,6 +50,9 @@ class Runner:
 
 @pytest.fixture
 def install(tmp_path, monkeypatch):
+    from mindie_diagnostics.service_environment import NETWORK_ENV
+    for key in NETWORK_ENV:
+        monkeypatch.delenv(key, raising=False)
     # Unit construction is tested on every platform without touching its real
     # service manager. Actual Linux locking gets its own test below.
     monkeypatch.setattr(service.sys, "platform", "linux")

@@ -63,6 +63,8 @@ class Runner:
 
 @pytest.fixture(params=["win32", "darwin"])
 def installation(request, tmp_path, monkeypatch):
+    for key in native.service_environment.NETWORK_ENV:
+        monkeypatch.delenv(key, raising=False)
     monkeypatch.setattr(sys, "platform", request.param)
     monkeypatch.setattr(os, "getuid", lambda: 1000, raising=False)
     monkeypatch.delenv("GH_TOKEN", raising=False)
@@ -346,6 +348,25 @@ def test_service_uses_gh_login_without_copying_temporary_token(installation, mon
     assert not (values['state'] / 'credentials.env').exists()
 
 
+def test_service_refreshes_proxy_and_loads_it_before_upload(installation, monkeypatch):
+    values, runner = installation
+    monkeypatch.setenv("HTTPS_PROXY", "http://fixture@proxy.invalid:8080")
+    monkeypatch.setenv("SSL_CERT_FILE", str(values["state"] / "Company CA.pem"))
+    first = service.install_service(**values)
+    monkeypatch.setenv("HTTPS_PROXY", "http://next-proxy.invalid:8080")
+    second = service.install_service(**values)
+    assert second["changed"] and second["since"] == first["since"]
+    monkeypatch.delenv("HTTPS_PROXY")
+    monkeypatch.delenv("SSL_CERT_FILE")
+    from mindie_diagnostics import cli
+    def worker(argv):
+        assert os.environ["HTTPS_PROXY"] == "http://next-proxy.invalid:8080"
+        assert os.environ["SSL_CERT_FILE"] == str(values["state"] / "Company CA.pem")
+        return 0
+    monkeypatch.setattr(cli, "main", worker)
+    assert native.run_worker(second["manifest"]) == 0
+
+
 def test_existing_private_file_is_not_read_by_installer(installation, monkeypatch):
     values, runner = installation
     credentials = values["state"].parent / "private.env"
@@ -359,6 +380,11 @@ def test_existing_private_file_is_not_read_by_installer(installation, monkeypatc
     monkeypatch.setattr(Path, "read_text", guarded)
     result = service.install_service(**values, environment_file=credentials)
     assert result["status"] == "installed"
+    monkeypatch.setenv("HTTPS_PROXY", "http://ambient.invalid")
+    repeated = service.ensure_reporter_service(**values)
+    manifest = json.loads(Path(repeated["manifest"]).read_text())
+    assert manifest["environment_file"] == str(credentials)
+    assert not (values["unit_dir"] / "mindie-network.env").exists()
 
 
 def test_worker_loads_private_file_in_process_and_drops_inherited_token(installation, monkeypatch):

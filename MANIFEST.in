@@ -1,0 +1,6 @@
+include LICENSE
+include README.md
+include README.en.md
+include AGENTS.md
+recursive-include mindie_diagnostics *.py
+recursive-include tests *.py

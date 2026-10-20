@@ -42,11 +42,11 @@ from xml.etree import ElementTree as ET
 
 from . import service as common
 from .fallback import _private_mkdir
+from . import service_environment
 
 MARKER = "mindie-diagnostics.native-service.v1"
 MANIFEST = "mindie-diagnostics-service.json"
 LIMIT = 32768
-ENV_KEYS = {"GH_TOKEN", "GITHUB_TOKEN", "GH_CONFIG_DIR", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"}
 
 
 def _physical(path):
@@ -318,6 +318,8 @@ def install_service(roots, state, repository, *, python=None, gh=None, interval=
             # The stored manifest serialized the physical state path; compare
             # against the same physical mapping of the incoming directory.
             common._check_reporter_binding(existing['argv'], existing['environment_file'], _physical(state), repository, reporting_config)
+            if environment_file is None:
+                environment_file = existing["environment_file"]
         fixed_since = existing["since"] if existing else common._since(since)
         interpreter, version = common._interpreter(runner, python)
         launcher = _physical(interpreter)
@@ -345,6 +347,7 @@ def install_service(roots, state, repository, *, python=None, gh=None, interval=
             raise common.ServiceError('unsafe_state_directory')
         _private_mkdir(state, parents=True, exist_ok=True)
         state = _physical(state)
+        environment_file, network_changed = service_environment.prepare(manifest.parent, environment_file)
         env_file = _private_environment(environment_file, runner)
         gh_path = (str(common._executable(gh)) if ensure and existing and env_file is None
                    else common._reporter_executable(gh, env_file))
@@ -367,7 +370,7 @@ def install_service(roots, state, repository, *, python=None, gh=None, interval=
                                       "WorkingDirectory": str(manifest.parent), "Umask": 0o077,
                                       "StandardOutPath": "/dev/null", "StandardErrorPath": "/dev/null"})
         config["unit_sha256"] = hashlib.sha256(payload).hexdigest()
-        changed = existing != config
+        changed = existing != config or network_changed
         _private_mkdir(state, parents=True, exist_ok=True)
         manifest_bytes = (json.dumps(config, ensure_ascii=True, indent=2) + "\n").encode("utf-8")
         if sys.platform == "win32":
@@ -510,17 +513,10 @@ def run_worker(config_path):
         os.environ.pop(key, None)
     env_file = _private_environment(config.get("environment_file"), subprocess.run)
     if env_file is not None:
-        with env_file.open(encoding="utf-8") as stream:
-            content = stream.read(LIMIT + 1)
-        if len(content) > LIMIT:
-            raise common.ServiceError("invalid_environment_file")
-        for line in content.splitlines():
-            if not line.strip() or line.lstrip().startswith("#"):
-                continue
-            key, equal, value = line.partition("=")
-            if not equal or key not in ENV_KEYS or any(ord(character) < 32 for character in value):
-                raise common.ServiceError("invalid_environment_file")
-            os.environ[key] = value
+        try:
+            os.environ.update(service_environment.read(env_file))
+        except ValueError:
+            raise common.ServiceError("invalid_environment_file") from None
     from .cli import main
     # JSONL and health are already bounded and owned by the worker. Avoid a
     # second unbounded console log or pythonw's absent standard streams.

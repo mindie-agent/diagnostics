@@ -331,10 +331,14 @@ def install_service(roots, state, repository, *, python=None, gh=None, interval=
             from .service_config import linux_worker_configuration
             old_argv, old_environment = linux_worker_configuration(existing[0])
             _check_reporter_binding(old_argv, old_environment, state, repository, reporting_config)
+            if environment_file is None:
+                environment_file = old_environment
         fixed_since = existing[1]["since"] if existing else _since(since)
         interpreter, version = _interpreter(runner, python)
         _check_loaded_owner(runner, path, allow_missing=True, creating=existing is None,
                             repair=existing is not None)
+        from .service_environment import prepare
+        environment_file, network_changed = prepare(path.parent, environment_file)
         environment_file = _environment_file(environment_file) if environment_file is not None else None
         gh_path = (str(_executable(gh)) if ensure and existing and environment_file is None
                    else _reporter_executable(gh, environment_file))
@@ -355,7 +359,7 @@ def install_service(roots, state, repository, *, python=None, gh=None, interval=
                 "StandardOutput=journal\nStandardError=journal\nSyslogIdentifier=mindie-diagnostics\n"
                 "LogRateLimitIntervalSec=30s\nLogRateLimitBurst=100\n"
                 "\n[Install]\nWantedBy=default.target\n")
-        changed = existing is None or existing[0] != text
+        changed = existing is None or existing[0] != text or network_changed
         state.mkdir(parents=True, exist_ok=True, mode=0o700)
         # Consent recheck after the native lock and blocking verifies, before
         # writing/enabling changed owned descriptions.

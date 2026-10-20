@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mindie-diagnostics"
 version = "0.5.0"
-description = "Bounded diagnostics, support bundles, and Ascend profiler analysis for MindIE owners"
+description = "Bounded structured diagnostics, local error codes, support bundles, and opt-in telemetry reporting for MindIE Agent"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []
@@ -15,16 +15,11 @@ test = ["pytest>=8,<10"]
 
 [project.scripts]
 mindie-diagnostics = "mindie_diagnostics.cli:main"
-mindie-profiler = "mindie_profiler.__main__:main"
-mindie-sim = "mindie_sim.__main__:main"
 
 [tool.setuptools.packages.find]
-include = ["mindie_diagnostics*", "mindie_profiler*", "mindie_sim*"]
+include = ["mindie_diagnostics*"]
 
 [tool.pytest.ini_options]
 markers = [
     "live_npu: standing A2/A3 Ascend NPU non-destructive live integration",
 ]
-
-[tool.setuptools.package-data]
-mindie_profiler = ["knowledge/*.json"]

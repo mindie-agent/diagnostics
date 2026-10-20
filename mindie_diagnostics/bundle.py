@@ -156,8 +156,8 @@ def _project(record, *, correlation=True):
             safe[key] = value
         elif key == "classification" and isinstance(value, str) and value in {"caller", "cancelled", "unknown"}:
             safe[key] = value
-        elif key in _LABELS and _label(value) is not None:
-            safe[key] = _label(value)
+        elif key in _LABELS and (label := _label(value)) is not None:
+            safe[key] = label
         elif key in _HASHES and isinstance(value, str) and re.fullmatch(r"[0-9a-f]{32,64}", value):
             safe[key] = value
         elif key == "stack_fingerprint" and isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value):

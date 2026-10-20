@@ -178,7 +178,7 @@ def test_partial_rank_scope_aligns_only_common_rank_ids(tmp_path):
     assert result["step_accounting"]["status"] == "comparable"
 
 
-def test_unknown_clock_is_not_comparable_even_when_both_say_unknown(tmp_path):
+def test_unknown_clock_keeps_duration_distributions_comparable(tmp_path):
     root = build_run(tmp_path)
     scene = {key: value for key, value in FULL_SCENE.items() if key != "clock_domain"}
     baseline = _report(root, scene=scene)
@@ -188,10 +188,15 @@ def test_unknown_clock_is_not_comparable_even_when_both_say_unknown(tmp_path):
 
     result = compare_profiles(baseline, candidate)
 
-    assert result["status"] == "not_comparable"
-    assert result["comparable"] is False
-    assert "clock_domain_unknown" in _reasons(result)
-    assert result["step_accounting"] is None
+    # A same-host/homogeneous-rank duration comparison does not need an
+    # absolute clock domain.  Clock domain only gates cross-machine timelines.
+    assert result["status"] == "comparable_with_limitations"
+    assert result["comparable"] is True
+    assert "clock_domain_unknown" in _codes(result)
+    assert "clock_domain_unknown" not in _reasons(result)
+    assert result["matching"]["clock_domain"]["duration_distribution_gate"] is False
+    assert result["step_accounting"]["metrics"]["wall_ms_p50"]["status"] == "compared"
+    assert result["step_accounting"]["metrics"]["observed_event_span_ms_p50"]["status"] == "compared"
 
 
 def test_missing_scene_facts_are_not_declared_a_match(tmp_path):
@@ -206,7 +211,7 @@ def test_missing_scene_facts_are_not_declared_a_match(tmp_path):
 
     assert result["status"] == "not_comparable"
     assert "scene_not_provided" in _reasons(result)
-    assert "clock_domain_unknown" in _reasons(result)
+    assert "clock_domain_unknown" not in _reasons(result)
     assert result["matching"]["scene"]["framework"]["status"] == "unavailable"
 
 
@@ -221,8 +226,11 @@ def test_scene_and_clock_mismatch_are_not_comparable(tmp_path):
     assert "scene_phase_mismatch" in _reasons(phase_result)
 
     clock_result = compare_profiles(baseline, clock)
-    assert clock_result["status"] == "not_comparable"
-    assert "clock_domain_mismatch" in _reasons(clock_result)
+    assert clock_result["status"] == "comparable_with_limitations"
+    assert clock_result["comparable"] is True
+    assert "clock_domain_mismatch" in _codes(clock_result)
+    assert "clock_domain_mismatch" not in _reasons(clock_result)
+    assert clock_result["step_accounting"]["metrics"]["wall_ms_p50"]["status"] == "compared"
 
 
 def test_input_identity_is_required_when_declared_and_unknown_when_absent(tmp_path):

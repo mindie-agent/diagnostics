@@ -8,8 +8,10 @@ measurements.  It never reads a DB, contacts a host, or re-runs a workload.
 
 [Invariants]
 - Both inputs must declare ``schema_version == mindie-profile-summary/1``.
-- Timing is compared only when scene facts, clock domain, rank scope, and
-  steady steps are compatible.  ``clock_domain == "unknown"`` is never a match.
+- Timing distributes (step/block/kernel p50) are compared per metric on one
+  host or homogeneous ranks even when ``clock_domain`` is unknown or differs.
+  ``clock_domain`` only gates cross-machine absolute timeline alignment and
+  ordering, never a duration-distribution comparison by itself.
 - Partial windows are re-aggregated only from the common real
   ``window_accounting`` rows; a declared p50 is not re-used for a different
   step/rank set.  Missing observations are reported, never imputed.
@@ -33,7 +35,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 from statistics import median
 from typing import Any, Iterable, Mapping
 
@@ -42,28 +43,28 @@ from .compare_acceptance import (
     classify_operator_sequence,
     compare_run_binding,
 )
+from .compare_metric import metric as _metric, num as _num
 
 SUMMARY_SCHEMA = "mindie-profile-summary/1"
 COMPARISON_SCHEMA = "mindie-profile-comparison/1"
 
 _ROW_METRICS = {
+    "observed_event_span_ms_p50": "observed_event_span_ms",
+    "device_busy_union_ms_p50": "device_busy_union_ms",
+    "device_activity_sum_ms_p50": "device_activity_sum_ms",
+    "exposed_comm_ms_p50": "exposed_comm_ms",
+    "device_uncovered_ms_p50": "device_uncovered_ms",
+    "total_cost_ms_p50": "total_cost_ms",
+    # Deprecated aliases remain comparable for older C7 reports.
     "wall_ms_p50": "wall_ms",
     "busy_union_ms_p50": "busy_union_ms",
     "kernel_sum_ms_p50": "kernel_sum_ms",
-    "exposed_comm_ms_p50": "exposed_comm_ms",
     "host_gap_ms_p50": "host_gap_ms",
-    "total_cost_ms_p50": "total_cost_ms",
 }
 _RATIO_METRICS = ("underfeed_bubble_ratio", "aicpu_exposed_ratio")
 _BLOCK_ORDER = ("Attention", "MoE", "Comm", "Norm", "Copy_Layout", "Unclassified", "Host_Gap")
 _REQUIRED_SCENE = ("framework", "phase")
 _OPTIONAL_SCENE = ("tp", "dp", "graph_mode")
-
-
-def _num(value: Any) -> float | None:
-    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value)):
-        return float(value)
-    return None
 
 
 def _int(value: Any) -> int | None:
@@ -207,6 +208,9 @@ def _source_content(summary: Mapping[str, Any]) -> dict[str, Any] | None:
         }
         if hashes:
             content["sources_sha256"] = hashes
+    fingerprints = identity.get("source_fingerprints")
+    if isinstance(fingerprints, Mapping) and fingerprints:
+        content["source_fingerprints"] = dict(fingerprints)
     return content or None
 
 
@@ -272,72 +276,6 @@ def _structural_reuse(baseline: Mapping[str, Any], candidate: Mapping[str, Any])
     result["status"] = "rejected" if reasons else "verified"
     result["allowed"] = not reasons
     return result
-
-
-def _cdf(k: int, n: int) -> float:
-    if k < 0:
-        return 0.0
-    if k >= n:
-        return 1.0
-    return sum(math.comb(n, i) for i in range(k + 1)) / (2**n)
-
-
-def _interval(values: list[float]) -> list[float] | None:
-    if len(values) < 6:
-        return None
-    ordered = sorted(values)
-    rank = 0
-    for candidate in range(1, len(ordered) // 2 + 1):
-        if _cdf(candidate - 1, len(ordered)) <= 0.025:
-            rank = candidate
-        else:
-            break
-    return [ordered[rank - 1], ordered[len(ordered) - rank]] if rank else None
-
-
-def _metric(unit: str, baseline: Any, candidate: Any,
-            b_values: list[float] | None = None, c_values: list[float] | None = None) -> dict[str, Any]:
-    b_value, c_value = _num(baseline), _num(candidate)
-    entry: dict[str, Any] = {
-        "unit": unit,
-        "status": "compared" if b_value is not None and c_value is not None else "not_comparable",
-        "baseline_p50": b_value,
-        "candidate_p50": c_value,
-        "delta": None,
-        "relative_delta_pct": None,
-        "direction": None,
-        "baseline_sample_count": len(b_values) if b_values else 0,
-        "candidate_sample_count": len(c_values) if c_values else 0,
-        "confidence_interval": None,
-    }
-    if unit == "ratio":
-        entry["delta_pp"] = None
-    if b_value is None or c_value is None:
-        entry["reason"] = "baseline_or_candidate_value_missing"
-        return entry
-    delta = c_value - b_value
-    entry["delta"] = delta
-    entry["direction"] = "increase" if delta > 0 else "decrease" if delta < 0 else "unchanged"
-    if unit == "ratio":
-        entry["delta_pp"] = delta * 100.0
-    if b_value != 0:
-        entry["relative_delta_pct"] = delta / abs(b_value) * 100.0
-    if b_values and c_values:
-        b_interval, c_interval = _interval(b_values), _interval(c_values)
-        if b_interval is not None and c_interval is not None:
-            entry["confidence_interval"] = {
-                "level": 0.95,
-                "method": "distribution_free_median_order_statistics",
-                "baseline": b_interval,
-                "candidate": c_interval,
-                "delta": None,
-                "delta_reason": "per_sample_differences_are_not_paired_by_step",
-            }
-        else:
-            entry["confidence_interval_reason"] = "fewer_than_6_per_sample_observations"
-    else:
-        entry["confidence_interval_reason"] = "per_sample_observations_unavailable"
-    return entry
 
 
 def _column_values(rows: Mapping[tuple[int, str], Mapping[str, Any]],
@@ -489,14 +427,47 @@ def compare_profiles(
         matching["scene"][field] = entry
 
     b_clock, c_clock = scene.get("clock_domain"), other_scene.get("clock_domain")
-    clock_entry = {"baseline": b_clock, "candidate": c_clock, "status": "match"}
-    if b_clock is None or c_clock is None or b_clock == "unknown" or c_clock == "unknown":
+    clock_entry = {
+        "baseline": b_clock,
+        "candidate": c_clock,
+        "status": "match",
+        "gates": ["cross_machine_timeline_alignment"],
+        "duration_distribution_gate": False,
+        "timeline_alignment_available": False,
+        "metric_policy": {
+            "duration_distributions": "compared_by_metric_without_clock_domain",
+            "absolute_timeline_alignment": "requires_equal_known_clock_domain",
+            "event_ordering": "requires_equal_known_clock_domain",
+        },
+        "basis": "clock_domain is required only for absolute cross-machine timelines/ordering",
+    }
+
+    def known_clock(value: Any) -> bool:
+        return value not in (None, "", "unknown")
+
+    if not known_clock(b_clock) or not known_clock(c_clock):
         clock_entry["status"] = "unknown"
-        hard.append(_lim("clock_domain_unknown", "clock_domain is unknown; timing is not comparable"))
+        limits.append(
+            _lim(
+                "clock_domain_unknown",
+                "clock_domain is unknown; duration distributions remain comparable, "
+                "but cross-machine timeline alignment is unavailable",
+                field="scene.clock_domain",
+            )
+        )
     elif b_clock != c_clock:
         clock_entry["status"] = "mismatch"
-        hard.append(_lim("clock_domain_mismatch", "clock_domain differs",
-                         details={"baseline": b_clock, "candidate": c_clock}))
+        limits.append(
+            _lim(
+                "clock_domain_mismatch",
+                "clock_domain differs; duration distributions remain comparable, "
+                "but cross-machine timeline alignment is unavailable",
+                field="scene.clock_domain",
+                details={"baseline": b_clock, "candidate": c_clock},
+            )
+        )
+    else:
+        clock_entry["timeline_alignment_available"] = True
     matching["clock_domain"] = clock_entry
 
     b_input, c_input = _input_identity(baseline), _input_identity(candidate)

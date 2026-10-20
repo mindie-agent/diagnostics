@@ -97,11 +97,12 @@ def _finding(
 
 
 def _explicit_task_type(event: Event) -> str | None:
-    if event.is_aicpu or event.bound_family == "aicpu_bound":
+    engine = str(getattr(event, "execution_engine", "") or "")
+    if event.is_aicpu or engine == "aicpu":
         return "AI_CPU"
-    if event.is_comm or event.bound_family == "comm_bound":
+    if event.is_comm or engine == "hccl":
         return "COMMUNICATION"
-    if event.bound_family in {"cube_bound", "vector_bound", "mix_bound"}:
+    if engine in {"aic", "aiv", "mix"}:
         return "AI_CORE"
     return event.task_type or event.core or None
 
@@ -262,6 +263,9 @@ def _evidence_scope(observation: Observation, core_events: Sequence[Event] | Non
     names = sorted({str(event.name) for event in events if event.name})
     devices = sorted({str(event.device_id) for event in events if event.device_id})
     bound_families = sorted({str(event.bound_family) for event in events if event.bound_family})
+    execution_engines = sorted(
+        {str(getattr(event, "execution_engine", "unknown") or "unknown") for event in events}
+    )
     return {
         "observation_id": observation.identity()["observation_id"],
         "rank_id": observation.rank_id,
@@ -282,6 +286,7 @@ def _evidence_scope(observation: Observation, core_events: Sequence[Event] | Non
         "kernel_names": names[:16],
         "device_ids": devices[:16],
         "bound_families": bound_families,
+        "execution_engines": execution_engines,
         "event_count": len(events),
         "aicpu_event_count": sum(1 for event in events if event.is_aicpu),
         "comm_event_count": sum(1 for event in events if event.is_comm),

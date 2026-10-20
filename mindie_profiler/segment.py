@@ -8,6 +8,9 @@
   * No step is inferred from kernel order, timestamps, or a CSV header.  A
     step exists only when the caller supplies ``STEP=START:END`` (or a steps
     file); an unlabelled window stays unlabelled.
+  * Multiple DB candidates in one rank directory are never resolved by newest
+    mtime.  The caller must pass an explicit DB, and ``inventory`` lists all
+    candidates instead.
   * Units are explicit at the CLI/API boundary and converted once to integer
     nanoseconds.  Report values are milliseconds.
   * Duplicate/ambiguous rank ids are rejected rather than silently paired.
@@ -32,6 +35,7 @@ from typing import Any, Iterable, Sequence
 from .events import ProfilerUsageError, Window
 
 _DB_GLOB = "ascend_pytorch_profiler*.db"
+_TRACE_GLOB = "trace_view*.json"
 _OUTPUT_DIR = "ASCEND_PROFILER_OUTPUT"
 _RANK_PATTERNS = (
     re.compile(r"(dp\d+_pp\d+_tp\d+_dcp\d+_ep\d+_rank\d+)", re.IGNORECASE),
@@ -51,6 +55,9 @@ class RankSource:
     csv_path: str | None
     kind: str | None
     notes: tuple[str, ...] = ()
+    db_candidates: tuple[str, ...] = ()
+    csv_candidates: tuple[str, ...] = ()
+    trace_candidates: tuple[str, ...] = ()
 
 
 def infer_rank_id(rank_dir: Path, ordinal: int = 0) -> str:
@@ -68,24 +75,53 @@ def infer_rank_index(rank_dir_text: str) -> int | None:
     return int(matches[-1]) if matches else None
 
 
-def _find_db(rank_dir: Path) -> tuple[Path | None, tuple[str, ...]]:
+def find_db_candidates(rank_dir: Path | str) -> list[Path]:
+    """Return every DB candidate in deterministic name order (never mtime)."""
+
+    base_dir = Path(rank_dir)
     found: list[Path] = []
-    for base in (rank_dir, rank_dir / _OUTPUT_DIR):
-        found.extend(base.glob(_DB_GLOB))
-    notes: list[str] = []
+    for base in (base_dir, base_dir / _OUTPUT_DIR):
+        if base.is_dir():
+            found.extend(base.glob(_DB_GLOB))
+    return sorted(set(found), key=lambda item: (str(item.parent), item.name))
+
+
+def find_csv_candidates(rank_dir: Path | str) -> list[Path]:
+    base_dir = Path(rank_dir)
+    found = [
+        candidate
+        for candidate in (
+            base_dir / "kernel_details.csv",
+            base_dir / _OUTPUT_DIR / "kernel_details.csv",
+        )
+        if candidate.is_file()
+    ]
+    return sorted(set(found), key=str)
+
+
+def find_trace_candidates(rank_dir: Path | str) -> list[Path]:
+    base_dir = Path(rank_dir)
+    found: list[Path] = []
+    for base in (base_dir, base_dir / _OUTPUT_DIR):
+        if base.is_dir():
+            found.extend(base.glob(_TRACE_GLOB))
+    return sorted(set(found), key=str)
+
+
+def _find_db(rank_dir: Path) -> tuple[Path | None, tuple[str, ...], tuple[Path, ...]]:
+    """Resolve a single DB only when it is unambiguous.
+
+    A rank directory with several DBs returns ``None`` plus the full candidate
+    list.  No mtime-based "newest" selection is performed.
+    """
+
+    found = find_db_candidates(rank_dir)
     if not found:
-        return None, ()
-    found = sorted(set(found), key=lambda item: (-item.stat().st_mtime, item.name))
+        return None, (), ()
     if len(found) > 1:
-        notes.append(f"{len(found)} profiler dbs in rank dir; using newest by mtime: {found[0].name}")
-    return found[0], tuple(notes)
-
-
-def _find_csv(rank_dir: Path) -> Path | None:
-    for candidate in (rank_dir / "kernel_details.csv", rank_dir / _OUTPUT_DIR / "kernel_details.csv"):
-        if candidate.is_file():
-            return candidate
-    return None
+        names = ", ".join(item.name for item in found)
+        return None, (f"{len(found)} profiler db candidates ({names}); pass one explicitly",), tuple(found)
+    return found[0], (), tuple(found)
 
 
 def _rank_dir_for_file(path: Path) -> Path:
@@ -103,13 +139,27 @@ def _source_for_dir(
 ) -> RankSource | None:
     rank_id = infer_rank_id(rank_dir, ordinal)
     rank_index = infer_rank_index(rank_dir.name)
-    db_path, notes = _find_db(rank_dir)
-    csv_path = _find_csv(rank_dir)
+    db_path, notes, db_candidates = _find_db(rank_dir)
+    csv_candidates = find_csv_candidates(rank_dir)
+    csv_path = csv_candidates[0] if len(csv_candidates) == 1 else None
+    trace_candidates = find_trace_candidates(rank_dir)
+    if len(csv_candidates) > 1:
+        notes = notes + (f"{len(csv_candidates)} kernel_details.csv candidates; pass one explicitly",)
     if explicit_file is not None:
         if explicit_file.suffix == ".db":
             db_path, csv_path = explicit_file, None
+            db_candidates = (explicit_file,)
+            csv_candidates = []
         else:
             csv_path, db_path = explicit_file, None
+            csv_candidates = [explicit_file]
+            db_candidates = ()
+    if db_path is None and len(db_candidates) > 1 and source in {"db", "auto"}:
+        names = ", ".join(item.name for item in db_candidates)
+        raise ProfilerUsageError(
+            f"rank {rank_id!r} has {len(db_candidates)} profiler db candidates ({names}); "
+            "pass an explicit .db path or run inventory to list them"
+        )
     if source == "db":
         kind = "db" if db_path else None
     elif source == "csv":
@@ -126,6 +176,9 @@ def _source_for_dir(
         csv_path=str(csv_path.resolve()) if csv_path else None,
         kind=kind,
         notes=notes,
+        db_candidates=tuple(str(item.resolve()) for item in db_candidates),
+        csv_candidates=tuple(str(item.resolve()) for item in csv_candidates),
+        trace_candidates=tuple(str(item.resolve()) for item in trace_candidates),
     )
 
 
@@ -149,9 +202,10 @@ def discover_rank_sources(
     root_path = root_path.resolve()
     if root_path.name == _OUTPUT_DIR:
         root_path = root_path.parent
-    own_db, _ = _find_db(root_path)
-    own_csv = _find_csv(root_path)
-    if own_db or own_csv:
+    own_db, _notes, own_db_candidates = _find_db(root_path)
+    own_csv_candidates = find_csv_candidates(root_path)
+    own_csv = own_csv_candidates[0] if len(own_csv_candidates) == 1 else None
+    if own_db or own_csv or own_db_candidates:
         item = _source_for_dir(root_path, ordinal=0, source=source)
         if item is None:
             raise ProfilerUsageError(f"no usable {source} source under {root_path}")

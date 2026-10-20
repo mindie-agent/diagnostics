@@ -456,13 +456,13 @@ def test_row_budget_is_enforced_not_truncated(tmp_path):
 
 def test_hash_schema_timing_and_event_locator_present(tmp_path):
     root = build_run(tmp_path)
-    report = analyze_profile(root, windows=[STEP4, STEP5])
+    report = analyze_profile(root, windows=[STEP4, STEP5], hash_sources=True)
     identity = report["source_identity"]
     db_path = root / RANK0_ID / "ASCEND_PROFILER_OUTPUT" / "ascend_pytorch_profiler_0.db"
     assert identity["db_files_sha256"][RANK0_ID] == hashlib.sha256(db_path.read_bytes()).hexdigest()
     assert identity["parser_version"] == PARSER_VERSION
     assert report["schema_version"] == "mindie-profile-summary/1"
-    assert identity["cache_state"] == "cold"
+    assert identity["cache_state"] == "path_size_mtime"
     assert identity["query_elapsed_ms"] >= 0
     assert any(item["phase"] == "sha256" for item in identity["query_timings"])
     assert any(item["phase"] == "read" for item in identity["query_timings"])

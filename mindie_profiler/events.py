@@ -29,7 +29,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-PARSER_VERSION = "mindie_profiler/0.0.3"
+PARSER_VERSION = "mindie_profiler/0.5.0"
 REPORT_SCHEMA = "mindie-profile-summary/1"
 
 
@@ -131,6 +131,9 @@ class Event:
     table: str
     block: str = "Unclassified"
     mapping_rule: str = "residual_unmapped"
+    execution_engine: str = "unknown"
+    # Deprecated: never derive this from ``execution_engine`` alone.  It stays
+    # ``unknown`` unless a measured PMU/wait/AICPU evidence fragment is bound.
     bound_family: str = "unknown"
     is_comm: bool = False
     is_aicpu: bool = False
@@ -201,6 +204,18 @@ class SourceRef:
     header_sha256: str | None = None
     optional_missing: tuple[str, ...] = ()
     notes: tuple[str, ...] = ()
+    mtime_ns: int | None = None
+
+    def content_identity(self) -> dict[str, Any]:
+        """Cheap cache identity used unless an explicit ``--hash`` is requested."""
+
+        return {
+            "path": self.path,
+            "size_bytes": self.size_bytes,
+            "mtime_ns": self.mtime_ns,
+            "schema_version": self.schema_version,
+            "sha256": self.sha256,
+        }
 
 
 @dataclass(slots=True)

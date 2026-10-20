@@ -1,16 +1,23 @@
 """Interval accounting for one explicit rank/window observation.
 
 [Role]
-  Compute wall, busy union, kernel sum, exposed communication, host/idle gap,
-  AICPU exposure, and per-block attributed busy time from classified events.
-  All arithmetic is integer-nanosecond interval math.
+  Compute the request wall time (when supplied), query-window duration,
+  observed device-event span, busy union, device activity sum, exposed
+  communication, uncovered device time, and per-block attributed busy time
+  from classified events.  All arithmetic is integer-nanosecond interval math.
 
 [Invariants]
-  * Overlapping device events are counted once in ``busy_union`` and once per
-    event in ``kernel_sum``; the two are deliberately not additive.
-  * ``wall`` is the observed event span (max end - min start), not the
-    caller's wider filter window.  ``host_gap = wall - busy_union`` is device
-    idle time, not a measured host dispatch latency.
+  * Overlapping device events are counted once in ``busy_union_ns`` and once
+    per event in ``device_activity_sum_ns``; the two are deliberately not
+    additive.
+  * ``observed_event_span_ns`` is ``max(end) - min(start)`` of clipped events,
+    not the caller's wider query window.  ``window_duration_ns`` is the query
+    window and ``request_wall_ns`` is an externally measured value only.
+  * ``device_uncovered_ns = observed_event_span_ns - busy_union_ns`` is device
+    idle time, never a host-dispatch measurement.  ``host_dispatch_gap_ns`` is
+    populated only from an explicit Host/Runtime correlation argument.
+  * Clipped events stay in busy union and activity sum but are excluded from
+    per-call P50/P90/Max distributions and counted in ``clipped_event_count``.
   * Exposed communication is comm-union minus non-comm-union; fused MoE
     communication is non-comm by classification and therefore not exposed.
   * Empty windows return ``available=False`` and None metrics, never zeros.
@@ -30,6 +37,7 @@ from typing import Sequence
 from .classify import ALL_BLOCKS, EVENT_BLOCKS
 
 Interval = tuple[int, int]
+_VARIANT_UNKNOWN = ""
 
 
 def merge_intervals(intervals: Sequence[Interval]) -> list[Interval]:
@@ -92,6 +100,18 @@ def _gaps(merged: Sequence[Interval]) -> list[int]:
     ]
 
 
+def percentile(values: Sequence[int | float | None], fraction: float) -> float | None:
+    """Nearest-rank percentile over non-None values; None when empty."""
+
+    clean = sorted(float(value) for value in values if value is not None)
+    if not clean:
+        return None
+    if fraction <= 0:
+        return clean[0]
+    index = max(0, min(len(clean) - 1, int(round(fraction * (len(clean) - 1)))))
+    return clean[index]
+
+
 @dataclass(slots=True)
 class Accounting:
     available: bool
@@ -100,11 +120,15 @@ class Accounting:
     aicpu_event_count: int
     stream_count: int
     window_span_ns: int
-    wall_ns: int | None = None
+    complete_event_count: int = 0
+    clipped_event_count: int = 0
+    request_wall_ns: int | None = None
+    observed_event_span_ns: int | None = None
     busy_union_ns: int | None = None
-    kernel_sum_ns: int | None = None
+    device_activity_sum_ns: int | None = None
     exposed_comm_ns: int | None = None
-    host_gap_ns: int | None = None
+    device_uncovered_ns: int | None = None
+    host_dispatch_gap_ns: int | None = None
     total_cost_ns: int | None = None
     exposed_aicpu_ns: int | None = None
     underfeed_ratio: float | None = None
@@ -119,13 +143,46 @@ class Accounting:
     first_event_ns: int | None = None
     last_event_ns: int | None = None
 
+    # Deprecated aliases retained for one release so older consumers can be
+    # migrated without changing measured values.
+    @property
+    def wall_ns(self) -> int | None:
+        return self.observed_event_span_ns
+
+    @property
+    def host_gap_ns(self) -> int | None:
+        return self.device_uncovered_ns
+
+    @property
+    def window_duration_ns(self) -> int:
+        return self.window_span_ns
+
+    @property
+    def device_busy_union_ns(self) -> int | None:
+        return self.busy_union_ns
+
+    @property
+    def kernel_sum_ns(self) -> int | None:
+        return self.device_activity_sum_ns
+
     def metric_ms(self, name: str) -> float | None:
         value = getattr(self, f"{name}_ns")
         return None if value is None else round(value / 1_000_000.0, 6)
 
 
-def account_window(events: Sequence, window) -> Accounting:
-    """Account one explicit window over already-classified events."""
+def account_window(
+    events: Sequence,
+    window,
+    *,
+    request_wall_ns: int | None = None,
+    host_dispatch_gap_ns: int | None = None,
+) -> Accounting:
+    """Account one explicit window over already-classified events.
+
+    ``request_wall_ns`` must come from an external client/server measurement.
+    ``host_dispatch_gap_ns`` must come from an actual Host/Runtime correlation;
+    neither is inferred from device gaps here.
+    """
 
     all_intervals: list[Interval] = []
     comm_intervals: list[Interval] = []
@@ -136,12 +193,14 @@ def account_window(events: Sequence, window) -> Accounting:
     block_duration: dict[str, int] = {block: 0 for block in EVENT_BLOCKS}
     block_events: dict[str, int] = {block: 0 for block in EVENT_BLOCKS}
     event_count = 0
+    complete_count = 0
+    clipped_count = 0
     comm_events = 0
     aicpu_events = 0
     streams: set[str] = set()
     first_ns: int | None = None
     last_ns: int | None = None
-    kernel_sum_ns = 0
+    activity_sum_ns = 0
 
     for event in events:
         clipped = event.clipped(window.start_ns, window.end_ns)
@@ -150,7 +209,7 @@ def account_window(events: Sequence, window) -> Accounting:
         left, right = clipped
         duration = right - left
         event_count += 1
-        kernel_sum_ns += duration
+        activity_sum_ns += duration
         all_intervals.append((left, right))
         streams.add(str(event.stream_id))
         first_ns = left if first_ns is None else min(first_ns, left)
@@ -159,6 +218,10 @@ def account_window(events: Sequence, window) -> Accounting:
         block_intervals[block].append((left, right))
         block_duration[block] += duration
         block_events[block] += 1
+        if event.complete_in(window.start_ns, window.end_ns):
+            complete_count += 1
+        else:
+            clipped_count += 1
         if event.is_comm:
             comm_events += 1
             comm_intervals.append((left, right))
@@ -173,10 +236,14 @@ def account_window(events: Sequence, window) -> Accounting:
     base = Accounting(
         available=bool(event_count),
         event_count=event_count,
+        complete_event_count=complete_count,
+        clipped_event_count=clipped_count,
         comm_event_count=comm_events,
         aicpu_event_count=aicpu_events,
         stream_count=len(streams),
         window_span_ns=window.span_ns,
+        request_wall_ns=request_wall_ns,
+        host_dispatch_gap_ns=host_dispatch_gap_ns,
         block_union_ns={block: 0 for block in ALL_BLOCKS},
         block_duration_ns={block: 0 for block in ALL_BLOCKS},
         block_event_count={block: 0 for block in EVENT_BLOCKS},
@@ -186,8 +253,8 @@ def account_window(events: Sequence, window) -> Accounting:
         return base
 
     busy_union_ns = union_length(all_intervals)
-    wall_ns = max(0, last_ns - first_ns)
-    host_gap_ns = max(0, wall_ns - busy_union_ns)
+    observed_span_ns = max(0, last_ns - first_ns)
+    uncovered_ns = max(0, observed_span_ns - busy_union_ns)
     exposed_comm_ns = subtract_length(comm_intervals, noncomm_intervals)
     exposed_aicpu_ns = subtract_length(aicpu_intervals, non_aicpu_intervals)
     merged = merge_intervals(all_intervals)
@@ -204,19 +271,25 @@ def account_window(events: Sequence, window) -> Accounting:
         base.block_share_pct[block] = (
             round(100.0 * value / attributed, 6) if attributed > 0 else None
         )
-    base.block_union_ns["Host_Gap"] = host_gap_ns
-    base.block_duration_ns["Host_Gap"] = host_gap_ns
+    base.block_union_ns["Host_Gap"] = uncovered_ns
+    base.block_duration_ns["Host_Gap"] = uncovered_ns
     base.block_share_pct["Host_Gap"] = None
-    base.wall_ns = wall_ns
+    base.observed_event_span_ns = observed_span_ns
     base.busy_union_ns = busy_union_ns
-    base.kernel_sum_ns = kernel_sum_ns
+    base.device_activity_sum_ns = activity_sum_ns
     base.exposed_comm_ns = exposed_comm_ns
-    base.host_gap_ns = host_gap_ns
-    base.total_cost_ns = kernel_sum_ns + host_gap_ns
+    base.device_uncovered_ns = uncovered_ns
+    base.total_cost_ns = activity_sum_ns + uncovered_ns
     base.exposed_aicpu_ns = exposed_aicpu_ns
-    base.underfeed_ratio = round(host_gap_ns / wall_ns, 6) if wall_ns > 0 else None
-    base.aicpu_exposed_ratio = round(exposed_aicpu_ns / wall_ns, 6) if wall_ns > 0 else None
-    base.coverage_ratio = round(wall_ns / window.span_ns, 6) if window.span_ns > 0 else None
+    base.underfeed_ratio = (
+        round(uncovered_ns / observed_span_ns, 6) if observed_span_ns > 0 else None
+    )
+    base.aicpu_exposed_ratio = (
+        round(exposed_aicpu_ns / observed_span_ns, 6) if observed_span_ns > 0 else None
+    )
+    base.coverage_ratio = (
+        round(observed_span_ns / window.span_ns, 6) if window.span_ns > 0 else None
+    )
     base.largest_internal_bubble_ns = max(gaps) if gaps else 0
     base.internal_bubble_total_ns = sum(gaps)
     base.first_event_ns = first_ns
@@ -224,43 +297,66 @@ def account_window(events: Sequence, window) -> Accounting:
     return base
 
 
-def hotspot_aggregates(events: Sequence, window=None) -> list[dict]:
-    """Group classified events by (rank, block, name) for hotspot reporting.
+def variant_key(event) -> tuple[str, str, str, str, str, str]:
+    """Default hotspot identity: rank, block, kernel name, and input variant."""
 
-    When ``window`` is supplied, occurrence durations are clipped to it so the
-    hotspot sum stays consistent with the window's ``kernel_sum``.
+    return (
+        str(event.rank_id),
+        str(event.block),
+        str(event.name or "<missing>"),
+        str(event.input_shapes or _VARIANT_UNKNOWN),
+        str(event.input_dtypes or _VARIANT_UNKNOWN),
+        str(event.input_formats or _VARIANT_UNKNOWN),
+    )
+
+
+def hotspot_aggregates(events: Sequence, window=None) -> list[dict]:
+    """Group classified events by the six-field variant key.
+
+    Clipped occurrences contribute their clipped duration to ``duration_ns``
+    and ``call_count`` but never enter ``durations`` (the per-call P50/P90/Max
+    population); they are counted separately in ``clipped_event_count``.
     """
 
-    groups: dict[tuple[str, str, str], dict] = {}
+    groups: dict[tuple[str, str, str, str, str, str], dict] = {}
     for event in events:
         if window is not None:
             clipped = event.clipped(window.start_ns, window.end_ns)
             if clipped is None:
                 continue
             duration = clipped[1] - clipped[0]
+            complete = event.complete_in(window.start_ns, window.end_ns)
         else:
             duration = event.duration_ns
-        key = (event.rank_id, event.block, event.name or "<missing>")
+            complete = True
+        key = variant_key(event)
         row = groups.get(key)
         if row is None:
             row = {
                 "rank_id": event.rank_id,
                 "semantic_block": event.block,
                 "kernel_name": event.name or "<missing>",
-                "duration_ns": 0,
-                "count": 0,
-                "durations": [],
-                "bound_family": event.bound_family,
-                "op_type": event.op_type,
                 "input_shapes": event.input_shapes,
                 "input_dtypes": event.input_dtypes,
                 "input_formats": event.input_formats,
+                "duration_ns": 0,
+                "count": 0,
+                "durations": [],
+                "clipped_event_count": 0,
+                "execution_engines": set(),
+                "bound_families": set(),
+                "op_type": event.op_type,
                 "locators": [],
             }
             groups[key] = row
         row["duration_ns"] += duration
         row["count"] += 1
-        row["durations"].append(duration)
+        if complete:
+            row["durations"].append(duration)
+        else:
+            row["clipped_event_count"] += 1
+        row["execution_engines"].add(event.execution_engine or "unknown")
+        row["bound_families"].add(event.bound_family or "unknown")
         if len(row["locators"]) < 16:
             row["locators"].append(event.locator)
     return list(groups.values())

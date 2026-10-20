@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 from .analyze import analyze_profile
+from .correlate import correlate_profile
 from .events import (
     PARSER_VERSION,
     REPORT_SCHEMA,
@@ -34,13 +35,19 @@ from .events import (
     SourceRef,
     Window,
 )
+from .inventory import inventory_profile
 from .segment import (
     discover_rank_sources,
+    find_csv_candidates,
+    find_db_candidates,
+    find_trace_candidates,
     load_steps_file,
     parse_step_windows,
     parse_windows,
     resolve_ranks,
 )
+from .sources_trace import build_trace_index, iter_trace_events
+from .sql import run_sql
 
 __version__ = "0.5.0"
 analyze = analyze_profile
@@ -57,10 +64,18 @@ __all__ = [
     "Window",
     "analyze",
     "analyze_profile",
+    "build_trace_index",
+    "correlate_profile",
     "discover_rank_sources",
+    "find_csv_candidates",
+    "find_db_candidates",
+    "find_trace_candidates",
+    "inventory_profile",
+    "iter_trace_events",
     "load_steps_file",
     "parse_step_windows",
     "parse_windows",
     "resolve_ranks",
+    "run_sql",
     "__version__",
 ]

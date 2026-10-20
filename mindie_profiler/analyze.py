@@ -10,8 +10,9 @@
   * A request without an explicit window/full-range is rejected; step ids are
     never inferred.
   * DB schema errors are surfaced, not bypassed with a CSV fallback.
-  * Every read is bounded by rows and wall time; hash/schema/query timings are
-    recorded in the report.
+  * Every read is bounded by rows and wall time; schema/query timings are
+    recorded.  Content SHA256 is opt-in (``hash_sources=False`` by default);
+    the default identity is path+size_bytes+mtime_ns+schema_version.
   * Empty/incomplete windows produce limitations and ``None`` metrics, never
     fabricated zeros or conclusions.
 
@@ -26,6 +27,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -66,6 +68,13 @@ def _normalize_windows(windows: Iterable[Window] | None) -> list[Window]:
     return rows
 
 
+def _mtime_ns(path: str) -> int | None:
+    try:
+        return int(Path(path).stat().st_mtime_ns)
+    except OSError:
+        return None
+
+
 def _source_ref(
     item: RankSource,
     *,
@@ -92,6 +101,7 @@ def _source_ref(
         header_sha256=header_sha256,
         optional_missing=tuple(optional_missing),
         notes=item.notes,
+        mtime_ns=_mtime_ns(path),
     )
 
 
@@ -104,6 +114,7 @@ def _observations_for_rank(
     max_rows: int,
     query_timeout_s: float,
     csv_timeout_s: float,
+    request_wall_ns: int | None,
     limitations: list[dict],
     query_timings: list[dict],
     schema_rows: list[dict],
@@ -119,7 +130,13 @@ def _observations_for_rank(
         {"rank_id": rank_id, "phase": "sha256", "elapsed_ms": hash_ms, "enabled": bool(hash_sources)}
     )
     if not hash_sources:
-        _add(limitations, "sha256_disabled", rank_id, "sha256 hashing was disabled; source identity is incomplete", "high")
+        _add(
+            limitations,
+            "sha256_disabled",
+            rank_id,
+            "content sha256 was not requested; identity uses path+size_bytes+mtime_ns+schema_version",
+            "low",
+        )
 
     if item.kind == "db":
         probe_started = time.perf_counter()
@@ -155,7 +172,7 @@ def _observations_for_rank(
                 event.rank_id = rank_id
                 event.rank_index = item.rank_index
             classify_events(events)
-            accounting = account_window(events, window)
+            accounting = account_window(events, window, request_wall_ns=request_wall_ns)
             stats.rank_id = rank_id
             stats.window_label = window.label or str(window.step)
             observations.append(
@@ -259,7 +276,7 @@ def _observations_for_rank(
     for index, window in enumerate(query_windows):
         events = query_events.get(index, [])
         classify_events(events)
-        accounting = account_window(events, window)
+        accounting = account_window(events, window, request_wall_ns=request_wall_ns)
         stats = query_stats.get(index)
         if stats is None:
             stats = QueryStats(rank_id=rank_id, window_label=window.label or str(window.step), budget=max_rows)
@@ -325,10 +342,12 @@ def analyze_profile(
     full_range: bool = False,
     source: str = "auto",
     top_n: int = 8,
-    hash_sources: bool = True,
+    hash_sources: bool = False,
     max_rows: int = 1_000_000,
     query_timeout_s: float = 20.0,
     csv_timeout_s: float = 30.0,
+    group_by: str = "variant",
+    request_wall_ms: float | None = None,
     scene: dict[str, Any] | None = None,
     model_provider: Any | None = None,
     model_inputs: Any | None = None,
@@ -354,6 +373,17 @@ def analyze_profile(
         raise ProfilerUsageError("top_n must be positive")
     if max_rows <= 0:
         raise ProfilerUsageError("max_rows must be positive")
+    if group_by not in {"variant", "kernel"}:
+        raise ProfilerUsageError("group_by must be 'variant' or 'kernel'")
+    request_wall_ns: int | None = None
+    if request_wall_ms is not None:
+        if (
+            not isinstance(request_wall_ms, (int, float))
+            or not math.isfinite(float(request_wall_ms))
+            or request_wall_ms < 0
+        ):
+            raise ProfilerUsageError("request_wall_ms must be a finite non-negative number")
+        request_wall_ns = int(round(float(request_wall_ms) * 1_000_000))
     selected_windows = _normalize_windows(windows)
     validate_selection(selected_windows, full_range=full_range)
     requested_steps = sorted({window.step for window in selected_windows if window.step is not None})
@@ -398,6 +428,7 @@ def analyze_profile(
             max_rows=max_rows,
             query_timeout_s=max(0.1, query_timeout_s),
             csv_timeout_s=max(0.1, csv_timeout_s),
+            request_wall_ns=request_wall_ns,
             limitations=limitations,
             query_timings=query_timings,
             schema_rows=schema_rows,
@@ -420,7 +451,7 @@ def analyze_profile(
                     "partial_window_coverage",
                     f"{item.rank_id}:{observation.window.label or observation.window.step}",
                     f"Observed event span covers {accounting.coverage_ratio:.1%} of the requested window; "
-                    "head/tail idle outside the span is not included in wall/host_gap.",
+                    "head/tail idle outside the span is not included in observed_event_span/device_uncovered.",
                     "medium",
                 )
 
@@ -463,6 +494,7 @@ def analyze_profile(
         schema_rows=schema_rows,
         output_path=str(output) if output is not None else None,
         top_n=top_n,
+        group_by=group_by,
     )
     report = enrich_report(
         report,

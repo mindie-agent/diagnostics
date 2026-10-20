@@ -1,13 +1,17 @@
-"""Deterministic semantic-block classification for device events.
+"""Deterministic semantic-block and execution-engine classification.
 
 [Role]
   Map every kernel/communication event to exactly one of the six event
-  blocks (Attention, MoE, Comm, Norm, Copy_Layout, Unclassified).  Host_Gap
-  is not an event block; accounting derives it from wall minus busy union.
+  blocks (Attention, MoE, Comm, Norm, Copy_Layout, Unclassified) and to a
+  separate execution engine (aic / aiv / mix / aicpu / hccl / host).  The
+  engine is a hardware execution fact, never a resource-bottleneck verdict.
 
 [Invariants]
   * Classification is pure and order-independent; every event receives a
-    block and a human-readable mapping rule.
+    block, an engine, and a human-readable mapping rule.
+  * ``execution_engine`` and ``bound_family`` are orthogonal.  ``bound_family``
+    stays ``unknown`` unless a caller later binds measured PMU/wait evidence;
+    an AIC/AIV engine string alone never becomes ``cube_bound``/``vector_bound``.
   * Fused MoE communication kernels are MoE, not Comm, so their AIV work is
     not counted twice as exposed communication.
   * A missing/blank name is Unclassified, never a fabricated category.
@@ -35,6 +39,7 @@ EVENT_BLOCKS: tuple[str, ...] = (
     "Unclassified",
 )
 ALL_BLOCKS: tuple[str, ...] = EVENT_BLOCKS + ("Host_Gap",)
+EXECUTION_ENGINES: tuple[str, ...] = ("aic", "aiv", "mix", "aicpu", "hccl", "host", "unknown")
 MAPPING_RULES = {
     "Attention": "op_name_prefix+layer_scope",
     "MoE": "grouped_matmul+dispatch_combine",
@@ -81,6 +86,7 @@ def fold_text(value: str | None) -> str:
 class Classification:
     block: str
     mapping_rule: str
+    execution_engine: str
     bound_family: str
     is_comm: bool
     is_aicpu: bool
@@ -90,18 +96,34 @@ def _contains(text: str, tokens: tuple[str, ...]) -> bool:
     return any(token in text for token in tokens)
 
 
-def _bound_family(text: str, core: str) -> str:
-    folded_core = fold_text(core)
-    if "communication" in folded_core or "hccl" in folded_core:
-        return "comm_bound"
-    if "aicpu" in folded_core or "aicpu" in text or "ai_cpu" in folded_core:
-        return "aicpu_bound"
-    if "mix" in folded_core:
-        return "mix_bound"
-    if "vector" in folded_core or "aiv" in folded_core:
-        return "vector_bound"
+def _execution_engine(
+    *,
+    folded_core: str,
+    folded_task_type: str,
+    table: str,
+    is_comm: bool,
+    is_aicpu: bool,
+) -> str:
+    """Return the measured execution engine, independent of bottleneck evidence."""
+
+    if table in {"PYTORCH_API", "CANN_API", "MSTX_EVENTS"}:
+        return "host"
+    if is_comm or "communication" in folded_core or "hccl" in folded_core:
+        return "hccl"
+    if is_aicpu or "aicpu" in folded_core or "ai_cpu" in folded_core or "aicpu" in folded_task_type:
+        return "aicpu"
+    if "mix" in folded_core or "mix" in folded_task_type:
+        return "mix"
+    if "vector" in folded_core or "aiv" in folded_core or "vector" in folded_task_type:
+        return "aiv"
     if "core" in folded_core or "cube" in folded_core or "aic" in folded_core:
-        return "cube_bound"
+        return "aic"
+    if "aic" in folded_task_type or "cube" in folded_task_type:
+        return "aic"
+    if "aiv" in folded_task_type or "vector" in folded_task_type:
+        return "aiv"
+    if "mix" in folded_task_type:
+        return "mix"
     return "unknown"
 
 
@@ -117,6 +139,7 @@ def classify_event(
 
     text = fold_text(" ".join((name, op_type, task_type, core)))
     folded_core = fold_text(core)
+    folded_task_type = fold_text(task_type)
     is_aicpu = "aicpu" in text or "ai_cpu" in folded_core
     is_comm_source = (
         table == "COMMUNICATION_OP"
@@ -151,7 +174,15 @@ def classify_event(
     return Classification(
         block=block,
         mapping_rule=rule,
-        bound_family=_bound_family(text, core),
+        execution_engine=_execution_engine(
+            folded_core=folded_core,
+            folded_task_type=folded_task_type,
+            table=table,
+            is_comm=is_comm,
+            is_aicpu=is_aicpu,
+        ),
+        # No PMU/wait/AICPU evidence is available at classification time.
+        bound_family="unknown",
         is_comm=is_comm,
         is_aicpu=is_aicpu,
     )
@@ -170,6 +201,7 @@ def apply(events: list) -> None:
         )
         event.block = result.block
         event.mapping_rule = result.mapping_rule
+        event.execution_engine = result.execution_engine
         event.bound_family = result.bound_family
         event.is_comm = result.is_comm
         event.is_aicpu = result.is_aicpu

@@ -35,7 +35,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
-from .accounting import hotspot_aggregates
+from .accounting import hotspot_aggregates, percentile
 from .classify import ALL_BLOCKS, MAPPING_RULES
 from .cross_rank import aggregate_observations, cross_rank_stats, p50
 from .events import Observation, PARSER_VERSION, REPORT_SCHEMA, SourceRef
@@ -71,14 +71,22 @@ def _schema_version(sources: Sequence[SourceRef]) -> str | dict[str, str]:
 
 def _metric_definitions() -> dict[str, str]:
     return {
-        "wall_ms": "observed event span (max end - min start) inside the explicit window; overlap-free",
-        "busy_union_ms": "length of the union of clipped device event intervals; overlapping events counted once",
-        "kernel_sum_ms": "sum of clipped device event durations; overlapping events counted per event, so it can exceed wall",
+        "request_wall_ms": "external client/server request duration; None unless explicitly supplied",
+        "window_duration_ms": "query window length (window.end_ns - window.start_ns), not a request duration",
+        "observed_event_span_ms": "max clipped event end - min clipped event start inside the explicit window",
+        "device_busy_union_ms": "length of the union of clipped device event intervals; overlapping events counted once",
+        "device_activity_sum_ms": "sum of clipped device event durations; overlapping events counted per event",
         "exposed_comm_ms": "communication union minus non-communication union; fused MoE communication is not exposed",
-        "host_gap_ms": "wall minus busy_union; device idle/underfeed proxy, not a measured host dispatch trace",
-        "total_cost_ms": "kernel_sum + host_gap; not an end-to-end wall and not additive with exposed_comm",
-        "underfeed_bubble_ratio": "host_gap / wall",
+        "device_uncovered_ms": "observed_event_span minus device_busy_union; device idle, not a host-dispatch measurement",
+        "host_dispatch_gap_ms": "measured Host/Runtime to device launch gap; None without correlate evidence",
+        "total_cost_ms": "device_activity_sum + device_uncovered; not an end-to-end wall and not additive with exposed_comm",
+        "clipped_event_count": "events crossed by a window boundary; kept in activity sums but excluded from per-call P50/P90/Max",
+        "underfeed_bubble_ratio": "device_uncovered / observed_event_span",
         "block_union_ms": "per-block union of clipped events; shares are normalised over the sum of block unions",
+        "wall_ms": "deprecated alias for observed_event_span_ms",
+        "busy_union_ms": "deprecated alias for device_busy_union_ms",
+        "kernel_sum_ms": "deprecated alias for device_activity_sum_ms",
+        "host_gap_ms": "deprecated alias for device_uncovered_ms",
         "steady_steps": "only explicitly supplied steps; kernel details have no step-id column",
         "window_start_us/window_end_us": "offsets from window_origin_ns; exact bounds remain integer window_start_ns/window_end_ns",
     }
@@ -97,13 +105,46 @@ def _filter_sql(locator: dict[str, Any], task_ids: Sequence[int], row_indices: S
     return f"kernel_details.csv WHERE row_index IN ({_id_list(row_indices)})"
 
 
-def _hotspots(observations: Sequence[Observation], sources: dict[str, SourceRef], top_n: int) -> list[dict]:
-    grouped: dict[tuple[str, str, str], dict] = {}
+def _hotspot_key(row: dict, group_by: str) -> tuple:
+    if group_by == "kernel":
+        return (row["rank_id"], row["semantic_block"], row["kernel_name"])
+    return (
+        row["rank_id"],
+        row["semantic_block"],
+        row["kernel_name"],
+        row.get("input_shapes", ""),
+        row.get("input_dtypes", ""),
+        row.get("input_formats", ""),
+    )
+
+
+def _execution_engine(row: dict) -> str | None:
+    engines = sorted(str(item) for item in row.get("execution_engines", ()) if item)
+    if not engines:
+        return None
+    return engines[0] if len(engines) == 1 else "mixed"
+
+
+def _bound_family(row: dict) -> str:
+    families = sorted(str(item) for item in row.get("bound_families", ()) if item and item != "unknown")
+    return families[0] if len(families) == 1 else "unknown"
+
+
+def _hotspots(
+    observations: Sequence[Observation],
+    sources: dict[str, SourceRef],
+    top_n: int,
+    *,
+    group_by: str = "variant",
+) -> list[dict]:
+    if group_by not in {"variant", "kernel"}:
+        raise ValueError(f"group_by must be variant or kernel, got {group_by!r}")
+    grouped: dict[tuple, dict] = {}
     total_duration = 0
     for observation in observations:
         if not observation.accounting.available:
             continue
-        total_duration += observation.accounting.kernel_sum_ns or 0
+        total_duration += observation.accounting.device_activity_sum_ns or 0
         identity_by_locator = {id(event.locator): event.identity() for event in observation.events}
         for row in hotspot_aggregates(observation.events, observation.window):
             enriched_locators = []
@@ -111,22 +152,33 @@ def _hotspots(observations: Sequence[Observation], sources: dict[str, SourceRef]
                 identity = identity_by_locator.get(id(locator)) or {}
                 enriched_locators.append({**locator, "event_id": identity.get("event_id")})
             row["locators"] = enriched_locators
-            key = (row["rank_id"], row["semantic_block"], row["kernel_name"])
+            key = _hotspot_key(row, group_by)
             current = grouped.get(key)
             if current is None:
                 current = {
                     **row,
                     "durations": list(row["durations"]),
                     "locators": list(row["locators"]),
+                    "execution_engines": set(row.get("execution_engines", ())),
+                    "bound_families": set(row.get("bound_families", ())),
                     "last_observation": observation,
                     "window_labels": [observation.window.label or str(observation.window.step)],
                     "window_bounds_ns": [[observation.window.start_ns, observation.window.end_ns]],
+                    "variant_inputs": {
+                        (row.get("input_shapes", ""), row.get("input_dtypes", ""), row.get("input_formats", ""))
+                    },
                 }
                 grouped[key] = current
             else:
                 current["duration_ns"] += row["duration_ns"]
                 current["count"] += row["count"]
+                current["clipped_event_count"] += row["clipped_event_count"]
                 current["durations"].extend(row["durations"])
+                current["execution_engines"].update(row.get("execution_engines", ()))
+                current["bound_families"].update(row.get("bound_families", ()))
+                current["variant_inputs"].add(
+                    (row.get("input_shapes", ""), row.get("input_dtypes", ""), row.get("input_formats", ""))
+                )
                 if len(current["locators"]) < 16:
                     current["locators"].extend(row["locators"][: 16 - len(current["locators"])])
                 label = observation.window.label or str(observation.window.step)
@@ -186,12 +238,23 @@ def _hotspots(observations: Sequence[Observation], sources: dict[str, SourceRef]
             "rank_id": row["rank_id"],
             "source_sha256": source.sha256 if source else None,
         }
-        has_shape = bool(row.get("input_shapes"))
+        variant_inputs = sorted(row.get("variant_inputs", ()))
+        variant_count = len(variant_inputs) if group_by == "kernel" else 1
+        if group_by == "kernel" and variant_count > 1:
+            input_shapes = None
+            input_dtypes = None
+            input_formats = None
+        else:
+            input_shapes = row.get("input_shapes") or None
+            input_dtypes = row.get("input_dtypes") or None
+            input_formats = row.get("input_formats") or None
+        has_shape = bool(input_shapes)
         reason = (
             "model provider/inputs not configured; no ideal lower bound or prediction was requested"
             if has_shape
             else "missing input shape/dtype/layout and no model provider configured"
         )
+        durations = row["durations"]
         rows.append(
             {
                 "rank": observation.rank_index if observation.rank_index is not None else row["rank_id"],
@@ -199,15 +262,30 @@ def _hotspots(observations: Sequence[Observation], sources: dict[str, SourceRef]
                 "rank_index": observation.rank_index,
                 "semantic_block": row["semantic_block"],
                 "kernel_name": row["kernel_name"],
-                "measured_device_ms_p50": p50(_ms(value) for value in row["durations"]),
+                "input_shapes": input_shapes,
+                "input_dtypes": input_dtypes,
+                "input_formats": input_formats,
+                "variant_count": variant_count,
+                "variant_inputs": [
+                    {"input_shapes": shapes, "input_dtypes": dtypes, "input_formats": formats}
+                    for shapes, dtypes, formats in variant_inputs
+                ] if group_by == "kernel" else [],
+                "group_by": group_by,
+                "execution_engine": _execution_engine(row),
+                "bound_family": _bound_family(row),
+                "measured_device_ms_p50": p50(_ms(value) for value in durations),
+                "measured_device_ms_p90": _ms(percentile(durations, 0.9)),
+                "measured_device_ms_max": _ms(max(durations) if durations else None),
                 "measured_device_ms_total": _ms(row["duration_ns"]),
                 "share_of_busy_pct": (
                     round(100.0 * row["duration_ns"] / total_duration, 6) if total_duration > 0 else None
                 ),
-                "share_basis": "sum of clipped event durations / kernel_sum",
+                "share_basis": "sum of clipped event durations / device_activity_sum",
                 "representative_window": observation.window.label or str(observation.window.step),
                 "call_count": row["count"],
-                "bound_family": row["bound_family"],
+                "complete_call_count": len(durations),
+                "clipped_event_count": row["clipped_event_count"],
+                "distribution_basis": "complete_in_window_events_only",
                 "modeling_alignment": {
                     "status": "unmodeled",
                     "ideal_hardware_lower_bound_ms": None,
@@ -244,14 +322,24 @@ def _window_accounting(observations: Sequence[Observation]) -> list[dict]:
                 "window_start_us": 0.0,
                 "window_end_us": round(observation.window.span_ns / 1000.0, 3),
                 "event_count": accounting.event_count,
+                "complete_event_count": accounting.complete_event_count,
+                "clipped_event_count": accounting.clipped_event_count,
                 "comm_event_count": accounting.comm_event_count,
                 "stream_count": accounting.stream_count,
-                "wall_ms": _ms(accounting.wall_ns),
-                "busy_union_ms": _ms(accounting.busy_union_ns),
-                "kernel_sum_ms": _ms(accounting.kernel_sum_ns),
+                "request_wall_ms": _ms(accounting.request_wall_ns),
+                "window_duration_ms": _ms(accounting.window_span_ns),
+                "observed_event_span_ms": _ms(accounting.observed_event_span_ns),
+                "device_busy_union_ms": _ms(accounting.busy_union_ns),
+                "device_activity_sum_ms": _ms(accounting.device_activity_sum_ns),
                 "exposed_comm_ms": _ms(accounting.exposed_comm_ns),
-                "host_gap_ms": _ms(accounting.host_gap_ns),
+                "device_uncovered_ms": _ms(accounting.device_uncovered_ns),
+                "host_dispatch_gap_ms": _ms(accounting.host_dispatch_gap_ns),
                 "total_cost_ms": _ms(accounting.total_cost_ns),
+                # Deprecated aliases: same measured values, explicit old names.
+                "wall_ms": _ms(accounting.observed_event_span_ns),
+                "busy_union_ms": _ms(accounting.busy_union_ns),
+                "kernel_sum_ms": _ms(accounting.device_activity_sum_ns),
+                "host_gap_ms": _ms(accounting.device_uncovered_ns),
                 "exposed_aicpu_ms": _ms(accounting.exposed_aicpu_ns),
                 "underfeed_bubble_ratio": accounting.underfeed_ratio,
                 "aicpu_exposed_ratio": accounting.aicpu_exposed_ratio,
@@ -303,7 +391,7 @@ def _block_breakdown(observations: Sequence[Observation]) -> list[dict]:
                 "mapping_rule": MAPPING_RULES[block],
                 "event_count": sum(obs.accounting.block_event_count.get(block, 0) for obs in usable),
                 "basis": (
-                    "host gap = wall - busy union"
+                    "device uncovered = observed event span - device busy union"
                     if block == "Host_Gap"
                     else "per-block union; shares normalised over attributed block unions"
                 ),
@@ -351,6 +439,7 @@ def build_report(
     schema_rows: Sequence[dict],
     output_path: str | None,
     top_n: int,
+    group_by: str = "variant",
 ) -> dict:
     steps = sorted({int(step) for step in requested_steps})
     step_observations = [
@@ -367,12 +456,19 @@ def build_report(
         "step_status": "explicit" if steps else "not_provided",
         "rank_scope": sorted({observation.rank_id for observation in observations}),
         "aggregation": "p50_over_step_rank_observations",
+        "request_wall_ms_p50": step_aggregate["request_wall_ms_p50"],
+        "observed_event_span_ms_p50": step_aggregate["wall_ms_p50"],
+        "device_busy_union_ms_p50": step_aggregate["busy_union_ms_p50"],
+        "device_activity_sum_ms_p50": step_aggregate["kernel_sum_ms_p50"],
+        "exposed_comm_ms_p50": step_aggregate["exposed_comm_ms_p50"],
+        "device_uncovered_ms_p50": step_aggregate["host_gap_ms_p50"],
+        "total_cost_ms_p50": step_aggregate["total_cost_ms_p50"],
+        "clipped_event_count": step_aggregate["clipped_event_count"],
+        # Deprecated aliases.
         "wall_ms_p50": step_aggregate["wall_ms_p50"],
         "busy_union_ms_p50": step_aggregate["busy_union_ms_p50"],
         "kernel_sum_ms_p50": step_aggregate["kernel_sum_ms_p50"],
-        "exposed_comm_ms_p50": step_aggregate["exposed_comm_ms_p50"],
         "host_gap_ms_p50": step_aggregate["host_gap_ms_p50"],
-        "total_cost_ms_p50": step_aggregate["total_cost_ms_p50"],
         "underfeed_bubble_ratio": step_aggregate["underfeed_bubble_ratio_p50"],
         "aicpu_exposed_ratio": step_aggregate["aicpu_exposed_ratio_p50"],
         "coverage_ratio_p50": step_aggregate["coverage_ratio_p50"],
@@ -394,25 +490,31 @@ def build_report(
             "exporter_schema_version": _schema_version(sources),
             "parser_version": PARSER_VERSION,
             "query_elapsed_ms": round(float(elapsed_ms), 6),
-            "timing_scope": "hash + schema probe + bounded explicit-window reads; capture, export, and first cold full-table scan are excluded",
-            "cache_state": "cold",
-            "cache_scope": "none; every invocation re-reads the bounded window",
+            "timing_scope": "schema probe + bounded explicit-window reads (plus sha256 only with --hash); capture, export, and first cold full-table scan are excluded",
+            "cache_state": "path_size_mtime",
+            "cache_scope": "content sha256 is opt-in (--hash); the default identity is path+size_bytes+mtime_ns+schema_version",
             "query_timings": list(query_timings),
             "sources": [
                 {
                     "rank_id": source.rank_id,
                     "kind": source.kind,
                     "basename": source.basename,
+                    "path": source.path,
                     "sha256": source.sha256,
                     "size_bytes": source.size_bytes,
+                    "mtime_ns": source.mtime_ns,
                     "schema_version": source.schema_version,
                     "schema_variant": source.schema_variant,
                     "header_sha256": source.header_sha256,
                     "optional_missing": list(source.optional_missing),
                     "notes": list(source.notes),
+                    "content_identity": source.content_identity(),
                 }
                 for source in sources
             ],
+            "source_fingerprints": {
+                source.rank_id: source.content_identity() for source in sources
+            },
             "schema": list(schema_rows),
         },
         "scene": {
@@ -427,7 +529,10 @@ def build_report(
         },
         "step_accounting": step_accounting,
         "semantic_block_breakdown": _block_breakdown(analysis_observations),
-        "top_hotspot_kernels": _hotspots(analysis_observations, source_by_rank, top_n),
+        "top_hotspot_kernels": _hotspots(
+            analysis_observations, source_by_rank, top_n, group_by=group_by
+        ),
+        "hotspot_grouping": group_by,
         "window_accounting": _window_accounting(observations),
         "findings": _limitations_findings(limitations),
         "limitations": list(limitations),

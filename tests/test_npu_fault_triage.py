@@ -25,10 +25,17 @@ from mindie_diagnostics import decode_cann_error_code, triage_ascend_plog
     ("code", "severity", "subsystem", "tool"),
     [
         ("EZ9999", "fatal", "aicore_kernel", "msaicerr"),
+        ("EI0002", "error", "hccl_collective", "HCCL_ENTRY_LOG_ENABLE=1"),
+        ("EI0004", "error", "hccl_collective", "hccn_tool"),
         ("EI0006", "error", "hccl_collective", "hccn_tool"),
         ("EL0004", "fatal", "driver_memory", "npu-smi"),
+        ("E80000", "fatal", "driver_memory", "npu-smi"),
+        ("EE8888", "error", "runtime_rts", "asys"),
+        ("EE9999", "fatal", "runtime_rts", "asys"),
         ("507015", "fatal", "aicore_kernel", "asys"),
+        ("507018", "fatal", "aicpu_kernel", "msaicerr"),
         ("507035", "fatal", "aicore_kernel", "npu-objdump"),
+        ("507014", "error", "aicore_kernel", "npu-check"),
     ],
 )
 def test_decode_cann_error_code_known_codes(code, severity, subsystem, tool):
@@ -38,9 +45,12 @@ def test_decode_cann_error_code_known_codes(code, severity, subsystem, tool):
     assert result["severity"] == severity
     assert result["subsystem"] == subsystem
     assert result["recognized"] is True
+    assert result["documented"] is True
     assert result["summary"]
+    assert result["recommended_tools"]
+    assert result["remediation_steps"]
     assert result["deterministic_next_commands"]
-    assert tool in " ".join(result["deterministic_next_commands"])
+    assert tool in " ".join(result["remediation_steps"]) or tool in result["recommended_tools"]
 
 
 def test_decode_unknown_code_is_explicit_not_fabricated():
@@ -106,11 +116,114 @@ def test_driver_oom_and_empty_plog_are_classified_without_invention():
         "[ERROR] DRIVER(7,8):2026-09-22-14:56:00.000.000 rank[0] "
         "EL0004 Failed to allocate memory"
     )
+    hbm_oom = triage_ascend_plog(
+        "[ERROR] RUNTIME(9,10):2026-09-22-14:57:00.000.000 rank[0] deviceId:3 "
+        "ErrCode=E80000, desc=[HBM memory allocation failure]"
+    )
     empty = triage_ascend_plog("no errors in this plog\n")
 
     assert oom["fault_domain"] == "device_oom_or_driver"
     assert oom["error_codes"] == ["EL0004"]
+    assert "npu-smi" in oom["recommended_tools"]
+    assert hbm_oom["fault_domain"] == "device_oom_or_driver"
+    assert hbm_oom["error_codes"] == ["E80000"]
+    assert hbm_oom["device_id"] == "3"
     assert empty["root_cause_line"] is None
     assert empty["fault_domain"] == "unknown"
     assert empty["cascading_timeout_detected"] is False
     assert empty["decoded_codes"] == []
+    assert empty["aicore_subunits"] == []
+    assert empty["sync_hazard_detected"] is False
+    assert empty["graph_dfx_detected"] is False
+
+
+def test_ascendc_sync_hang_and_pipe_race_triage_extracts_indicators_and_synccheck():
+    plog = "\n".join([
+        "[ERROR] RUNTIME(1200,1205):2026-09-22-15:00:01.100.000 "
+        "rank[0] deviceId:1 streamID:[12] taskID[44] "
+        "kernel_name: FlashAttentionScoreGrad, ErrCode=507014, "
+        "desc=[aicore task execute timeout, CrossCoreWaitFlag hang after SetFlag/WaitFlag mismatch on PIPE_ALL]",
+        "[ERROR] HCCL(1200,1209):2026-09-22-15:00:15.000.000 "
+        "rank[2] ErrCode=EI0002 Notify wait timeout",
+    ])
+
+    result = triage_ascend_plog(plog)
+
+    assert result["fault_domain"] == "ascendc_sync_or_pipe_hazard"
+    assert result["sync_hazard_detected"] is True
+    assert "SetFlag/WaitFlag_mismatch" in result["sync_hazard_indicators"]
+    assert "CrossCoreWaitFlag_hang" in result["sync_hazard_indicators"]
+    assert result["failed_operator"] == "FlashAttentionScoreGrad"
+    assert result["cascading_timeout_detected"] is True
+    assert result["cascading_rank"] == "2"
+    assert "npu-check" in result["recommended_tools"]
+    assert any("npu-check --tool synccheck" in step for step in result["remediation_steps"])
+    assert any("msaicerr -i" in step for step in result["remediation_steps"])
+
+
+def test_aicore_exception_subunits_extracted_across_mte_vec_cube_biu():
+    plog = "\n".join([
+        "[ERROR] RUNTIME(3100,3102):2026-09-22-15:10:00.000.000 "
+        "rank[0] deviceId:0 streamID:[4] taskID[99] "
+        "failed operator: GroupedMatmulSwiglu, ErrCode=507035, EZ9999 "
+        "mte2_err gm_to_ub read overflow, mte3_err ub_to_gm, "
+        "vec error info: 0x100200, cube error info: 0x04, biu error info: 0x01",
+    ])
+
+    result = triage_ascend_plog(plog)
+
+    assert result["fault_domain"] == "aicore_memory_or_tiling"
+    assert result["error_codes"] == ["EZ9999", "507035"]
+    assert result["aicore_subunits"] == ["MTE2", "MTE3", "VEC", "CUBE", "BIU"]
+    assert result["exception_subunits"] == ["MTE2", "MTE3", "VEC", "CUBE", "BIU"]
+    assert result["aic_error_bitmask"] == 0x100200
+    assert {"asys", "msaicerr", "npu-objdump", "msnpureport"} <= set(result["recommended_tools"])
+    assert any("npu-objdump --dump-elf" in step for step in result["remediation_steps"])
+
+
+def test_torch_npugraph_ex_and_ge_dynamic_shape_dfx_triage():
+    capture_plog = "\n".join([
+        "[ERROR] TORCHAIR(5001,5002):2026-09-22-16:00:00.000.000 "
+        "rank[0] deviceId:0 torch.npugraph_ex BackendCompilerFailed: "
+        "aclgraph stream capture fail on operator: AddRmsNorm, ErrCode=EZ3002",
+    ])
+    dyn_shape_plog = "\n".join([
+        "[ERROR] GE(6001,6002):2026-09-22-16:05:00.000.000 "
+        "rank[0] deviceId:2 op_name: MoeInitRoutingV2, ErrCode=E10009, EZ1013 "
+        "dynamic shape range inference and TilingFailed",
+    ])
+
+    capture = triage_ascend_plog(capture_plog)
+    dyn_shape = triage_ascend_plog(dyn_shape_plog)
+
+    assert capture["fault_domain"] == "aclgraph_capture_or_stream"
+    assert capture["graph_dfx_detected"] is True
+    assert capture["graph_dfx_stage"] == "compile_or_capture"
+    assert "TORCH_COMPILE_DEBUG=1" in capture["recommended_tools"]
+    assert any("TORCH_COMPILE_DEBUG=1" in step for step in capture["remediation_steps"])
+
+    assert dyn_shape["fault_domain"] == "aclgraph_capture_or_stream"
+    assert dyn_shape["graph_dfx_detected"] is True
+    assert dyn_shape["graph_dfx_stage"] == "dynamic_shape"
+    assert dyn_shape["error_codes"] == ["E10009", "EZ1013"]
+    assert any("DUMP_GE_GRAPH=2" in step for step in dyn_shape["remediation_steps"])
+
+
+def test_hccl_config_and_runtime_stream_faults_recommend_targeted_commands():
+    hccl_cfg = triage_ascend_plog(
+        "[ERROR] HCCL(7001,7002):2026-09-22-17:00:00.000.000 "
+        "rank[3] deviceId:3 ErrCode=EI0004 ranktable topology parse failed"
+    )
+    rts_fault = triage_ascend_plog(
+        "[ERROR] RUNTIME(8001,8002):2026-09-22-17:01:00.000.000 "
+        "rank[0] deviceId:0 streamID:[15] ErrCode=EE9999, EE8888 internal event fault"
+    )
+
+    assert hccl_cfg["fault_domain"] == "hccl_collective_timeout_or_skew"
+    assert hccl_cfg["error_codes"] == ["EI0004"]
+    assert "HCCL_ENTRY_LOG_ENABLE=1" in hccl_cfg["recommended_tools"]
+    assert any("HCCL_ENTRY_LOG_ENABLE=1" in step for step in hccl_cfg["remediation_steps"])
+
+    assert rts_fault["fault_domain"] == "runtime_stream_or_event"
+    assert rts_fault["error_codes"] == ["EE9999", "EE8888"]
+    assert "ASCEND_LAUNCH_BLOCKING=1" in rts_fault["recommended_tools"]

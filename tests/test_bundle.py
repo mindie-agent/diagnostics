@@ -51,6 +51,23 @@ def test_projection_never_exports_unknown_text_or_paths_and_is_idempotent():
     assert export_public_event(public) == public
 
 
+def test_label_projection_preserves_safe_values_and_omits_credentials():
+    secret = "ghp_" + "A" * 36
+    attributes = {
+        "category": "transport", "submission_state": "unknown",
+        "error_type": "ConnectionError", "error_code": 12,
+        "tool": "remote.exec", "stage": "handshake", "status": "failed",
+        "reason": secret,
+    }
+    public = export_public_event(example(attributes=attributes))
+    assert public["attributes"] == {
+        key: value for key, value in attributes.items() if key != "reason"
+    }
+    assert attributes["reason"] == secret
+    assert secret not in json.dumps(public)
+    assert export_public_event(public) == public
+
+
 @pytest.mark.parametrize("changes", [
     {"schema": 2}, {"schema": True}, {"trace_id": "invalid"}, {"operation_id": "../"},
     {"timestamp": "not-utc"}, {"attributes": []}, {"pid": -1}, {"severity": "BAD"},

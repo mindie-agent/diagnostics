@@ -190,7 +190,7 @@ class Outbox:
                 return False
             existing = db.execute("SELECT payload,state,last_error FROM incidents WHERE fingerprint=?", (fingerprint,)).fetchone()
             if existing:
-                if (existing["state"] in ("exhausted", "expired", "permanent-failed")
+                if (existing["state"] in ("exhausted", "expired", "permanent-failed", "blocked")
                         and not (existing["last_error"] or "").startswith("submission_uncertain")):
                     # A fresh authorized event restores evidence discarded by
                     # the old read-attempt budget. Never replay unknown writes.

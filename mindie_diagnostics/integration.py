@@ -13,8 +13,8 @@ status view (`reporting_status`) over local events, worker health, and outbox.
 
 [Timeouts & Locks]
 - `_meta_lock` is acquired non-blocking (`blocking=False`) to avoid lock queues.
-- `_read_outbox` opens SQLite in read-only URI mode (`?mode=ro`) with a 150ms
-  progress-handler deadline and `busy_timeout=100`.
+- `_read_outbox` opens SQLite in read-only URI mode (`?mode=ro`) with a 5.0s
+  progress-handler deadline over a 3.0s `busy_timeout`.
 
 [Side-Effect Policy]
 - `configure_reporting` atomically writes `reporting.json` via temp file + `os.replace`.
@@ -396,7 +396,7 @@ _FINGERPRINT = re.compile(r"[0-9a-f]{16,64}\Z")
 _STATIC_CODE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
 _TABLE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}\Z")
 _HEALTH_LIMIT = 65536
-_QUERY_DEADLINE = 0.15
+_QUERY_DEADLINE = 5.0
 _OUTBOX_COLUMNS = (
     "fingerprint",
     "state",
@@ -492,13 +492,16 @@ def _queue_absent():
     return {"counts": {}, "recent": []}
 
 
-def _queue_unavailable():
-    return {
+def _queue_unavailable(error_type=None):
+    view = {
         "status": "unavailable",
         "hint": "outbox is not a safe local database",
         "counts": {},
         "recent": [],
     }
+    if isinstance(error_type, str) and error_type:
+        view["error_type"] = error_type
+    return view
 
 
 def _issue_url(value, repository):
@@ -557,18 +560,18 @@ def _read_outbox(config, repository):
         info = f._lstat_or_missing(path)
         if info is None:
             return _queue_absent()
-    except OSError:
-        return _queue_unavailable()
+    except OSError as exc:
+        return _queue_unavailable(type(exc).__name__)
     if os.path.islink(path) or not stat.S_ISREG(info.st_mode) or info.st_size <= 0:
         return _queue_unavailable()
     deadline = time.monotonic() + _QUERY_DEADLINE
     try:
-        conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=0.1)
-    except Exception:
-        return _queue_unavailable()
+        conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=3.0)
+    except Exception as exc:
+        return _queue_unavailable(type(exc).__name__)
     try:
         conn.execute("PRAGMA query_only=ON")
-        conn.execute("PRAGMA busy_timeout=100")
+        conn.execute("PRAGMA busy_timeout=3000")
 
         def _progress():
             return 1 if time.monotonic() >= deadline else 0
@@ -587,8 +590,8 @@ def _read_outbox(config, repository):
         query = "SELECT %s FROM incidents ORDER BY last_seen DESC LIMIT 5" % selected
         recent = [_recent_row(row, repository) for row in conn.execute(query)]
         return {"counts": counts, "recent": recent}
-    except Exception:
-        return _queue_unavailable()
+    except Exception as exc:
+        return _queue_unavailable(type(exc).__name__)
     finally:
         try:
             conn.close()

@@ -1,0 +1,7 @@
+include AGENTS.md LICENSE README.md README.en.md pyproject.toml
+recursive-include mindie_diagnostics *.py
+recursive-include mindie_profiler *.py *.json
+recursive-include mindie_sim *.py
+recursive-include benchmarks *.py *.json
+recursive-include docs *.md
+recursive-include tests *.py *.txt *.ini *.json *.md

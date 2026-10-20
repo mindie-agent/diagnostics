@@ -1,0 +1,29 @@
+	   Phy-ID0    Phy-ID1    Phy-ID2    Phy-ID3    Phy-ID4    Phy-ID5    Phy-ID6    Phy-ID7    Phy-ID8    Phy-ID9    Phy-ID10   Phy-ID11   Phy-ID12   Phy-ID13   Phy-ID14   Phy-ID15   
+Phy-ID0    X          SIO        HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    
+Phy-ID1    SIO        X          HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    
+Phy-ID2    HCCS_SW    HCCS_SW    X          SIO        HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    
+Phy-ID3    HCCS_SW    HCCS_SW    SIO        X          HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    
+Phy-ID4    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    X          SIO        HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    
+Phy-ID5    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    SIO        X          HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    
+Phy-ID6    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    X          SIO        HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    
+Phy-ID7    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    SIO        X          HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    
+Phy-ID8    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    X          SIO        HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    
+Phy-ID9    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    SIO        X          HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    
+Phy-ID10   HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    X          SIO        HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    
+Phy-ID11   HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    SIO        X          HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    
+Phy-ID12   HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    X          SIO        HCCS_SW    HCCS_SW    
+Phy-ID13   HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    SIO        X          HCCS_SW    HCCS_SW    
+Phy-ID14   HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    X          SIO        
+Phy-ID15   HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    HCCS_SW    SIO        X          
+
+Legend:
+
+  X    = Self
+  SYS  = Path traversing PCIe and NUMA nodes. Nodes are connected through SMP, such as QPI, UPI.
+  PHB  = Path traversing PCIe and the PCIe host bridge of a CPU.
+  PIX  = Path traversing a single PCIe switch
+  PXB  = Path traversing multipul PCIe switches
+  HCCS = Connection traversing HCCS.
+  SIO  = Path traversing the SIO bus
+  HCCS_SW = Connection traversing HCCS through a switch
+  NA   = Unknown relationship.

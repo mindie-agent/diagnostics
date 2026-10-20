@@ -1,6 +1,6 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "mindie-diagnostics"
@@ -16,9 +16,15 @@ test = ["pytest>=8,<10"]
 [project.scripts]
 mindie-diagnostics = "mindie_diagnostics.cli:main"
 mindie-profiler = "mindie_profiler.__main__:main"
+mindie-sim = "mindie_sim.__main__:main"
 
-[tool.hatch.build.targets.wheel]
-packages = ["mindie_diagnostics", "mindie_profiler"]
+[tool.setuptools.packages.find]
+include = ["mindie_diagnostics*", "mindie_profiler*", "mindie_sim*"]
 
-[tool.hatch.build.targets.sdist]
-include = ["/mindie_diagnostics", "/mindie_profiler", "/tests", "/benchmarks", "/docs", "/README.md", "/README.en.md", "/AGENTS.md", "/LICENSE", "/pyproject.toml"]
+[tool.pytest.ini_options]
+markers = [
+    "live_npu: standing A2/A3 Ascend NPU non-destructive live integration",
+]
+
+[tool.setuptools.package-data]
+mindie_profiler = ["knowledge/*.json"]

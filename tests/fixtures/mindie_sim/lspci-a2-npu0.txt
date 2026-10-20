@@ -1,0 +1,2 @@
+		LnkCap:	Port #0, Speed 32GT/s, Width x16, ASPM L0s L1, Exit Latency L0s <4us, L1 <8us
+		LnkSta:	Speed 16GT/s (downgraded), Width x16

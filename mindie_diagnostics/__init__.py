@@ -20,9 +20,13 @@ from .logging import configure, get_recorder
 from .bundle import collect_bundle, export_public_event
 from .redact import redact_text
 from .process_output import capture_output
-from .npu_fault_triage import decode_cann_error_code, triage_ascend_plog
+from .npu_fault_triage import (
+    decode_cann_error_code,
+    triage_ascend_plog,
+    triage_npu_fault,
+)
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 __all__ = ["configure", "get_recorder", "current_context", "bind_context",
            "wrap_context", "collect_bundle", "export_public_event", "redact_text", "capture_output",
-           "decode_cann_error_code", "triage_ascend_plog"]
+           "decode_cann_error_code", "triage_ascend_plog", "triage_npu_fault"]

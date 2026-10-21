@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mindie-diagnostics"
-version = "0.5.0"
+version = "0.5.1"
 description = "Bounded structured diagnostics, local error codes, support bundles, and opt-in telemetry reporting for MindIE Agent"
 readme = "README.md"
 requires-python = ">=3.11"

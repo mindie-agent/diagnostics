@@ -31,7 +31,7 @@ from datetime import datetime
 from typing import Any
 
 CANN_CODE_RE = re.compile(r"(?<![A-Za-z0-9])E[A-Z0-9][0-9][0-9A-Z]{3}(?![A-Za-z0-9])")
-RTS_CODE_RE = re.compile(r"(?<!\d)((?:107|207|507)\d{3})(?!\d)")
+RTS_CODE_RE = re.compile(r"(?<!\d)((?:107|161|207|507|561)\d{3})(?!\d)")
 TIMESTAMP_RE = re.compile(
     r"(\d{4})[-/](\d{2})[-/](\d{2})[T _-](\d{2}):(\d{2}):(\d{2})"
     r"(?:[.,](\d{1,9})(?:[.,](\d{1,9}))?)?"
@@ -123,10 +123,15 @@ RTS_CODES: dict[str, tuple[str, str, str]] = {
     "507035": ("fatal", "aicore_kernel", "Vector core exception (507035); an AIV instruction or UB address faulted."),
     "507001": ("fatal", "driver_memory", "Event/memory/driver fault (507001); a Runtime event timed out or memory access failed."),
     "107002": ("error", "runtime_rts", "Invalid stream or context (107002); the Runtime object was invalid or already released."),
+    "107003": ("error", "runtime_rts", "ACL_ERROR_RT_CONTEXT_NULL (107003); current host thread has no bound NPU context (missing torch.npu.set_device in worker thread)."),
+    "161001": ("error", "acl_interface", "ACLNN_ERR_PARAM_NULLPTR (161001); null pointer or shadowed opapi/custom-op symbol in aclnn workspace/execution call."),
+    "207001": ("fatal", "driver_memory", "ACL_ERROR_RT_MEMORY_ALLOCATION (207001); device HBM or camem allocator exhausted."),
     "207008": ("error", "runtime_rts", "ACLGraph stream capture resource exhaustion (207008); AclmdlRICaptureBegin ran out of stream/event resources."),
     "507014": ("error", "aicore_kernel", "AICore execution timeout (507014); the kernel exceeded the device execution budget or hung on a sync flag."),
     "507046": ("error", "runtime_rts", "Stream synchronize timeout (507046); the host waited past the stream deadline."),
     "507033": ("error", "driver_memory", "Device initialization or memory-mapping failure (507033)."),
+    "561000": ("error", "acl_interface", "aclnn internal tiling or workspace failure (561000); inspect opapi tiling and tensor shape/layout alignment."),
+    "561103": ("error", "acl_interface", "aclnn operator tiling or kernel launch failure (561103); inspect custom-op ABI and tiling offset bounds."),
 }
 
 CANN_CODES: dict[str, tuple[str, str, str]] = {
@@ -210,8 +215,12 @@ def _code_commands(code: str, subsystem: str) -> tuple[str, ...]:
     extras: tuple[str, ...] = ()
     if code in {"EI0002", "EI0004", "EI0006", "EI0009", "EI0010", "EI0012", "EI0013", "EI0018"}:
         extras = ("asys analyze -r=trace --file=<hccl_trace.bin>",)
-    elif code in {"EL0004", "E80000", "E89999", "EH0010", "507001", "507033"}:
+    elif code in {"EL0004", "E80000", "E89999", "EH0010", "207001", "507001", "507033"}:
         extras = ("dmesg | grep -i -E 'hisi|svm|oom|alloc' | tail -50",)
+    elif code == "107003":
+        extras = ("perf probe -x /usr/local/Ascend/ascend-toolkit/latest/lib64/libascendcl.so 'aclrtSetDevice deviceId=%x0:s32'",)
+    elif code in {"161001", "561000", "561103"}:
+        extras = ("ldd <custom_op.so> && nm -D <custom_op.so> | grep aclnn",)
     elif code in {"507014"}:
         extras = (
             "npu-check --tool synccheck <reproduce-command>",
@@ -360,54 +369,31 @@ def _operator(text: str) -> str | None:
 
 
 _MODEL_FAULT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    (
-        "vllm_ascend_aclgraph_capture_failure",
-        re.compile(
-            r"AclmdlRICaptureBegin|\b207008\b|\bEL0009\b|Insufficient_Stream_Resources|"
-            r"ACL\s+graph\s+is\s+incompatible\s+with\s+ASCEND_LAUNCH_BLOCKING|"
-            r"cudagraph_capture_sizes|FULL_DECODE_ONLY|recompile_limit|"
-            r"_local_scalar_dense|\.item\(\).*capture|capture.*\.item\(\)",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "vllm_ascend_idle_dp_collective_hang",
-        re.compile(
-            r"idle\s+dp|num_tokens_across_dp|active_batch\s*==\s*0|num_tokens\s*==\s*0|"
-            r"recompute_scheduler_enable|dummy_run|dummy\s+forward|FlashComm|"
-            r"oproj_tensor_parallel_size|npu_moe_distribute_dispatch_v2|HcclAlltoAllV|"
-            r"(?:dp\s+rank|data\s+parallel).*(?:hang|timeout|EI0002|EI0006|allreduce|alltoall|mc2)",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "msmodelslim_quant_weight_or_scale_mismatch",
-        re.compile(
-            r"msmodelslim|modelslim|compressed[-_]tensors|quant_model_description|"
-            r"weight_scale|input_scale|dequant_scale|quant_scale|anti_outlier|"
-            r"UnquantizedLinearMethod|AscendW8A8|AscendW4A8|w8a8_dynamic|w4a8_dynamic",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "mooncake_or_kv_pool_transfer_fault",
-        re.compile(
-            r"mooncake|MooncakeConnector|MooncakeLayerwiseConnector|\bhixl\b|lmcache|"
-            r"llm[-_]datadist|kv_transfer|kv_connector|kv_producer|kv_consumer|"
-            r"register_memory|ibv_reg_mr|cp_kv_cache_interleave_size",
-            re.IGNORECASE,
-        ),
-    ),
-    (
-        "numerical_nan_inf_or_determinism_drift",
-        re.compile(
-            r"\bnan\b|\binf(?:inity)?\b|precision\s+(?:drift|drop|mismatch)|"
-            r"cosine\s+similarity|kl\s+divergence|non[-_]?deterministic|determinism\s+drift|"
-            r"gnorm\s+spike|loss\s+spike|HCCL_DETERMINISTIC|LCCL_DETERMINISTIC|"
-            r"VLLM_BATCH_INVARIANT|msprobe",
-            re.IGNORECASE,
-        ),
-    ),
+    ("vllm_ascend_aclgraph_capture_failure", re.compile(
+        r"AclmdlRICaptureBegin|\b207008\b|\bEL0009\b|Insufficient_Stream_Resources|ACL\s+graph\s+is\s+incompatible\s+with\s+ASCEND_LAUNCH_BLOCKING|"
+        r"cudagraph_capture_sizes|FULL_DECODE_ONLY|recompile_limit|_local_scalar_dense|\.item\(\).*capture|capture.*\.item\(\)", re.IGNORECASE)),
+    ("vllm_ascend_idle_dp_collective_hang", re.compile(
+        r"idle\s+dp|num_tokens_across_dp|active_batch\s*==\s*0|num_tokens\s*==\s*0|recompute_scheduler_enable|dummy_run|dummy\s+forward|FlashComm|"
+        r"oproj_tensor_parallel_size|npu_moe_distribute_dispatch_v2|HcclAlltoAllV|(?:dp\s+rank|data\s+parallel).*(?:hang|timeout|EI0002|EI0006|allreduce|alltoall|mc2)", re.IGNORECASE)),
+    ("msmodelslim_quant_weight_or_scale_mismatch", re.compile(
+        r"msmodelslim|modelslim|compressed[-_]tensors|quant_model_description|weight_scale|input_scale|dequant_scale|quant_scale|anti_outlier|"
+        r"UnquantizedLinearMethod|AscendW8A8|AscendW4A8|w8a8_dynamic|w4a8_dynamic", re.IGNORECASE)),
+    ("mooncake_or_kv_pool_transfer_fault", re.compile(
+        r"mooncake|MooncakeConnector|MooncakeLayerwiseConnector|\bhixl\b|lmcache|llm[-_]datadist|kv_transfer|kv_connector|kv_producer|kv_consumer|"
+        r"register_memory|ibv_reg_mr|cp_kv_cache_interleave_size", re.IGNORECASE)),
+    ("custom_op_abi_or_symbol_shadowing", re.compile(
+        r"_C_ascend|libascend_kernels\.so|ACLNN_ERR_PARAM_NULLPTR|\b161001\b|\b561000\b|\b561103\b|"
+        r"opapi_math|undef(?:ined)?\s+symbol.*aclnn|NotImplementedError.*Meta|dispatch\s+key.*Meta|"
+        r"errcode\s*[:=]?\s*264|tiling\s+offset\s+out\s+of\s+range", re.IGNORECASE)),
+    ("multithread_npu_context_or_rogue_device0", re.compile(
+        r"\b107003\b|ACL_ERROR_RT_CONTEXT_NULL|context\s+is\s+null|aclrtSetDevice.*device\s*0|"
+        r"rogue\s+device\s*0|ThreadPoolExecutor.*set_device", re.IGNORECASE)),
+    ("enginecore_shm_or_zmq_frame_corruption", re.compile(
+        r"shm_broadcast|multiproc_executor.*(?:EOFError|UnpicklingError|corrupt)|"
+        r"EngineCore.*(?:ZMQ|hang|deadlock)|MessageQueue.*(?:chunk|corrupt|timeout)", re.IGNORECASE)),
+    ("numerical_nan_inf_or_determinism_drift", re.compile(
+        r"\bnan\b|\binf(?:inity)?\b|precision\s+(?:drift|drop|mismatch)|cosine\s+similarity|kl\s+divergence|"
+        r"non[-_]?deterministic|determinism\s+drift|gnorm\s+spike|loss\s+spike|HCCL_DETERMINISTIC|LCCL_DETERMINISTIC|VLLM_BATCH_INVARIANT|msprobe", re.IGNORECASE)),
 )
 
 MODEL_FAULT_REMEDIATIONS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
@@ -452,6 +438,28 @@ MODEL_FAULT_REMEDIATIONS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
             "Verify RoCE/RDMA NIC status (`hccn_tool -i <dev> -link -g`, `hccn_tool -i <dev> -ip -g`) and align HCCL_SOCKET_IFNAME and GLOO_SOCKET_IFNAME across Prefill (kv_producer) and Decode (kv_consumer) nodes.",
             "When using Mooncake PD disaggregation with GQA models, use MooncakeLayerwiseConnector or disable C8 KV cache quantization (--quantization-param-path) which is incompatible with standard MooncakeConnector.",
             "Ensure cp_kv_cache_interleave_size equals block_size when combining Context Parallelism (pcp/dcp) with Mooncake/HIXL KV transfer, and assign unique engine_id per P/D instance.",
+        ),
+    ),
+    "custom_op_abi_or_symbol_shadowing": (
+        ("ldd", "nm", "ASCEND_LAUNCH_BLOCKING=1", "asys"),
+        (
+            "Verify vllm_ascend._C_ascend and libascend_kernels.so match the active CANN/PyTorch ABI (`ldd` / `nm -D`) and ensure libopapi.so is not shadowed by opapi_math when hitting ACLNN_ERR_PARAM_NULLPTR (161001).",
+            "Register a Meta kernel alongside PrivateUse1 in TORCH_LIBRARY_IMPL so torch.compile / npugraph_ex fake-tensor tracing does not fail on custom ops.",
+            "For npu_fused_infer_attention_score_v2 (FIA) errcode 264 / tiling offset out of range in MTP (num_speculative_tokens >= 1), match actual_seq_lengths_kv counting domain to tensor rank (3D BSH/BSND per-token vs 4D BNSD sequence count).",
+        ),
+    ),
+    "multithread_npu_context_or_rogue_device0": (
+        ("torch.npu.set_device", "perf", "asys", "npu-smi"),
+        (
+            "Call torch.npu.set_device(device_id) explicitly inside every background ThreadPoolExecutor / ZMQ / async callback thread before invoking any NPU tensor op or aclnn kernel (107003 / ACL_ERROR_RT_CONTEXT_NULL).",
+            "Trace rogue device 0 context creation on multi-card workers without code intrusion via `perf probe -x /usr/local/Ascend/ascend-toolkit/latest/lib64/libascendcl.so 'aclrtSetDevice deviceId=%x0:s32'`.",
+        ),
+    ),
+    "enginecore_shm_or_zmq_frame_corruption": (
+        ("py-spy", "gdb", "asys", "npu-smi"),
+        (
+            "Inspect vllm EngineCore shm_broadcast ring buffer and ZMQ DEALER/ROUTER multipart framing when /v1/models returns HTTP 200 (handled in API Server) while /v1/chat/completions hangs indefinitely.",
+            "Check whether a rank worker crashed or emitted oversized/misaligned SchedulerOutput frames across MessageQueue shared memory.",
         ),
     ),
 }
@@ -554,7 +562,7 @@ def _domain(
         return "ascendc_sync_or_pipe_hazard"
     if any(code in {"507015", "507035", "507014", "EZ9999", "EZ2001"} for code in root_codes):
         return "aicore_memory_or_tiling"
-    if any(code in {"EL0004", "E80000", "E89999", "EH0010", "507001", "507033"} for code in root_codes):
+    if any(code in {"EL0004", "E80000", "E89999", "EH0010", "207001", "507001", "507033"} for code in root_codes):
         return "device_oom_or_driver"
     if model_fault_category:
         return model_fault_category

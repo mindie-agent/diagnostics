@@ -36,6 +36,10 @@ from mindie_diagnostics import decode_cann_error_code, triage_ascend_plog
         ("507018", "fatal", "aicpu_kernel", "msaicerr"),
         ("507035", "fatal", "aicore_kernel", "npu-objdump"),
         ("507014", "error", "aicore_kernel", "npu-check"),
+        ("107003", "error", "runtime_rts", "perf"),
+        ("161001", "error", "acl_interface", "ldd"),
+        ("207001", "fatal", "driver_memory", "dmesg"),
+        ("561103", "error", "acl_interface", "ldd"),
     ],
 )
 def test_decode_cann_error_code_known_codes(code, severity, subsystem, tool):
@@ -278,3 +282,36 @@ def test_vllm_ascend_five_model_fault_categories_and_remediations():
     assert mooncake_res["model_fault_category"] == "mooncake_or_kv_pool_transfer_fault"
     assert any("MooncakeLayerwiseConnector" in step for step in mooncake_res["remediation_steps"])
     assert any("cp_kv_cache_interleave_size" in step for step in mooncake_res["remediation_steps"])
+
+
+def test_codex_distilled_custom_op_multithread_context_and_shm_triage():
+    custom_op_res = triage_ascend_plog(
+        "[ERROR] OPAPI(9501,9502):2026-09-22-18:05:00.000.000 "
+        "rank[0] deviceId:0 libascend_kernels.so / opapi_math symbol shadowing: "
+        "ACLNN_ERR_PARAM_NULLPTR (161001) and FIA errcode 264 tiling offset out of range"
+    )
+    assert custom_op_res["fault_domain"] == "custom_op_abi_or_symbol_shadowing"
+    assert custom_op_res["model_fault_category"] == "custom_op_abi_or_symbol_shadowing"
+    assert "161001" in custom_op_res["error_codes"]
+    assert any("opapi_math" in step for step in custom_op_res["remediation_steps"])
+    assert any("actual_seq_lengths_kv" in step for step in custom_op_res["remediation_steps"])
+
+    ctx_res = triage_ascend_plog(
+        "[ERROR] RUNTIME(9601,9602):2026-09-22-18:06:00.000.000 "
+        "rank[2] deviceId:2 ErrCode=107003 ACL_ERROR_RT_CONTEXT_NULL: "
+        "context is null in ThreadPoolExecutor worker before set_device"
+    )
+    assert ctx_res["fault_domain"] == "multithread_npu_context_or_rogue_device0"
+    assert ctx_res["model_fault_category"] == "multithread_npu_context_or_rogue_device0"
+    assert "107003" in ctx_res["error_codes"]
+    assert any("torch.npu.set_device" in step for step in ctx_res["remediation_steps"])
+    assert any("perf probe" in step for step in ctx_res["remediation_steps"])
+
+    shm_res = triage_ascend_plog(
+        "[ERROR] VLLM(9701,9702):2026-09-22-18:07:00.000.000 "
+        "rank[0] multiproc_executor UnpicklingError in shm_broadcast MessageQueue chunk corrupt "
+        "causing EngineCore ZMQ hang"
+    )
+    assert shm_res["fault_domain"] == "enginecore_shm_or_zmq_frame_corruption"
+    assert shm_res["model_fault_category"] == "enginecore_shm_or_zmq_frame_corruption"
+    assert any("shm_broadcast" in step for step in shm_res["remediation_steps"])

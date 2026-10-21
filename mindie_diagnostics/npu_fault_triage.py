@@ -31,7 +31,7 @@ from datetime import datetime
 from typing import Any
 
 CANN_CODE_RE = re.compile(r"(?<![A-Za-z0-9])E[A-Z0-9][0-9][0-9A-Z]{3}(?![A-Za-z0-9])")
-RTS_CODE_RE = re.compile(r"(?<!\d)((?:107|507)\d{3})(?!\d)")
+RTS_CODE_RE = re.compile(r"(?<!\d)((?:107|207|507)\d{3})(?!\d)")
 TIMESTAMP_RE = re.compile(
     r"(\d{4})[-/](\d{2})[-/](\d{2})[T _-](\d{2}):(\d{2}):(\d{2})"
     r"(?:[.,](\d{1,9})(?:[.,](\d{1,9}))?)?"
@@ -123,6 +123,7 @@ RTS_CODES: dict[str, tuple[str, str, str]] = {
     "507035": ("fatal", "aicore_kernel", "Vector core exception (507035); an AIV instruction or UB address faulted."),
     "507001": ("fatal", "driver_memory", "Event/memory/driver fault (507001); a Runtime event timed out or memory access failed."),
     "107002": ("error", "runtime_rts", "Invalid stream or context (107002); the Runtime object was invalid or already released."),
+    "207008": ("error", "runtime_rts", "ACLGraph stream capture resource exhaustion (207008); AclmdlRICaptureBegin ran out of stream/event resources."),
     "507014": ("error", "aicore_kernel", "AICore execution timeout (507014); the kernel exceeded the device execution budget or hung on a sync flag."),
     "507046": ("error", "runtime_rts", "Stream synchronize timeout (507046); the host waited past the stream deadline."),
     "507033": ("error", "driver_memory", "Device initialization or memory-mapping failure (507033)."),
@@ -135,6 +136,7 @@ CANN_CODES: dict[str, tuple[str, str, str]] = {
     "EZ3002": ("error", "ge_graph", "Graph/operator execution failure (EZ3002); inspect GE graph build and kernel selection."),
     "EZ1013": ("error", "ge_graph", "Dynamic-shape tiling or range inference failure (EZ1013); inspect dynamic shape bounds and tiling key selection."),
     "EL0004": ("fatal", "driver_memory", "Driver memory allocation failure (EL0004); host or device memory is exhausted."),
+    "EL0009": ("error", "runtime_rts", "Insufficient stream resources during ACLGraph capture (EL0009); reduce cudagraph_capture_sizes or use FULL_DECODE_ONLY."),
     "E80000": ("fatal", "driver_memory", "HBM/device memory exhaustion or allocation failure (E80000); the device memory pool is depleted."),
     "E89999": ("fatal", "driver_memory", "Driver/memory subsystem internal failure (E89999); inspect driver dmesg and HBM health."),
     "EI0002": ("error", "hccl_collective", "HCCL collective/Notify-wait timeout (EI0002); rank skew, peer failure or a broken link."),
@@ -157,70 +159,40 @@ CANN_CODES: dict[str, tuple[str, str, str]] = {
 }
 
 _AICORE_COMMANDS = (
-    "asys collect --tar=True --output=$HOME/dfx_info",
-    "msaicerr -i $HOME/dfx_info -o $HOME/msaicerr_out",
+    "asys collect --tar=True --output=$HOME/dfx_info", "msaicerr -i $HOME/dfx_info -o $HOME/msaicerr_out",
     "asys analyze -r=aicore_error --path=$HOME/aic_err_info",
     "cd /usr/local/Ascend/cann/tools/msaicerr && python3 msaicerr.py -p $HOME/aic_err_info -out $HOME/msaicerr_out -dev 0",
-    "ASCEND_LAUNCH_BLOCKING=1 <reproduce-command>",
-    "npu-objdump --dump-elf <failed_kernel.o>",
-    "msnpureport report -d 0",
-    "npu-smi info",
+    "ASCEND_LAUNCH_BLOCKING=1 <reproduce-command>", "npu-objdump --dump-elf <failed_kernel.o>",
+    "msnpureport report -d 0", "npu-smi info",
 )
 _SYNC_COMMANDS = (
-    "npu-check --tool synccheck <reproduce-command>",
-    "ASCEND_LAUNCH_BLOCKING=1 <reproduce-command>",
-    "asys collect --tar=True --output=$HOME/dfx_info",
-    "msaicerr -i $HOME/dfx_info -o $HOME/msaicerr_out",
-    "npu-objdump --dump-elf <failed_kernel.o>",
-    "msnpureport report -d 0",
+    "npu-check --tool synccheck <reproduce-command>", "ASCEND_LAUNCH_BLOCKING=1 <reproduce-command>",
+    "asys collect --tar=True --output=$HOME/dfx_info", "msaicerr -i $HOME/dfx_info -o $HOME/msaicerr_out",
+    "npu-objdump --dump-elf <failed_kernel.o>", "msnpureport report -d 0",
 )
 _HCCL_COMMANDS = (
     "HCCL_ENTRY_LOG_ENABLE=1 ASCEND_GLOBAL_LOG_LEVEL=1 <reproduce-command>",
-    "hccn_tool -i 0 -link -g",
-    "hccn_tool -i 0 -ip -g",
-    'grep -rn "error cqe" "$ASCEND_PROCESS_LOG_PATH"',
-    "asys collect --tar=True --output=$HOME/dfx_info",
-    "msnpureport report -d 0",
-    "export HCCL_EXEC_TIMEOUT=1800",
+    "hccn_tool -i 0 -link -g", "hccn_tool -i 0 -ip -g", 'grep -rn "error cqe" "$ASCEND_PROCESS_LOG_PATH"',
+    "asys collect --tar=True --output=$HOME/dfx_info", "msnpureport report -d 0", "export HCCL_EXEC_TIMEOUT=1800",
 )
 _MEMORY_COMMANDS = (
-    "npu-smi info",
-    "npu-smi info -t health -i 0",
-    "npu-smi info -t memory -i 0",
-    "free -h",
-    "asys health",
-    "msnpureport report -d 0",
-    "asys collect --tar=True --output=$HOME/dfx_info",
+    "npu-smi info", "npu-smi info -t health -i 0", "npu-smi info -t memory -i 0",
+    "free -h", "asys health", "msnpureport report -d 0", "asys collect --tar=True --output=$HOME/dfx_info",
 )
 _GRAPH_COMMANDS = (
     "TORCH_COMPILE_DEBUG=1 TORCH_LOGS=\"+dynamo,recompiles,graph_breaks\" <reproduce-command>",
-    "ASCEND_LAUNCH_BLOCKING=1 <reproduce-command>",
-    "DUMP_GE_GRAPH=2 DUMP_GRAPH_LEVEL=2 <reproduce-command>",
-    "asys collect --tar=True --output=$HOME/dfx_info",
-    "asys info -r=status",
-    "msnpureport report -d 0",
-    "npu-smi info",
+    "ASCEND_LAUNCH_BLOCKING=1 <reproduce-command>", "DUMP_GE_GRAPH=2 DUMP_GRAPH_LEVEL=2 <reproduce-command>",
+    "asys collect --tar=True --output=$HOME/dfx_info", "asys info -r=status", "msnpureport report -d 0", "npu-smi info",
 )
 _ACL_COMMANDS = (
-    "asys info -r=software",
-    "asys collect --tar=True --output=$HOME/dfx_info",
-    "msnpureport report -d 0",
-    "npu-smi info",
+    "asys info -r=software", "asys collect --tar=True --output=$HOME/dfx_info", "msnpureport report -d 0", "npu-smi info",
 )
 _UNKNOWN_COMMANDS = (
-    "asys collect --tar=True --output=$HOME/dfx_info",
-    "msnpureport report -d 0",
-    "npu-smi info",
-    "asys info -r=software",
+    "asys collect --tar=True --output=$HOME/dfx_info", "msnpureport report -d 0", "npu-smi info", "asys info -r=software",
 )
 _SUBSYSTEM_COMMANDS = {
-    "runtime_rts": _GRAPH_COMMANDS,
-    "aicore_kernel": _AICORE_COMMANDS,
-    "aicpu_kernel": _AICORE_COMMANDS,
-    "hccl_collective": _HCCL_COMMANDS,
-    "driver_memory": _MEMORY_COMMANDS,
-    "ge_graph": _GRAPH_COMMANDS,
-    "acl_interface": _ACL_COMMANDS,
+    "runtime_rts": _GRAPH_COMMANDS, "aicore_kernel": _AICORE_COMMANDS, "aicpu_kernel": _AICORE_COMMANDS,
+    "hccl_collective": _HCCL_COMMANDS, "driver_memory": _MEMORY_COMMANDS, "ge_graph": _GRAPH_COMMANDS, "acl_interface": _ACL_COMMANDS,
 }
 _SUBSYSTEM_TOOLS: dict[str, tuple[str, ...]] = {
     "aicore_kernel": ("asys", "msaicerr", "npu-objdump", "msnpureport", "npu-smi"),
@@ -387,20 +359,132 @@ def _operator(text: str) -> str | None:
     return None
 
 
+_MODEL_FAULT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "vllm_ascend_aclgraph_capture_failure",
+        re.compile(
+            r"AclmdlRICaptureBegin|\b207008\b|\bEL0009\b|Insufficient_Stream_Resources|"
+            r"ACL\s+graph\s+is\s+incompatible\s+with\s+ASCEND_LAUNCH_BLOCKING|"
+            r"cudagraph_capture_sizes|FULL_DECODE_ONLY|recompile_limit|"
+            r"_local_scalar_dense|\.item\(\).*capture|capture.*\.item\(\)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "vllm_ascend_idle_dp_collective_hang",
+        re.compile(
+            r"idle\s+dp|num_tokens_across_dp|active_batch\s*==\s*0|num_tokens\s*==\s*0|"
+            r"recompute_scheduler_enable|dummy_run|dummy\s+forward|FlashComm|"
+            r"oproj_tensor_parallel_size|npu_moe_distribute_dispatch_v2|HcclAlltoAllV|"
+            r"(?:dp\s+rank|data\s+parallel).*(?:hang|timeout|EI0002|EI0006|allreduce|alltoall|mc2)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "msmodelslim_quant_weight_or_scale_mismatch",
+        re.compile(
+            r"msmodelslim|modelslim|compressed[-_]tensors|quant_model_description|"
+            r"weight_scale|input_scale|dequant_scale|quant_scale|anti_outlier|"
+            r"UnquantizedLinearMethod|AscendW8A8|AscendW4A8|w8a8_dynamic|w4a8_dynamic",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "mooncake_or_kv_pool_transfer_fault",
+        re.compile(
+            r"mooncake|MooncakeConnector|MooncakeLayerwiseConnector|\bhixl\b|lmcache|"
+            r"llm[-_]datadist|kv_transfer|kv_connector|kv_producer|kv_consumer|"
+            r"register_memory|ibv_reg_mr|cp_kv_cache_interleave_size",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "numerical_nan_inf_or_determinism_drift",
+        re.compile(
+            r"\bnan\b|\binf(?:inity)?\b|precision\s+(?:drift|drop|mismatch)|"
+            r"cosine\s+similarity|kl\s+divergence|non[-_]?deterministic|determinism\s+drift|"
+            r"gnorm\s+spike|loss\s+spike|HCCL_DETERMINISTIC|LCCL_DETERMINISTIC|"
+            r"VLLM_BATCH_INVARIANT|msprobe",
+            re.IGNORECASE,
+        ),
+    ),
+)
+
+MODEL_FAULT_REMEDIATIONS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "vllm_ascend_aclgraph_capture_failure": (
+        ("TORCH_COMPILE_DEBUG=1", "TORCH_LOGS=+dynamo,recompiles,graph_breaks", "ASCEND_LAUNCH_BLOCKING=0", "asys", "npu-smi"),
+        (
+            'Reduce ACLGraph capture buckets via --compilation-config \'{"cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32], "cudagraph_mode": "FULL_DECODE_ONLY"}\' when hitting 207008 / EL0009 (Insufficient_Stream_Resources).',
+            "Unset ASCEND_LAUNCH_BLOCKING=0 during ACLGraph capture, or pass --enforce-eager when debugging single-op execution.",
+            "Remove host-synchronizing .item() / aten::_local_scalar_dense calls inside model forward and mark dynamic dimensions with torch._dynamo.mark_static().",
+            'TORCH_COMPILE_DEBUG=1 TORCH_LOGS="+dynamo,recompiles,graph_breaks" <reproduce-command>',
+        ),
+    ),
+    "vllm_ascend_idle_dp_collective_hang": (
+        ("HCCL_ENTRY_LOG_ENABLE=1", "hccn_tool", "asys", "msnpureport"),
+        (
+            "Ensure idle DP ranks (num_tokens == 0 / active_batch == 0) execute a dummy forward pass with num_tokens_across_dp padding so all EP/TP ranks enter HcclAllReduce / HcclAlltoAllV / MC2 collectives together.",
+            "For hybrid linear-attention models (Qwen3-Next GDN / Kimi KDA), pad recurrent state updates on idle DP ranks without corrupting persistent state caches.",
+            'Enable --additional-config \'{"recompute_scheduler_enable": true}\' when using finegrained oproj_tensor_parallel_size or FlashComm1 across DP ranks.',
+            "Select moe_comm_type (mc2 vs alltoall) using max(num_tokens_across_dp) so all DP ranks dispatch identical collective primitives.",
+        ),
+    ),
+    "msmodelslim_quant_weight_or_scale_mismatch": (
+        ("msmodelslim", "msprobe", "asys"),
+        (
+            "Verify config.json quantization_config and quant_model_description.json match the vllm-ascend --quantization ascend / compressed-tensors loader contract.",
+            "Check weight_scale, input_scale, and dequant_scale tensor shapes and dtypes (int64/float32 for dequant_scale on W8A8/W4A8) and ensure excluded layers (lm_head, mlp.gate) are listed in ignore/exclude_layers.",
+            "Fallback quantization-sensitive layers (mlp.down_proj, self_attn.o_proj, MoE router/gate, shared_experts, MLA kv_b_proj) to BF16/FP16 (`disable_names`) if W8A8/W4A8 activation clamping overflows.",
+            "Apply msmodelslim outlier suppression (quarot, flex_smooth_quant, or iter_smooth) with real calibration prompts before exporting W8A8/W4A8 weights.",
+        ),
+    ),
+    "numerical_nan_inf_or_determinism_drift": (
+        ("msprobe", "HCCL_DETERMINISTIC=true", "LCCL_DETERMINISTIC=1", "VLLM_BATCH_INVARIANT=1", "asys"),
+        (
+            'Run layerwise precision dump with msprobe: --additional-config \'{"dump_config": {"dump_path": "./msprobe_dump", "task": "statistics", "level": "L1", "summary_mode": "md5"}}\' and compare against CPU/GPU golden via `msprobe compare -i ./compare.json -o ./compare_out`.',
+            "Enable bitwise deterministic execution: export HCCL_DETERMINISTIC=true LCCL_DETERMINISTIC=1 ATB_MATMUL_SHUFFLE_K_ENABLE=0 ATB_LLM_LCOC_ENABLE=0 and set VLLM_BATCH_INVARIANT=1 (or rl_config.enable_batch_invariant=true).",
+            "For FP16 overflow (NaN/Inf in RoPE, MLA query-key scaling, or DeepSeek/Gemma residual accumulation), switch to --dtype bfloat16 or clamp FP32 accumulator scales.",
+        ),
+    ),
+    "mooncake_or_kv_pool_transfer_fault": (
+        ("hccn_tool", "HCCL_SOCKET_IFNAME", "GLOO_SOCKET_IFNAME", "asys", "npu-smi"),
+        (
+            "Verify RoCE/RDMA NIC status (`hccn_tool -i <dev> -link -g`, `hccn_tool -i <dev> -ip -g`) and align HCCL_SOCKET_IFNAME and GLOO_SOCKET_IFNAME across Prefill (kv_producer) and Decode (kv_consumer) nodes.",
+            "When using Mooncake PD disaggregation with GQA models, use MooncakeLayerwiseConnector or disable C8 KV cache quantization (--quantization-param-path) which is incompatible with standard MooncakeConnector.",
+            "Ensure cp_kv_cache_interleave_size equals block_size when combining Context Parallelism (pcp/dcp) with Mooncake/HIXL KV transfer, and assign unique engine_id per P/D instance.",
+        ),
+    ),
+}
+MODEL_FAULT_CATEGORIES = tuple(MODEL_FAULT_REMEDIATIONS.keys())
+
+
+def _model_fault_category(text: str) -> str | None:
+    for category, pattern in _MODEL_FAULT_PATTERNS:
+        if pattern.search(text):
+            return category
+    return None
+
+
 def _parse_line(line: str, index: int) -> dict[str, Any]:
     codes = _codes(line)
     lowered = line.lower()
     sync_ind = _sync_indicators(line)
     graph_stg = _graph_stages(line)
+    model_cat = _model_fault_category(line)
     has_failure_word = any(
         token in lowered
-        for token in ("error", "fail", "exception", "timeout", "hang", "deadlock", "mismatch", "hazard", "race", "break", "abort")
+        for token in (
+            "error", "fail", "exception", "timeout", "hang", "deadlock", "mismatch",
+            "hazard", "race", "break", "abort", "nan", "inf", "overflow", "drift",
+            "spike", "missing", "incompatible", "exhaust",
+        )
     )
     is_error = (
         bool(ERROR_RE.search(line))
         or ("error" in lowered and bool(codes))
         or (bool(sync_ind) and (has_failure_word or bool(codes)))
         or (bool(graph_stg) and (has_failure_word or bool(codes)))
+        or (bool(model_cat) and (has_failure_word or bool(codes)))
     )
     timeout = bool(TIMEOUT_RE.search(line)) or any(code in {"EI0002", "EI0006"} for code in codes)
     moment, raw_time = _timestamp(line)
@@ -413,7 +497,7 @@ def _parse_line(line: str, index: int) -> dict[str, Any]:
         "stream_id": _first_int(STREAM_RE, line), "task_id": _first_int(TASK_RE, line),
         "operator": _operator(line), "bitmask": _bitmask(line),
         "subunits": _subunits(line), "sync_indicators": sync_ind,
-        "graph_stages": graph_stg,
+        "graph_stages": graph_stg, "model_fault_category": model_cat,
     }
 
 
@@ -429,7 +513,9 @@ def _score(parsed: dict[str, Any]) -> int:
         score += 95
     if any(code in {"507018", "EZ9999", "EZ2001", "E39999"} for code in codes):
         score += 90
-    if any(code in {"EE8888", "EE9999", "EE1002", "507046", "107002"} for code in codes):
+    if parsed.get("model_fault_category"):
+        score += 85
+    if any(code in {"EE8888", "EE9999", "EE1002", "507046", "107002", "207008", "EL0009"} for code in codes):
         score += 75
     if AICORE_RE.search(line):
         score += 70
@@ -443,7 +529,7 @@ def _score(parsed: dict[str, Any]) -> int:
         score += 45
     if NUMERIC_RE.search(line):
         score += 30
-    if parsed["timeout"]:
+    if parsed["timeout"] and not parsed.get("model_fault_category"):
         score += 5
     else:
         score += 20
@@ -456,6 +542,7 @@ def _domain(
     bitmask: int | None,
     sync_indicators: list[str],
     graph_stages: list[str],
+    model_fault_category: str | None = None,
 ) -> str:
     line = root["line"] if root else ""
     root_codes = root.get("codes") or codes
@@ -469,6 +556,8 @@ def _domain(
         return "aicore_memory_or_tiling"
     if any(code in {"EL0004", "E80000", "E89999", "EH0010", "507001", "507033"} for code in root_codes):
         return "device_oom_or_driver"
+    if model_fault_category:
+        return model_fault_category
     if hccl_codes or TIMEOUT_RE.search(line):
         return "hccl_collective_timeout_or_skew"
     if AICORE_RE.search(line):
@@ -484,7 +573,7 @@ def _domain(
     if any(code in {"EE8888", "EE9999", "EE1002", "507046"} for code in root_codes):
         return "runtime_stream_or_event"
     if NUMERIC_RE.search(line):
-        return "numeric_nan_or_precision"
+        return "numerical_nan_inf_or_determinism_drift"
     if bitmask and bitmask & (0x800000 | 0x400000):
         return "aicore_memory_or_tiling"
     return "unknown"
@@ -495,13 +584,19 @@ def _tools_for_triage(
     fault_domain: str,
     sync_indicators: list[str],
     graph_stages: list[str],
+    model_fault_category: str | None = None,
 ) -> list[str]:
     tools: list[str] = []
+    for cat in (model_fault_category, fault_domain):
+        if cat in MODEL_FAULT_REMEDIATIONS:
+            for tool in MODEL_FAULT_REMEDIATIONS[cat][0]:
+                if tool not in tools:
+                    tools.append(tool)
     if sync_indicators or fault_domain == "ascendc_sync_or_pipe_hazard":
         for tool in ("npu-check", "asys", "msaicerr", "npu-objdump", "msnpureport"):
             if tool not in tools:
                 tools.append(tool)
-    if graph_stages or fault_domain == "aclgraph_capture_or_stream":
+    if graph_stages or fault_domain in {"aclgraph_capture_or_stream", "vllm_ascend_aclgraph_capture_failure"}:
         for tool in ("TORCH_COMPILE_DEBUG=1", "ASCEND_LAUNCH_BLOCKING=1", "asys", "msnpureport", "npu-smi"):
             if tool not in tools:
                 tools.append(tool)
@@ -510,7 +605,7 @@ def _tools_for_triage(
         "hccl_collective_timeout_or_skew": ("hccn_tool", "HCCL_ENTRY_LOG_ENABLE=1", "asys", "msnpureport"),
         "device_oom_or_driver": ("npu-smi", "asys", "msnpureport"),
         "runtime_stream_or_event": ("ASCEND_LAUNCH_BLOCKING=1", "asys", "msnpureport", "npu-smi"),
-        "numeric_nan_or_precision": ("asys", "msaicerr", "npu-smi"),
+        "numeric_nan_or_precision": ("msprobe", "asys", "msaicerr", "npu-smi"),
         "unknown": ("asys", "msnpureport", "npu-smi"),
     }.get(fault_domain, ())
     for tool in domain_defaults:
@@ -528,13 +623,19 @@ def _actions(
     fault_domain: str,
     sync_indicators: list[str] = (),
     graph_stages: list[str] = (),
+    model_fault_category: str | None = None,
 ) -> list[str]:
     actions: list[str] = []
+    for cat in (model_fault_category, fault_domain):
+        if cat in MODEL_FAULT_REMEDIATIONS:
+            for command in MODEL_FAULT_REMEDIATIONS[cat][1]:
+                if command not in actions:
+                    actions.append(command)
     if sync_indicators or fault_domain == "ascendc_sync_or_pipe_hazard":
         for command in _SYNC_COMMANDS:
             if command not in actions:
                 actions.append(command)
-    if graph_stages or fault_domain == "aclgraph_capture_or_stream":
+    if graph_stages or fault_domain in {"aclgraph_capture_or_stream", "vllm_ascend_aclgraph_capture_failure"}:
         for command in _GRAPH_COMMANDS:
             if command not in actions:
                 actions.append(command)
@@ -559,7 +660,7 @@ def _actions(
 
 
 def triage_ascend_plog(plog_text: str) -> dict[str, Any]:
-    """Parse raw Ascend plog text and separate root cause from cascade timeouts."""
+    """Parse raw Ascend plog or vllm-ascend log text and separate root cause from cascade timeouts."""
     text = str(plog_text or "")
     parsed = [_parse_line(line, index) for index, line in enumerate(text.splitlines()) if line.strip()]
     errors = [item for item in parsed if item["is_error"]]
@@ -581,6 +682,7 @@ def triage_ascend_plog(plog_text: str) -> dict[str, Any]:
             "stream_id": None, "task_id": None,
             "cascading_timeout_detected": False, "cascading_timeout_lines": [],
             "cascading_rank": None, "decoded_codes": [], "fault_domain": "unknown",
+            "model_fault_category": None, "vllm_ascend_fault_category": None,
             "recommended_tools": default_tools,
             "remediation_steps": list(default_actions),
             "recommended_actions": default_actions,
@@ -610,19 +712,25 @@ def triage_ascend_plog(plog_text: str) -> dict[str, Any]:
     graph_stages = list(dict.fromkeys(
         root["graph_stages"] + [stg for item in parsed for stg in item["graph_stages"]]
     ))
-    domain = _domain(root, codes, bitmask, sync_indicators, graph_stages)
+    model_cat = root.get("model_fault_category") or next(
+        (item["model_fault_category"] for item in parsed if item.get("model_fault_category")),
+        None,
+    )
+    domain = _domain(root, codes, bitmask, sync_indicators, graph_stages, model_cat)
+    if model_cat is None and domain == "aclgraph_capture_or_stream":
+        model_cat = "vllm_ascend_aclgraph_capture_failure"
     decoded = [decode_cann_error_code(code) for code in codes]
     first_cascade = cascades[0] if cascades else None
     device_id = root["device_id"] or next((item["device_id"] for item in parsed if item["device_id"]), None)
     stream_id = root["stream_id"] or next((item["stream_id"] for item in parsed if item["stream_id"]), None)
     task_id = root["task_id"] or next((item["task_id"] for item in parsed if item["task_id"]), None)
     operator = root["operator"] or next((item["operator"] for item in parsed if item["operator"]), None)
-    actions = _actions(codes, domain, sync_indicators, graph_stages)
-    tools = _tools_for_triage(codes, domain, sync_indicators, graph_stages)
+    actions = _actions(codes, domain, sync_indicators, graph_stages, model_cat)
+    tools = _tools_for_triage(codes, domain, sync_indicators, graph_stages, model_cat)
     primary_detail = (
         decoded[0]["summary"]
         if decoded
-        else (", ".join(sync_indicators) if sync_indicators else (", ".join(graph_stages) if graph_stages else "unclassified error"))
+        else (model_cat or (", ".join(sync_indicators) if sync_indicators else (", ".join(graph_stages) if graph_stages else "unclassified error")))
     )
     summary = f"{domain}: {primary_detail}"
     if subunits:
@@ -638,8 +746,8 @@ def triage_ascend_plog(plog_text: str) -> dict[str, Any]:
         "aicore_subunits": subunits, "exception_subunits": list(subunits),
         "sync_hazard_detected": bool(sync_indicators),
         "sync_hazard_indicators": sync_indicators,
-        "graph_dfx_detected": bool(graph_stages),
-        "graph_dfx_stage": graph_stages[0] if graph_stages else None,
+        "graph_dfx_detected": bool(graph_stages or model_cat == "vllm_ascend_aclgraph_capture_failure"),
+        "graph_dfx_stage": graph_stages[0] if graph_stages else ("compile_or_capture" if model_cat == "vllm_ascend_aclgraph_capture_failure" else None),
         "graph_dfx_indicators": graph_stages,
         "failed_operator": operator, "kernel_name": operator, "device_id": device_id,
         "stream_id": stream_id, "task_id": task_id,
@@ -647,6 +755,8 @@ def triage_ascend_plog(plog_text: str) -> dict[str, Any]:
         "cascading_timeout_lines": [item["line"] for item in cascades[:8]],
         "cascading_rank": first_cascade["rank"] if first_cascade else None,
         "decoded_codes": decoded, "fault_domain": domain,
+        "model_fault_category": model_cat,
+        "vllm_ascend_fault_category": model_cat,
         "recommended_tools": tools,
         "remediation_steps": list(actions),
         "recommended_actions": actions,
@@ -655,4 +765,11 @@ def triage_ascend_plog(plog_text: str) -> dict[str, Any]:
     }
 
 
-__all__ = ["CANN_CODES", "RTS_CODES", "decode_cann_error_code", "triage_ascend_plog"]
+__all__ = [
+    "CANN_CODES",
+    "MODEL_FAULT_CATEGORIES",
+    "MODEL_FAULT_REMEDIATIONS",
+    "RTS_CODES",
+    "decode_cann_error_code",
+    "triage_ascend_plog",
+]

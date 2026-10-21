@@ -227,3 +227,54 @@ def test_hccl_config_and_runtime_stream_faults_recommend_targeted_commands():
     assert rts_fault["fault_domain"] == "runtime_stream_or_event"
     assert rts_fault["error_codes"] == ["EE9999", "EE8888"]
     assert "ASCEND_LAUNCH_BLOCKING=1" in rts_fault["recommended_tools"]
+
+
+def test_vllm_ascend_five_model_fault_categories_and_remediations():
+    aclgraph_res = triage_ascend_plog(
+        "[ERROR] RUNTIME(9001,9002):2026-09-22-18:00:00.000.000 "
+        "rank[0] deviceId:0 AclmdlRICaptureBegin failed: ErrCode=207008, EL0009 "
+        "Insufficient_Stream_Resources during cudagraph_capture_sizes capture"
+    )
+    assert aclgraph_res["fault_domain"] == "vllm_ascend_aclgraph_capture_failure"
+    assert aclgraph_res["model_fault_category"] == "vllm_ascend_aclgraph_capture_failure"
+    assert {"EL0009", "207008"} <= set(aclgraph_res["error_codes"])
+    assert any("FULL_DECODE_ONLY" in step for step in aclgraph_res["remediation_steps"])
+
+    idle_dp_res = triage_ascend_plog(
+        "[ERROR] HCCL(9101,9102):2026-09-22-18:01:00.000.000 "
+        "rank[1] deviceId:1 ErrCode=EI0002 HcclAlltoAllV / npu_moe_distribute_dispatch_v2 timeout: "
+        "idle dp rank 0 skipped forward with active_batch == 0 and num_tokens_across_dp mismatch"
+    )
+    assert idle_dp_res["fault_domain"] == "vllm_ascend_idle_dp_collective_hang"
+    assert idle_dp_res["model_fault_category"] == "vllm_ascend_idle_dp_collective_hang"
+    assert any("num_tokens_across_dp" in step for step in idle_dp_res["remediation_steps"])
+    assert any("recompute_scheduler_enable" in step for step in idle_dp_res["remediation_steps"])
+
+    quant_res = triage_ascend_plog(
+        "[ERROR] VLLM_ASCEND(9201,9202):2026-09-22-18:02:00.000.000 "
+        "rank[0] KeyError: msmodelslim quant_model_description.json missing weight_scale / dequant_scale "
+        "for AscendW8A8LinearMethod on model.layers.0.mlp.down_proj"
+    )
+    assert quant_res["fault_domain"] == "msmodelslim_quant_weight_or_scale_mismatch"
+    assert quant_res["model_fault_category"] == "msmodelslim_quant_weight_or_scale_mismatch"
+    assert "msmodelslim" in quant_res["recommended_tools"]
+    assert any("quant_model_description.json" in step for step in quant_res["remediation_steps"])
+
+    numeric_res = triage_ascend_plog(
+        "[ERROR] VLLM_ASCEND(9301,9302):2026-09-22-18:03:00.000.000 "
+        "rank[0] deviceId:0 NaN/Inf overflow and cosine similarity determinism drift detected in MLA attention"
+    )
+    assert numeric_res["fault_domain"] == "numerical_nan_inf_or_determinism_drift"
+    assert numeric_res["model_fault_category"] == "numerical_nan_inf_or_determinism_drift"
+    assert "msprobe" in numeric_res["recommended_tools"]
+    assert any("HCCL_DETERMINISTIC=true" in step for step in numeric_res["remediation_steps"])
+
+    mooncake_res = triage_ascend_plog(
+        "[ERROR] VLLM_ASCEND(9401,9402):2026-09-22-18:04:00.000.000 "
+        "rank[0] deviceId:0 MooncakeConnector kv_transfer register_memory / ibv_reg_mr failed "
+        "between kv_producer and kv_consumer with cp_kv_cache_interleave_size mismatch"
+    )
+    assert mooncake_res["fault_domain"] == "mooncake_or_kv_pool_transfer_fault"
+    assert mooncake_res["model_fault_category"] == "mooncake_or_kv_pool_transfer_fault"
+    assert any("MooncakeLayerwiseConnector" in step for step in mooncake_res["remediation_steps"])
+    assert any("cp_kv_cache_interleave_size" in step for step in mooncake_res["remediation_steps"])

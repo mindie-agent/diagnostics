@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/mindie-agent/mindie-agent/main/assets/brand/mindie-agent-logo.png" alt="MindIE Agent logo" width="128" height="128">
+</p>
+
 <h1 align="center">MindIE Agent Diagnostics (<code>mindie-diagnostics</code>)</h1>
 
 <p align="center">
@@ -25,10 +29,10 @@
 
 `mindie-diagnostics` 就是专门为 MindIE Agent 全家桶解决这两个痛点的共享诊断底座：
 
-- **全程零大模型调用（100% Model-Free）**：无论是记日志、清理旧文件、导出诊断包还是自动提 Issue，全都是纯确定性的本地 Python 代码，**绝不偷偷调用任何大模型、绝不抓取你的聊天记录（Transcript），也绝不会擅自重跑失败的业务命令**。
+- **全程零大模型调用（100% Model-Free）与确定性故障定界**：无论是记日志、解析 CANN 故障码/`plog`/算子编译/分布式通信信号、清理旧文件、导出诊断包还是自动提 Issue，全都是纯确定性的本地 Python 规则与代码，**绝不偷偷调用任何大模型、绝不抓取你的聊天记录（Transcript），也绝不会擅自重跑失败的业务命令**。
 - **循环写日志，永远不撑爆硬盘**：每个进程只用 4 个固定的 `1 MiB` JSONL 小文件循环写入（等读取方读完才覆盖），离线清理默认控制在 `7 天 / 128 MiB / 512 个文件` 以内。
-- **白名单级隐私脱敏，放心发 Issue**：导出的离线诊断包和公开 GitHub Issue 只保留**组件名、版本号、执行阶段、静态错误类别、耗时、退出码和组件自身的代码栈行号**。你的命令原文、代码内容、Prompt、文件路径、服务器 IP 和密码密钥**一概不准进诊断包**。
-- **自动上报完全自愿（默认关闭，随时撤回）**：GitHub Issue 自动上报默认处于关闭状态（Opt-in）。只有你显式开启后才会工作，而且一旦你关掉开关，队列里还没发出去的上报任务会立刻作废。
+- **白名单级本地隐私脱敏，放心发 Issue**：所有诊断证据在落盘导出或进入远端上报队列前均执行严格的本地脱敏——离线诊断包和公开 GitHub Issue 只保留**组件名、版本号、执行阶段、静态错误类别、耗时、退出码和组件自身的代码栈行号**。你的命令原文、代码内容、Prompt、文件路径、服务器 IP 和密码密钥**一概不准进诊断包**。
+- **与客户端插件共用统一贡献开关（默认关闭，随时撤回）**：在 MindIE Agent 宿主插件中，故障自动上报与社区知识共享共用同一份持久化授权（`mindie-consent.json`），默认处于关闭状态（Opt-in）。只有你显式确认开启后才会启动后台上报 Worker（遇到网络中断会自动退避重试，结果不确定的请求只核对远端去重标记、绝不重复建单）；一旦关掉开关，队列里未发送的任务会立刻作废。
 
 ```mermaid
 flowchart LR
@@ -47,13 +51,6 @@ flowchart LR
 ---
 
 ## 快速开始
-
-在 MindIE Agent 插件中，知识共享和故障上报共用该安装配置的贡献开关。
-显式选择贡献后，插件关联同一授权文件、配置诊断并启动原生后台 worker；
-配置成功不等于 worker 已就绪。旧版授权没有 `choice_revision` 时只提示重新明确选择，
-不会把旧的独立关闭选择升级成自动上传。不同安装配置各自拥有 policy、队列和 worker。
-网络或 GitHub 权限暂不可用时保留待发证据并退避重试；结果不确定的 POST 只核对远端 marker，
-不会自动重复创建 Issue。下面的底层 CLI 也可供独立组件显式管理诊断；插件通过统一贡献入口调用。
 
 ### 方式一：直接把链接发给你的 Agent 自动安装/接入（推荐）
 

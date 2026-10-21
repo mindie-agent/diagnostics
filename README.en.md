@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/mindie-agent/mindie-agent/main/assets/brand/mindie-agent-logo.png" alt="MindIE Agent logo" width="128" height="128">
+</p>
+
 <h1 align="center">MindIE Agent Diagnostics (<code>mindie-diagnostics</code>)</h1>
 
 <p align="center">
@@ -25,10 +29,10 @@ When troubleshooting remote development tools (`remote-dev`, `coordinator`, `npu
 
 `mindie-diagnostics` solves both problems across the entire MindIE Agent ecosystem:
 
-- **100% Model-Free Execution**: Recording logs, rotating files, exporting bundles, and filing Issues are pure deterministic Python operations — **they never call an LLM, never read conversation transcripts, and never replay failed user commands.**
+- **100% Model-Free Execution & Deterministic Fault Triage**: Recording logs, parsing CANN error codes / `plog` / operator build / distributed signals, rotating files, exporting bundles, and filing Issues are pure deterministic local Python operations — **they never call an LLM, never read conversation transcripts, and never replay failed user commands.**
 - **Bounded Ring-Buffer Logs That Never Fill Your Disk**: Each component writes to four fixed `1 MiB` JSONL segments per process (reusing a segment only after registered readers finish), with offline cleanup keeping each root within `7 days / 128 MiB / 512 files`.
-- **Strict Allowlist Privacy**: Exported bundles and public GitHub Issues contain **only static component names, versions, operation stages, error categories, durations, exit codes, and internal product stack frames**. Your commands, source code, prompts, file paths, host IPs, and credentials are completely excluded.
-- **Explicit Opt-In Issue Reporting**: Automatic GitHub Issue reporting is **off by default**. Turning it off immediately revokes any queued reports waiting to be sent.
+- **Strict Local Allowlist Redaction Before Any Export**: Diagnostic evidence is deterministically redacted locally before entering any bundle or outbound queue. Exported bundles and public GitHub Issues contain **only static component names, versions, operation stages, error categories, durations, exit codes, and internal product stack frames** — your commands, source code, prompts, file paths, host IPs, and credentials are never included.
+- **Unified Opt-In Contribution Switch**: Inside MindIE Agent host plugins, fault reporting and community knowledge sharing share a single persistent consent switch (`mindie-consent.json`) that is **off by default**. Enabling contribution starts an isolated background reporter worker (which backs off on transient network failures and reconciles remote markers instead of creating duplicate Issues); turning it off immediately revokes any unsent reports in the queue.
 
 ```mermaid
 flowchart LR
@@ -47,18 +51,6 @@ flowchart LR
 ---
 
 ## Quick Start
-
-MindIE Agent plugins use one contribution choice per installation profile for
-knowledge sharing and fault reporting. An explicit contribution choice links the
-same consent authority, configures diagnostics, and starts the native worker.
-Configuration alone does not mean that the worker is ready. Legacy choices
-without `choice_revision` require an explicit unified choice before diagnostics
-upload; an old reporting opt-out is never silently expanded. Profiles own separate
-policies, queues, and workers. Temporary network or GitHub permission failures
-retain evidence with backoff. An uncertain POST only reconciles remote markers
-and never automatically creates another issue. The lower-level CLI below also
-supports explicitly managed standalone components; plugins use their unified
-contribution entrypoint.
 
 ### Option 1: One-Sentence Setup via Your AI Agent (Recommended)
 

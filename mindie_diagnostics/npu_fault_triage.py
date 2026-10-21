@@ -765,6 +765,16 @@ def triage_ascend_plog(plog_text: str) -> dict[str, Any]:
     }
 
 
+def triage_npu_fault(plog_text: str) -> dict[str, Any]:
+    """Public alias for the Ascend plog root-cause classifier.
+
+    ``triage_ascend_plog`` remains the descriptive implementation name.  The
+    shorter public spelling is stable for release benchmarks and downstream
+    integrations that triage a mix of HCCL, driver and device faults.
+    """
+    return triage_ascend_plog(plog_text)
+
+
 __all__ = [
     "CANN_CODES",
     "MODEL_FAULT_CATEGORIES",
@@ -772,4 +782,5 @@ __all__ = [
     "RTS_CODES",
     "decode_cann_error_code",
     "triage_ascend_plog",
+    "triage_npu_fault",
 ]

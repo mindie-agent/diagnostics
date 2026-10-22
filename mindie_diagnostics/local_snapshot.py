@@ -90,6 +90,8 @@ def recent_failures(roots):
                 break
             try:
                 data, partial = _tail(name)
+            except TimeoutError:
+                raise
             except OSError as exc:
                 result['errors'].append({'category': 'log_read_failed', 'error_type': type(exc).__name__})
                 result['truncated'] = True
@@ -127,6 +129,8 @@ def recent_failures(roots):
         records.sort(key=lambda row: row.get('timestamp', ''), reverse=True)
         result['recent'] = records[:5]
         result['truncated'] |= len(records) > 5
+    except TimeoutError:
+        raise
     except (OSError, ValueError, TypeError) as exc:
         result['errors'].append({'category': 'log_scan_failed', 'error_type': type(exc).__name__})
         result['truncated'] = True

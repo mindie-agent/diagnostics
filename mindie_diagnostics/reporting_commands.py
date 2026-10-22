@@ -84,15 +84,27 @@ def maintain(config=None, *, update_running=False, unit_dir=None, budget_seconds
     if queue is not None:
         queue.maintain()
         queue.withdraw_unconsented()
+    enabled = bool(policy and policy.get('decision') == 'enabled')
+    active_queue = queue if enabled else None
     for root in roots:
         if time.monotonic() >= deadline:
             result['retention'].append({'status': 'unavailable', 'category': 'budget_exhausted', 'limited': True})
             break
         try:
-            if queue is not None:
-                result['ingestion'].append(ingest(root, queue, max_files=32, max_bytes=1024*1024,
+            if not enabled and (Path(root) / '.readers' / 'registry.json').exists():
+                from .reader_registry import unregister_reader
+                try:
+                    unregister_reader(root, path, timeout=min(.2, max(0, deadline - time.monotonic())))
+                except TimeoutError:
+                    raise
+                except (OSError, ValueError, RuntimeError):
+                    pass
+            if active_queue is not None:
+                result['ingestion'].append(ingest(root, active_queue, max_files=32, max_bytes=1024*1024,
                                                  config=config))
-            result['retention'].append(prune(root, queue=queue))
+            result['retention'].append(prune(root, queue=active_queue))
+        except TimeoutError:
+            raise
         except (OSError, ValueError, RuntimeError) as exc:
             result['status'] = 'degraded'
             result['retention'].append({'status': 'unavailable', 'category': type(exc).__name__})
@@ -166,6 +178,8 @@ def ensure(config=None, *, unit_dir=None):
                     'recovery_hint': 'Inspect reporting status; an explicit reporting ensure may restart a stopped worker.'}
     except ServiceError as exc:
         return {'status': 'degraded', 'category': exc.category}
+    except TimeoutError:
+        raise
     except (OSError, ValueError, RuntimeError) as exc:
         # Runtime exceptions contain only static product categories.
         category = str(exc) if isinstance(exc, RuntimeError) and str(exc).replace('_','').isalnum() and len(str(exc))<80 else 'reporting_ensure_failed'
@@ -188,9 +202,9 @@ def _bounded_runner(deadline):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise subprocess.TimeoutExpired(command, 0)
-        timeout = kwargs.get('timeout')
-        kwargs['timeout'] = remaining if timeout is None else min(timeout, remaining)
-        return subprocess.run(command, **kwargs)
+        timeout = kwargs.pop('timeout', None)
+        bounded_timeout = remaining if timeout is None else min(timeout, remaining)
+        return subprocess.run(command, timeout=bounded_timeout, **kwargs)
 
     run.deadline = deadline
     return run
@@ -332,6 +346,8 @@ def upgrade_running(config=None, *, unit_dir=None, deadline=None):
                 failure = exc.category
                 failure_action = exc.action
                 failure_returncode = exc.returncode
+            except TimeoutError:
+                raise
             except (OSError, ValueError, RuntimeError) as exc:
                 failure = _safe_category(exc, 'reporter_update_failed')
             extra = {}
@@ -362,7 +378,7 @@ def upgrade_running(config=None, *, unit_dir=None, deadline=None):
                             worker.get('healthy') and worker.get('runtime_source') == current['source_hash']):
                         time.sleep(.1)
                         worker = _worker_view(config)
-                    native_status = service_status(unit_dir=unit_dir, runner=runner)
+                    native_status = service_status(unit_dir=unit_dir, runner=rollback_runner)
                     rollback = ('restored'
                                 if worker.get('healthy')
                                 and worker.get('runtime_source') == current['source_hash']
@@ -374,6 +390,8 @@ def upgrade_running(config=None, *, unit_dir=None, deadline=None):
                     rollback = 'failed'
                     rollback_action = exc.action
                     rollback_returncode = exc.returncode
+                except TimeoutError:
+                    raise
                 except (OSError, ValueError, RuntimeError):
                     rollback = 'failed'
             if rollback_action is not None:
@@ -391,5 +409,7 @@ def upgrade_running(config=None, *, unit_dir=None, deadline=None):
         if exc.returncode is not None:
             result['failure_returncode'] = exc.returncode
         return result
+    except TimeoutError:
+        raise
     except (OSError, ValueError, RuntimeError) as exc:
         return {'status': 'degraded', 'reason': _safe_category(exc, 'reporter_update_failed')}

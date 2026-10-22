@@ -57,6 +57,14 @@ def test_service_status_and_remove_remain_available():
         assert args.command == 'service' and args.action == action
 
 
+def test_service_failure_status_returns_nonzero(monkeypatch, capsys):
+    from mindie_diagnostics import service
+    for status, expected in (('active', 0), ('failed', 1), ('unknown', 1), ('error', 1)):
+        monkeypatch.setattr(service, 'service_status', lambda status=status: {'status': status})
+        assert cli.main(['service', 'status']) == expected
+        assert json.loads(capsys.readouterr().out) == {'status': status}
+
+
 def test_reporting_maintain_forwards_optional_flags(monkeypatch, capsys):
     from mindie_diagnostics import reporting_commands
     seen = []

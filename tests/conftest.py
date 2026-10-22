@@ -8,6 +8,16 @@ def isolated_runtime(tmp_path, monkeypatch):
     # runner-under-test code, even when the original variable did not exist.
     for key in ('GH_TOKEN', 'GITHUB_TOKEN', 'MINDIE_COMMUNITY_POLICY'):
         monkeypatch.setenv(key, '')
+    home = tmp_path.resolve() / 'home'
+    for key, value in (
+        ('HOME', home),
+        ('USERPROFILE', home),
+        ('XDG_CONFIG_HOME', tmp_path.resolve() / 'xdg-config'),
+        ('XDG_STATE_HOME', tmp_path.resolve() / 'xdg-state'),
+        ('LOCALAPPDATA', tmp_path.resolve() / 'localappdata'),
+        ('MINDIE_DIAGNOSTICS_SERVICE_DIR', tmp_path.resolve() / 'service'),
+    ):
+        monkeypatch.setenv(key, str(value))
     monkeypatch.setenv('MINDIE_DIAGNOSTICS_ROOT', str(tmp_path.resolve() / 'isolated-diagnostics'))
     monkeypatch.setenv('MINDIE_DIAGNOSTICS_CONFIG', str(tmp_path.resolve() / 'reporting.json'))
     from mindie_diagnostics import reporter

@@ -156,7 +156,7 @@ def main(argv: list[str] | None = None) -> int:
                               'returncode': exc.returncode}), flush=True)
             return 1
         print(json.dumps(result, ensure_ascii=True))
-        return 0
+        return 0 if result.get("status") not in {"unknown", "error", "failed"} else 1
     if args.command == "bundle":
         from .bundle import collect_bundle
         print(json.dumps(collect_bundle(args.root, operation_id=args.operation_id, output=args.output), ensure_ascii=True))
@@ -221,6 +221,15 @@ def main(argv: list[str] | None = None) -> int:
             if (policy is None or policy['decision'] != 'enabled' or policy['repository'] != args.repository
                     or Path(args.state).absolute() != f.state_path(args.reporting_config)):
                 queue.withdraw_unconsented()
+                from .reader_registry import unregister_reader
+                for root in args.root:
+                    if (Path(root) / '.readers' / 'registry.json').exists():
+                        try:
+                            unregister_reader(root, queue.path, timeout=0.5)
+                        except TimeoutError:
+                            raise
+                        except (OSError, ValueError, RuntimeError):
+                            pass
                 return 0
             args.root = list(policy['roots'])
             result = run_cycle(args, queue, github, recorder, health, since=since)

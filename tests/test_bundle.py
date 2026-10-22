@@ -133,6 +133,8 @@ def test_symlink_and_overwrite_guards(tmp_path):
     link = tmp_path / "link"
     try:
         link.symlink_to(tmp_path, target_is_directory=True)
+    except TimeoutError:
+        raise
     except OSError:
         pytest.skip("symlink creation unavailable")
     with pytest.raises(ValueError, match="symlink"):

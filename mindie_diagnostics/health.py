@@ -47,6 +47,8 @@ def read_health(state, *, clock=time.time):
                                     now - data['progress_at'] > max(1200, data['interval'] * 3))
         data['healthy'] = not data['stale'] and not data['progress_stalled'] and data['status'] in {'running', 'idle'}
         return data
+    except TimeoutError:
+        raise
     except (OSError, ValueError, TypeError, KeyError):
         return {'status': 'unreadable', 'healthy': False}
 

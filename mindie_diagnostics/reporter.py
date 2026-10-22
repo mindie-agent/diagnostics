@@ -196,6 +196,8 @@ def _run_gh(command, data, *, deadline, max_bytes, cancel=None):
             else:
                 try:
                     os.killpg(proc.pid, signal.SIGTERM)
+                except TimeoutError:
+                    raise
                 except OSError:
                     pass
                 # The leader can exit while descendants still own its pipes.
@@ -204,11 +206,15 @@ def _run_gh(command, data, *, deadline, max_bytes, cancel=None):
                 while time.monotonic() < until:
                     try:
                         os.killpg(proc.pid, 0)
+                    except TimeoutError:
+                        raise
                     except OSError:
                         break
                     time.sleep(0.01)
                 try:
                     os.killpg(proc.pid, signal.SIGKILL)
+                except TimeoutError:
+                    raise
                 except OSError:
                     pass
             try:
@@ -221,6 +227,8 @@ def _run_gh(command, data, *, deadline, max_bytes, cancel=None):
             if stream is not None:
                 try:
                     stream.close()
+                except TimeoutError:
+                    raise
                 except OSError:
                     cleanup_failed = True
     for thread in threads:

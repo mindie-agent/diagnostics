@@ -329,6 +329,8 @@ def collect_bundle(root, *, operation_id=None, output=None, max_bytes=MAX_BYTES,
                             omitted += removed
                     except (ValueError, TypeError, OverflowError, RecursionError):
                         invalid += 1
+        except TimeoutError:
+            raise
         except (OSError, ValueError):
             gaps.add("unreadable_event_file")
     def payload():

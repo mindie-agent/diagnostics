@@ -39,7 +39,7 @@ def test_async_contexts_do_not_leak():
 def test_environment_round_trip_and_bad_input(monkeypatch):
     env = {**os.environ, "MINDIE_DIAGNOSTICS_CONTEXT": json.dumps({"trace_id": "a" * 32, "token": "never"})}
     result = subprocess.run([sys.executable, "-c", "import json; from mindie_diagnostics import current_context; print(json.dumps(current_context()))"],
-                            env=env, capture_output=True, text=True, check=True)
+                            env=env, capture_output=True, text=True, check=True, timeout=10)
     assert json.loads(result.stdout) == {"trace_id": "a" * 32}
     for raw in ("[]", "{broken", '{"trace_id": "not-id"}', "x" * 2049):
         monkeypatch.setenv("MINDIE_DIAGNOSTICS_CONTEXT", raw)

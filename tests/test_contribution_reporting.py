@@ -43,12 +43,16 @@ def test_two_profiles_ingest_only_their_own_events_and_withdraw_independently(tm
     assert policy.current_consent(profiles[0][1]) is None
     assert policy.current_consent(profiles[1][1]) is not None
     assert policy.service_directory(profiles[0][1]) != policy.service_directory(profiles[1][1])
+    # A disabled profile reader must be pruned from registry.json so it never starves active profiles.
+    from mindie_diagnostics.reader_registry import reader_guard
+    with reader_guard(root) as state:
+        assert state["readers"] == [str(profiles[1][3].path)]
 
 
 def test_live_authority_gates_post_without_policy_reconfiguration(tmp_path):
-    consent, config = tmp_path / "consent.json", tmp_path / "diagnostics.json"
+    consent, config, root = tmp_path / "consent.json", tmp_path / "diagnostics.json", tmp_path / "logs"
     revision = authority(consent)
-    configure_reporting(True, config=config, consent_config=consent)
+    configure_reporting(True, config=config, consent_config=consent, roots=[str(root)])
     reference = policy.current_consent(config)
     consent.write_text("{")
     with pytest.raises(ConsentUnavailable):
@@ -59,15 +63,15 @@ def test_live_authority_gates_post_without_policy_reconfiguration(tmp_path):
     assert policy.consent_status(reference) == "withdrawn"
     authority(consent)
     assert policy.consent_status(reference) == "withdrawn"
-    configure_reporting(True, config=config, consent_config=consent)
+    configure_reporting(True, config=config, consent_config=consent, roots=[str(root)])
     assert policy.current_consent(config)["revision"] != reference["revision"]
 
 
 def test_legacy_choice_does_not_authorize_new_reporting(tmp_path):
-    consent, config = tmp_path / "consent.json", tmp_path / "diagnostics.json"
+    consent, config, root = tmp_path / "consent.json", tmp_path / "diagnostics.json", tmp_path / "logs"
     consent.write_text(json.dumps({"schema": "mindie-consent/1", "choice": "contribute",
                                    "reporting": "disabled"}))
-    assert configure_reporting(True, config=config, consent_config=consent)["category"] == "contribution_not_enabled"
+    assert configure_reporting(True, config=config, consent_config=consent, roots=[str(root)])["category"] == "contribution_not_enabled"
     assert policy.current_consent(config) is None
 
 

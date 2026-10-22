@@ -89,12 +89,16 @@ def _is_source_hash(value):
 def _revision(dist):
     try:
         raw = dist.read_text("direct_url.json")
+    except TimeoutError:
+        raise
     except Exception:
         return None
     if not raw:
         return None
     try:
         meta = json.loads(raw)
+    except TimeoutError:
+        raise
     except Exception:
         _fail("source_rejected")
     editable = (meta.get("dir_info") or {}).get("editable")
@@ -148,11 +152,15 @@ def _collect(dist, read_bounded):
             _fail("source_rejected")
         try:
             data = read_bounded(loc, _MAX_BYTES)
+        except TimeoutError:
+            raise
         except Exception:
             _fail("source_rejected")
         if data is None:
             try:
                 st = loc.lstat()
+            except TimeoutError:
+                raise
             except OSError:
                 _fail("source_rejected")
             if not stat.S_ISREG(st.st_mode) or st.st_size != 0:
@@ -208,6 +216,8 @@ def _ensure_dir(path, absolute, owned):
         return path
     try:
         _private_mkdir(path, parents=True, exist_ok=True)
+    except TimeoutError:
+        raise
     except OSError:
         _fail("runtime_untrusted")
     if os.name != "nt":
@@ -274,6 +284,8 @@ def _load_json(path, read_bounded, limit):
         doc = json.loads(raw if isinstance(raw, str) else bytes(raw).decode())
     except RuntimeError:
         raise
+    except TimeoutError:
+        raise
     except Exception:
         _fail("runtime_untrusted")
     if not isinstance(doc, dict):
@@ -307,12 +319,16 @@ def _verify(py, version, site, work, deadline=None):
             _fail("verify_failed")
     except RuntimeError:
         raise
+    except TimeoutError:
+        raise
     except Exception:
         _fail("verify_failed")
     finally:
         for path in (out, err):
             try:
                 os.unlink(path)
+            except TimeoutError:
+                raise
             except OSError:
                 pass
 
@@ -436,6 +452,8 @@ def _transaction_lock(root, timeout):
         _fail("runtime_untrusted")
     try:
         fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), _FILE)
+    except TimeoutError:
+        raise
     except OSError:
         _fail("runtime_untrusted")
     try:
@@ -456,6 +474,8 @@ def _transaction_lock(root, timeout):
 
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
+            except TimeoutError:
+                raise
             except (BlockingIOError, OSError):
                 if time.monotonic() >= deadline:
                     _fail("runtime_busy")
@@ -467,6 +487,8 @@ def _transaction_lock(root, timeout):
                 try:
                     os.lseek(fd, 0, os.SEEK_SET)
                     msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                except TimeoutError:
+                    raise
                 except OSError:
                     pass
     finally:
@@ -513,6 +535,8 @@ def _create_venv(target, deadline=None):
         )
     except subprocess.TimeoutExpired:
         _fail("runtime_deadline_exceeded")
+    except TimeoutError:
+        raise
     except OSError:
         _fail("verify_failed")
     if proc.returncode != 0:
@@ -596,6 +620,8 @@ def prepare_runtime(config=None):
         with runtime_transaction(config):
             return _prepare_locked(config)
     except RuntimeError:
+        raise
+    except TimeoutError:
         raise
     except Exception:
         raise RuntimeError("runtime_unavailable") from None

@@ -375,7 +375,7 @@ def test_generated_unit_is_accepted_by_actual_systemd_analyze_and_old_workdir_re
     replies = []
     def runner(argv, **options):
         if Path(argv[0]).name == 'systemd-analyze':
-            reply = subprocess.run(argv, **options)
+            reply = subprocess.run(argv, timeout=options.pop('timeout', 30), **options)
             replies.append(reply)
             assert reply.returncode == 0, reply.stderr
             return reply

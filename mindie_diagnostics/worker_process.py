@@ -54,5 +54,7 @@ def windows_process(pid):
             return True, identity
         finally:
             kernel.CloseHandle(handle)
+    except TimeoutError:
+        raise
     except (OSError, AttributeError):
         return None, None

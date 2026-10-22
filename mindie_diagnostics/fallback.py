@@ -81,6 +81,8 @@ def _private_mkdir(path, *, parents=False, exist_ok=False):
     if not existed and os.name != "nt":
         try:
             path.chmod(0o700)
+        except TimeoutError:
+            raise
         except OSError:
             pass
 
@@ -479,6 +481,8 @@ def _retention_blocked(root):
     try:
         data = json.loads((root / "retention-state.json").read_bytes())
         return isinstance(data, dict) and data.get("blocked") is True
+    except TimeoutError:
+        raise
     except (OSError, ValueError, TypeError):
         return False
 
@@ -509,6 +513,8 @@ def _ensure_owned_tree(root, leaf) -> bool:
             return False
         _private_mkdir(leaf, parents=True, exist_ok=True)
         return not leaf.is_symlink() and leaf.is_dir()
+    except TimeoutError:
+        raise
     except OSError:
         return False
 
@@ -524,6 +530,8 @@ def _read_regular_bounded(path, limit):
         if Path(path).is_symlink():
             return None
         fd = os.open(os.fspath(path), flags)
+    except TimeoutError:
+        raise
     except OSError:
         return None
     try:
@@ -531,6 +539,8 @@ def _read_regular_bounded(path, limit):
         if not stat.S_ISREG(info.st_mode) or info.st_size <= 0 or info.st_size > limit:
             return None
         blob = os.read(fd, limit + 1)
+    except TimeoutError:
+        raise
     except OSError:
         return None
     finally:

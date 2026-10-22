@@ -123,6 +123,8 @@ def _try_lock(fd: int) -> bool:
             import fcntl
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return True
+    except TimeoutError:
+        raise
     except (BlockingIOError, OSError):
         return False
 
@@ -135,6 +137,30 @@ def _unlock(fd: int) -> None:
     else:
         import fcntl
         fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+def _active_reader(binding: str) -> bool:
+    """Prune deleted reader DBs or disabled profile queues so retention never self-bricks."""
+    path = _real_path(binding)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    except TimeoutError:
+        raise
+    except OSError:
+        return True
+    if not _regular(info):
+        return True
+    if path.name == "reporter.sqlite3" and path.parent.suffix == ".state":
+        from .fallback import PolicyUnavailable, read_policy
+        try:
+            policy = read_policy(path.parent.with_suffix(".json"))
+        except PolicyUnavailable:
+            return True
+        if policy is None or policy.get("decision") != "enabled":
+            return False
+    return True
 
 
 @contextmanager
@@ -157,12 +183,13 @@ def reader_guard(root, timeout: float = 2.0, queue_path=None):
                 raise TimeoutError("diagnostic reader registry is busy")
             time.sleep(min(.005, max(0, deadline - time.monotonic())))
         locked = True
-        readers = _readers(folder)
-        if queue_path is not None:
-            binding = _queue_path(queue_path)
-            if binding not in readers:
-                readers.append(binding)
-                _save(folder, readers)
+        existing = _readers(folder)
+        binding = _queue_path(queue_path) if queue_path is not None else None
+        readers = [r for r in existing if r == binding or _active_reader(r)]
+        if binding is not None and binding not in readers:
+            readers.append(binding)
+        if readers != existing:
+            _save(folder, readers)
         state = {"status": "ok", "readers": readers}
     except TimeoutError:
         state = {"status": "unknown", "reason": "timeout", "readers": []}
@@ -210,13 +237,16 @@ def cursor_snapshot(readers, timeout: float = 2.0):
         for binding in readers:
             if time.monotonic() >= deadline:
                 return None
+            if not _active_reader(binding):
+                continue
             path = _real_path(binding)
             if not _regular(path.lstat()):
                 return None
             remaining = max(0, deadline - time.monotonic())
-            db = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=remaining)
+            db = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=max(3.0, remaining))
             try:
                 db.execute("PRAGMA query_only=ON")
+                db.execute("PRAGMA busy_timeout=3000")
                 db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
                 table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='cursors'").fetchone()
                 rows = db.execute("SELECT path,inode,offset FROM cursors LIMIT ?", (_MAX_CURSOR_ROWS + 1,)).fetchall() if table else []
@@ -233,6 +263,8 @@ def cursor_snapshot(readers, timeout: float = 2.0):
             finally:
                 db.close()
         return snapshots
+    except TimeoutError:
+        raise
     except (OSError, sqlite3.Error, ValueError, TypeError):
         return None
 
@@ -262,6 +294,8 @@ class PressureReader:
             signature = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
         except FileNotFoundError:
             signature = None
+        except TimeoutError:
+            raise
         except OSError:
             return False
         if force or signature != self.signature:
@@ -276,5 +310,7 @@ def pressure_blocked(root) -> bool:
         path = _real_path(root) / "retention-state.json"
         data = json.loads(_read(path, 2048))
         return isinstance(data, dict) and data.get("schema") == 1 and data.get("blocked") is True
+    except TimeoutError:
+        raise
     except (OSError, ValueError, TypeError, UnicodeError):
         return False

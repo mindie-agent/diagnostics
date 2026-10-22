@@ -71,6 +71,8 @@ def drain(descriptor, operation, stream, storage_warning=None):
             # A final fragment is not proven to contain a complete credential.
             operation.event("WARNING", "process.output.gap", stream=stream,
                             omitted_bytes=len(pending) + discarded, reason="incomplete_line")
+    except TimeoutError:
+        raise
     except OSError as exc:
         operation.event("WARNING", "process.output.gap", stream=stream, error_type=type(exc).__name__)
     finally:
@@ -137,11 +139,15 @@ def capture_output(operation):
             for descriptor, backup in saved:
                 try:
                     os.dup2(backup, descriptor)
+                except TimeoutError:
+                    raise
                 except OSError as exc:
                     operation.event("WARNING", "process.output.gap", error_type=type(exc).__name__, reason="restore_unavailable")
                 finally:
                     try:
                         os.close(backup)
+                    except TimeoutError:
+                        raise
                     except OSError:
                         pass
             for thread in readers:

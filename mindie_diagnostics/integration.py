@@ -303,6 +303,8 @@ def _write_policy(path, payload):
         return False
     try:
         f._private_mkdir(path.parent, parents=True, exist_ok=True)
+    except TimeoutError:
+        raise
     except OSError:
         return False
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
@@ -317,6 +319,8 @@ def _write_policy(path, payload):
             os.close(fd)
         os.replace(tmp, path)
         return True
+    except TimeoutError:
+        raise
     except OSError:
         return False
     finally:
@@ -376,6 +380,17 @@ def configure_reporting(enabled, *, repository="mindie-agent/mindie-agent", conf
         blob = json.dumps(policy, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("utf-8")
         if len(blob) > 16384 or not _write_policy(path, blob):
             return _error("write_failed")
+        if not enabled:
+            from .reader_registry import unregister_reader
+            queue_path = f.state_path(config) / "reporter.sqlite3"
+            for root_dir in chosen:
+                if (Path(root_dir) / ".readers" / "registry.json").exists():
+                    try:
+                        unregister_reader(root_dir, queue_path, timeout=0.2)
+                    except TimeoutError:
+                        raise
+                    except (OSError, ValueError, RuntimeError):
+                        pass
         return {
             "status": "configured",
             "enabled": enabled,
@@ -430,6 +445,8 @@ def _worker_view(config):
     try:
         if f._lstat_or_missing(path) is None:
             return {"status": "not_started", "healthy": False}
+    except TimeoutError:
+        raise
     except OSError:
         return {"status": "unavailable", "healthy": False}
     raw = f._read_regular_bounded(path, _HEALTH_LIMIT)
@@ -454,6 +471,8 @@ def _worker_view(config):
                 alive = True
             except ProcessLookupError:
                 alive = False
+            except TimeoutError:
+                raise
             except OSError:
                 pass
         elif os.name == "nt":
@@ -560,6 +579,8 @@ def _read_outbox(config, repository):
         info = f._lstat_or_missing(path)
         if info is None:
             return _queue_absent()
+    except TimeoutError:
+        raise
     except OSError as exc:
         return _queue_unavailable(type(exc).__name__)
     if os.path.islink(path) or not stat.S_ISREG(info.st_mode) or info.st_size <= 0:
@@ -627,6 +648,8 @@ def _runtime_view(config):
     try:
         if f._lstat_or_missing(path) is None:
             return {'status': 'not_prepared'}
+    except TimeoutError:
+        raise
     except OSError:
         return {'status': 'unavailable'}
     raw = f._read_regular_bounded(path, 4096)

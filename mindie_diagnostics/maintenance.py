@@ -43,6 +43,8 @@ def _writer_exited(pid: int) -> bool:
         os.kill(pid, 0)
     except ProcessLookupError:
         return True
+    except TimeoutError:
+        raise
     except (OSError, ValueError, OverflowError):
         return False
     return False
@@ -151,6 +153,8 @@ def prune(root: str | Path, *, max_bytes: int = 128 * 1024 * 1024,
                 remaining -= 1
                 result['removed_files'] += 1
                 result['removed_bytes'] += size
+    except TimeoutError:
+        raise
     except (OSError, ValueError):
         incomplete = True
         result['reader_unknown'] = True
@@ -161,6 +165,8 @@ def prune(root: str | Path, *, max_bytes: int = 128 * 1024 * 1024,
     result['limited'] = bool(blocked or result['reader_unknown'])
     try:
         _marker(root, result, blocked, now)
+    except TimeoutError:
+        raise
     except (OSError, ValueError):
         result['limited'] = True
         result['marker_failed'] = True

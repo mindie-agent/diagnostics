@@ -35,6 +35,98 @@ def test_real_failure_ingestion_redaction_and_incremental_resume(tmp_path):
     assert queue.rows()[0]['incident_ids'] == [op.operation_id]
 
 
+class StopAfterRows:
+    """Owner stop-event shape, tripped by real queue progress, not call counts."""
+
+    def __init__(self, queue, rows):
+        self.queue, self.rows = queue, rows
+
+    def is_set(self):
+        return len(self.queue.rows()) >= self.rows
+
+
+def distinct_faults(root, *operations):
+    from mindie_diagnostics.integration import record_failure
+    identifiers = [record_failure('mindie-diagnostics', operation, stage='connect',
+                                  category='internal', exception=RuntimeError('x'),
+                                  root=root)['incident_id']
+                   for operation in operations]
+    assert all(identifiers)
+    files = list((root / 'events' / 'mindie-diagnostics').glob('*.jsonl'))
+    assert len(files) == 1
+    return Path(files[0]), identifiers
+
+
+def test_stop_during_ingestion_resumes_at_the_same_complete_record(tmp_path):
+    segment, identifiers = distinct_faults(tmp_path, 'drain.first', 'drain.second', 'drain.third')
+    size = segment.stat().st_size
+    queue = Outbox(tmp_path / 'queue.db')
+
+    stopped = ingest(tmp_path, queue, cancel=StopAfterRows(queue, 2))
+    assert (stopped['enqueued'], stopped['limited']) == (2, 1)
+    assert 0 < stopped['scanned_bytes'] < size
+    with queue.connect() as db:
+        saved = db.execute('SELECT inode, offset FROM cursors').fetchall()
+    # The cursor ends at the last enqueued record, never at end of file.
+    assert [(row['inode'], row['offset']) for row in saved] == [
+        (str(segment.stat().st_ino), stopped['scanned_bytes'])]
+
+    resumed = ingest(tmp_path, queue)
+    assert (resumed['enqueued'], resumed['limited']) == (1, 0)
+    # Every byte is read exactly once across the interrupted and resumed cycle.
+    assert stopped['scanned_bytes'] + resumed['scanned_bytes'] == size
+    assert sorted(sum((row['incident_ids'] for row in queue.rows()), [])) == sorted(identifiers)
+    assert ingest(tmp_path, queue)['scanned_bytes'] == 0
+
+
+def test_expired_absolute_deadline_consumes_nothing_and_defers_the_scan(tmp_path):
+    import time
+
+    segment, identifiers = distinct_faults(tmp_path, 'drain.first', 'drain.second')
+    queue = Outbox(tmp_path / 'queue.db')
+    expired = ingest(tmp_path, queue, deadline=time.monotonic() - 1)
+    assert (expired['enqueued'], expired['files'], expired['limited']) == (0, 0, 1)
+    with queue.connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM cursors').fetchone()[0] == 0
+    later = ingest(tmp_path, queue, deadline=time.monotonic() + 30)
+    assert (later['enqueued'], later['limited']) == (2, 0)
+    assert later['scanned_bytes'] == segment.stat().st_size
+    assert sorted(sum((row['incident_ids'] for row in queue.rows()), [])) == sorted(identifiers)
+
+
+def test_maintenance_scan_cutoff_skips_retention_and_resumes(tmp_path, monkeypatch, reporting_consent):
+    from mindie_diagnostics import fallback, maintenance, reporting_commands
+
+    segment, identifiers = distinct_faults(tmp_path, 'budget.first', 'budget.second')
+    queue = Outbox(fallback.state_path(reporting_consent['config_file']) / 'reporter.sqlite3')
+    clock = [100.0]
+    monkeypatch.setattr(reporting_commands.time, 'monotonic', lambda: clock[0])
+    real_enqueue = Outbox.enqueue
+
+    def enqueue_then_spend_budget(self, *args, **kwargs):
+        result = real_enqueue(self, *args, **kwargs)
+        clock[0] += 3.0
+        return result
+
+    monkeypatch.setattr(Outbox, 'enqueue', enqueue_then_spend_budget)
+    real_prune, pruned = maintenance.prune, []
+    monkeypatch.setattr(maintenance, 'prune', lambda *a, **kw: pruned.append(a[0]) or real_prune(*a, **kw))
+    first = reporting_commands.maintain(reporting_consent['config_file'], budget_seconds=5)
+    assert first['status'] == 'degraded' and first['network'] is False
+    assert first['ingestion'][0]['enqueued'] == 1
+    assert first['ingestion'][0]['limited'] == 1
+    assert first['retention'] == [{'status': 'unavailable', 'category': 'budget_exhausted', 'limited': True}]
+    assert pruned == []
+    with queue.connect() as db:
+        assert 0 < db.execute('SELECT offset FROM cursors').fetchone()[0] < segment.stat().st_size
+
+    monkeypatch.setattr(Outbox, 'enqueue', real_enqueue)
+    resumed = reporting_commands.maintain(reporting_consent['config_file'], budget_seconds=5)
+    assert resumed['ingestion'][0]['enqueued'] == 1
+    assert len(pruned) == 1
+    assert sorted(sum((row['incident_ids'] for row in queue.rows()), [])) == sorted(identifiers)
+
+
 def test_partial_final_record_is_revisited(tmp_path):
     path, _ = failure(tmp_path)
     from pathlib import Path

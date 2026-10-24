@@ -107,6 +107,91 @@ def test_full_intake_queue_does_not_prevent_publication(tmp_path, monkeypatch):
         assert not read_health(tmp_path / 'state')['healthy']
 
 
+class CyclePublisher:
+    """Local publication boundary: records calls, never touches the network."""
+
+    timeout = 30
+
+    def __init__(self, repository):
+        self.repository, self.calls = repository, []
+
+    def begin_cycle(self):
+        pass
+
+    def end_cycle(self):
+        pass
+
+    def find_issue(self, item):
+        self.calls.append('find')
+
+    def create_issue(self, title, body):
+        self.calls.append('post')
+        return {'number': 1, 'html_url': f'https://github.com/{self.repository}/issues/1'}
+
+
+def test_worker_stop_during_intake_admits_no_later_stage(tmp_path, monkeypatch, reporting_consent):
+    import threading
+    from mindie_diagnostics import maintenance
+    from mindie_diagnostics.integration import record_failure
+
+    roots = [tmp_path / 'logs-a', tmp_path / 'logs-b']
+    for root, operations in zip(roots, (('drain.first', 'drain.second'), ('drain.third',))):
+        for operation in operations:
+            assert record_failure('mindie-knowledge', operation, stage='connect',
+                                  category='internal', root=str(root))['recorded']
+    queue = Outbox(tmp_path / 'state' / 'queue.db')
+
+    class StopAfterFirstRecord(threading.Event):
+        """The owner's real Event, tripped once intake queued one record."""
+
+        def is_set(self):
+            if not super().is_set() and queue.rows():
+                self.set()
+            return super().is_set()
+
+    started = []
+    real_ingest, real_prune, real_publish = cli.ingest, maintenance.prune, cli.publish_one
+    monkeypatch.setattr(cli, 'ingest', lambda root, *a, **kw: started.append(('ingest', root)) or real_ingest(root, *a, **kw))
+    monkeypatch.setattr(maintenance, 'prune', lambda root, **kw: started.append(('retention', root)) or real_prune(root, **kw))
+    monkeypatch.setattr(cli, 'publish_one', lambda *a: started.append(('report', None)) or real_publish(*a))
+    publisher = CyclePublisher(reporting_consent['repository'])
+    args = SimpleNamespace(root=[str(root) for root in roots],
+                           reporting_config=reporting_consent['config_file'])
+    recorder = configure('stop-cycle', root=tmp_path / 'state' / 'diagnostics')
+    with Health(tmp_path / 'state', recorder) as health:
+        stopped = cli.run_cycle(args, queue, publisher, recorder, health,
+                                cancel=StopAfterFirstRecord())
+        # Intake of the first root is the only stage this cycle ever started.
+        assert started == [('ingest', str(roots[0]))]
+        assert publisher.calls == []
+        assert (stopped['status'], stopped['limited']) == ('degraded', 1)
+        assert (stopped['ingestion'][0]['enqueued'], stopped['ingestion'][0]['limited']) == (1, 1)
+        assert stopped['retention'] == [] and stopped['reporter'] is None
+        # The queued record and its cursor remainder are both retained.
+        assert [row['state'] for row in queue.rows()] == ['pending']
+        segment = next((roots[0] / 'events' / 'mindie-knowledge').glob('*.jsonl'))
+        with queue.connect() as db:
+            cursors = {row['path']: row['offset'] for row in db.execute('SELECT path, offset FROM cursors')}
+        assert 0 < cursors[str(segment)] < segment.stat().st_size
+        assert len(cursors) == 1
+
+        # A cycle entered with the stop already set admits no stage at all and
+        # therefore leaves that remainder untouched.
+        started.clear()
+        requested = threading.Event()
+        requested.set()
+        idle = cli.run_cycle(args, queue, publisher, recorder, health, cancel=requested)
+        assert started == [] and idle['reporter'] is None
+        assert (idle['status'], idle['limited']) == ('degraded', 1)
+
+        started.clear()
+        resumed = cli.run_cycle(args, queue, publisher, recorder, health, cancel=threading.Event())
+    assert [stage for stage, _ in started] == ['ingest', 'retention', 'ingest', 'retention', 'report']
+    assert sum(entry['enqueued'] for entry in resumed['ingestion']) == 2
+    assert len(queue.rows()) == 3 and resumed['reporter']['status'] == 'published'
+    assert publisher.calls == ['find', 'post']
+
+
 def test_failed_publication_terminal_is_visible_in_health(tmp_path, monkeypatch):
     recorder = configure('terminal-cycle', root=tmp_path/'logs')
     queue = Outbox(tmp_path/'state'/'queue.db')

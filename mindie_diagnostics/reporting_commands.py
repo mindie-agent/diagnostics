@@ -6,6 +6,8 @@ provisioning (`ensure`), and bounded automatic runtime handoff (`upgrade_running
 
 [Invariants]
 - Never invoked automatically when a tool records a local failure.
+- `maintain` phases (consent, intake, retention) are independent: each degrades
+  the status without cancelling the others; intake needs an enabled policy.
 - `upgrade_running` only upgrades an already-active healthy worker when the
   installed distribution is strictly newer (`_source_order == "newer"`) and at
   least 60s of budget remain (`61s` from `maintain`).
@@ -13,8 +15,10 @@ provisioning (`ensure`), and bounded automatic runtime handoff (`upgrade_running
   `runtime_source` readback verification; otherwise rolls back to `old_python`.
 
 [Timeouts & Locks]
-- `maintain` shares a single monotonic deadline capped at `75.0s` (or
-  `_UPDATE_BUDGET_S + 15.0`).
+- `maintain`'s capped monotonic budget admits stages instead of
+  capping wall clock: roots, intake and retention start only with
+  `_SETTLEMENT_RESERVE_S = 3.0s` left, intake scans until `deadline - 3.0s`, and
+  work already inside a lawful 3-5s SQLite wait may outlive the budget.
 - `upgrade_running` reserves `_ROLLBACK_RESERVE_S = 20.0s` for rollback before
   `deadline`, caps lock acquisition at `_LOCK_WAIT_S = 12.0s`, and polls worker
   readback for up to `_READBACK_S = 8.0s`.
@@ -53,19 +57,35 @@ def _state(config):
 def maintain(config=None, *, update_running=False, unit_dir=None, budget_seconds=75):
     """Offline queue expiry/intake and log retention, including reporting OFF.
 
-    One absolute budget (finite, nonnegative, capped at 75s) is captured at
-    entry and shared by offline cleanup and the optional handoff; the clock is
-    never reset. With ``update_running`` an additional bounded automatic
+    One absolute budget (finite, nonnegative) is captured at
+    entry (capped at ``max(75, _UPDATE_BUDGET_S + 15)``) and shared by offline
+    cleanup and the optional handoff; the clock is
+    never reset. It admits stages rather than capping total runtime: a root,
+    its intake or its retention starts only while ``_SETTLEMENT_RESERVE_S``
+    remains, intake scans until ``deadline - _SETTLEMENT_RESERVE_S``, and work
+    already inside a lawful SQLite wait may finish after the budget. A budget
+    smaller than that reserve therefore completes no root and says so
+    (``budget_exhausted``) instead of starting a scan it must cut off.
+    With ``update_running`` an additional bounded automatic
     handoff of an already running owned reporter to the installed source is
     attempted via :func:`upgrade_running`, but only when at least 61s remain
     (complete 60s handoff plus 1s exit margin). OFF, unconfigured,
     not-running, current, older-source and insufficient-budget skips are
     normal; a failed, suppressed or conflicting handoff degrades the
     aggregate status.
+
+    Phases are independent: consent withdrawal, per-root intake and per-root
+    local retention each report their own outcome and degrade the aggregate
+    status without cancelling the others. Intake stays fail-closed (it runs
+    only under an enabled policy); retention is purely local and runs for the
+    roots this policy already declares. A policy file that exists but cannot
+    be read still returns ``configuration_unavailable`` before any root is
+    known, so its retention remains blocked by design, not by accident.
     """
     from .maintenance import prune
     from .outbox import Outbox
     from .ingestion import ingest
+    from .reporting import ConsentUnavailable
     if isinstance(budget_seconds, bool) or not isinstance(budget_seconds, (int, float)):
         raise ValueError('invalid_budget')
     if not math.isfinite(budget_seconds) or budget_seconds < 0:
@@ -83,11 +103,20 @@ def maintain(config=None, *, update_running=False, unit_dir=None, budget_seconds
     result = {'status': 'ok', 'network': False, 'ingestion': [], 'retention': []}
     if queue is not None:
         queue.maintain()
-        queue.withdraw_unconsented()
+        try:
+            result['consent'] = {'withdrawn': queue.withdraw_unconsented()}
+        except ConsentUnavailable:
+            # An unreadable authority is not a revocation: queued evidence and
+            # its processing budget stay. Intake below is already fail-closed,
+            # and purely local retention of these known roots does not depend
+            # on this read, so it must not be cancelled by it.
+            result['status'] = 'degraded'
+            result['consent'] = {'status': 'unavailable',
+                                 'category': 'reporting_policy_unavailable'}
     enabled = bool(policy and policy.get('decision') == 'enabled')
     active_queue = queue if enabled else None
     for root in roots:
-        if time.monotonic() >= deadline:
+        if deadline - time.monotonic() < _SETTLEMENT_RESERVE_S:
             result['retention'].append({'status': 'unavailable', 'category': 'budget_exhausted', 'limited': True})
             break
         try:
@@ -99,9 +128,32 @@ def maintain(config=None, *, update_running=False, unit_dir=None, budget_seconds
                     raise
                 except (OSError, ValueError, RuntimeError):
                     pass
-            if active_queue is not None:
+        except TimeoutError:
+            raise
+        except (OSError, ValueError, RuntimeError) as exc:
+            result['status'] = 'degraded'
+            result['retention'].append({'status': 'unavailable', 'category': type(exc).__name__})
+        if active_queue is not None:
+            try:
+                # The scan stops one settlement reserve early so the enqueue and
+                # cursor write it already started keep their lawful SQLite wait.
                 result['ingestion'].append(ingest(root, active_queue, max_files=32, max_bytes=1024*1024,
-                                                 config=config))
+                                                 config=config,
+                                                 deadline=deadline - _SETTLEMENT_RESERVE_S))
+            except TimeoutError:
+                raise
+            except (OSError, ValueError, RuntimeError) as exc:
+                # Intake stops for this root and stays visible; the segment it
+                # failed on keeps its cursor, and nothing authorized a write.
+                result['status'] = 'degraded'
+                result['ingestion'].append({'status': 'unavailable', 'category': type(exc).__name__})
+        if deadline - time.monotonic() < _SETTLEMENT_RESERVE_S:
+            # Intake already spent this budget: do not start a scan that would
+            # only be cut off inside its own reader-cursor read.
+            result['status'] = 'degraded'
+            result['retention'].append({'status': 'unavailable', 'category': 'budget_exhausted', 'limited': True})
+            continue
+        try:
             result['retention'].append(prune(root, queue=active_queue))
         except TimeoutError:
             raise
@@ -186,6 +238,9 @@ def ensure(config=None, *, unit_dir=None):
         return {'status': 'degraded', 'category': category}
 
 
+# One lawful `Outbox.connect` wait (`timeout=3.0`/`busy_timeout=3000`): the
+# smallest remainder in which a fresh scan can still settle its own SQLite work.
+_SETTLEMENT_RESERVE_S = 3.0
 _UPDATE_BUDGET_S = 180.0
 _READBACK_S = 8.0
 _ROLLBACK_RESERVE_S = 20.0

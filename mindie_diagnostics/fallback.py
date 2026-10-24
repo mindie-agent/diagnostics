@@ -37,6 +37,8 @@ import sys
 import threading
 import time
 import uuid
+import subprocess
+import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -370,6 +372,42 @@ def record_failure(
         }
 
 
+def update_failure_policy(exception):
+    """Classify owned updater failures from typed facts, never exception text.
+
+    A broken helper or artifact is a product fault. Transport, credentials,
+    cancellation and local prerequisites stay visible locally. Wrappers may
+    preserve a typed transport cause without copying its private message.
+    """
+    current = exception
+    for _ in range(8):
+        code = getattr(current, "code", None)
+        category = getattr(current, "category", None)
+        if code in {"release_transport_unavailable", "release_http_error"}:
+            return "connectivity", False, code
+        if category in {"temporary_network", "rate_limited", "deadline"}:
+            return "connectivity", False, "update_transport_unavailable"
+        if category in {"authentication", "certificate"}:
+            return "credentials", False, "update_credentials_required"
+        if category in {"permission", "hook_trust"}:
+            return "permission", False, "update_permission_required"
+        if category == "cancelled":
+            return "cancelled", False, "update_cancelled"
+        if isinstance(current, (TimeoutError, subprocess.TimeoutExpired, urllib.error.URLError, ConnectionError)):
+            return "connectivity", False, "update_transport_unavailable"
+        if isinstance(current, (PermissionError, FileNotFoundError)):
+            return "prerequisite", False, "update_prerequisite_unavailable"
+        if isinstance(current, OSError) and current.errno in {errno.ENOSPC, errno.EROFS, errno.EMFILE, errno.ENFILE}:
+            return "prerequisite", False, "update_prerequisite_unavailable"
+        if isinstance(current, ImportError):
+            return "internal", True, "runtime_dependency_missing"
+        cause = getattr(current, "__cause__", None)
+        if cause is None:
+            break
+        current = cause
+    return "internal", True, "update_internal_failure"
+
+
 def _build_event(
     incident,
     component,
@@ -391,7 +429,13 @@ def _build_event(
         return None
     if not isinstance(reportable, bool):
         return None
+    error_code = None
+    if category == "update":
+        category, eligible, error_code = update_failure_policy(exception)
+        reportable = reportable and eligible
     attributes = {"stage": stage, "category": category}
+    if error_code is not None:
+        attributes["error_code"] = error_code
     if exception is not None:
         error_type = type(exception).__name__
         if not isinstance(error_type, str) or _ERROR_TYPE_RE.fullmatch(error_type) is None:

@@ -674,7 +674,7 @@ def reporting_status(*, config=None) -> dict:
         return {"status": "configuration_unavailable", "category": "reporting_policy_unavailable",
                 "local": {"status": "unavailable", "recent": []}}
     roots = policy["roots"] if policy else [str(f.default_root())]
-    local = recent_failures(roots)
+    local = recent_failures(roots, config=f.policy_path(config))
     local["retention"] = _retention_view(roots)
     try:
         path = f._as_local_absolute(f.policy_path(config))

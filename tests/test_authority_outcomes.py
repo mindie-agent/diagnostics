@@ -130,6 +130,51 @@ def test_policy_fault_during_ingestion_retains_cursor_for_recovery(tmp_path):
     assert ingest(tmp_path, queue)['enqueued'] == 1
 
 
+def test_damaged_queue_authority_degrades_without_cancelling_local_retention(tmp_path, monkeypatch, capsys):
+    """A consent read failure is reported, keeps evidence, and still prunes."""
+    from mindie_diagnostics import cli, maintenance, reporting_commands as commands
+
+    monkeypatch.setattr(maintenance, '_writer_exited', lambda pid: True)
+    config = tmp_path / 'diagnostics.json'
+    root = tmp_path / 'logs'
+    (root / 'events' / 'mindie-knowledge').mkdir(parents=True)
+    assert configure_reporting(True, config=config, repository='example/project',
+                               roots=[str(root)])['status'] == 'configured'
+    state = f.state_path(config)
+    state.mkdir(parents=True, exist_ok=True)
+    queue = Outbox(state / 'reporter.sqlite3')
+    queue.enqueue('scoped-fault', 'a' * 32, {'evidence': 'retained'},
+                  consent=f.current_consent(config))
+    damaged = '{"config_file"'
+    with queue.connect() as db:
+        db.execute('UPDATE incidents SET consent=?', (damaged,))
+    with pytest.raises(ConsentUnavailable):
+        queue.withdraw_unconsented()
+    segment = root / 'events' / 'mindie-knowledge' / ('424242-' + 'f' * 32 + '.jsonl')
+    segment.write_bytes(b'{"schema":1,"not":"an event"}\n' * 4)
+    os.utime(segment, (1, 1))
+
+    result = commands.maintain(config=config, budget_seconds=20)
+    assert result['status'] == 'degraded' and result['network'] is False
+    assert result['consent'] == {'status': 'unavailable',
+                                 'category': 'reporting_policy_unavailable'}
+    # Local retention of this policy's own declared root is not cancelled.
+    assert result['retention'][0]['removed_files'] == 1 and not segment.exists()
+    assert (root / 'retention-state.json').exists()
+    # Unpublished evidence and the damaged authority are both left intact.
+    assert [row['state'] for row in queue.rows()] == ['pending']
+    with queue.connect() as db:
+        assert db.execute('SELECT consent FROM incidents').fetchone()[0] == damaged
+    assert cli.main(['reporting', 'maintain', '--config', str(config)]) == 1
+    assert json.loads(capsys.readouterr().out)['status'] == 'degraded'
+
+    # Without a readable policy, intake stays fail-closed and nothing is lost.
+    config.unlink()
+    after = commands.maintain(config=config, budget_seconds=20)
+    assert after['status'] == 'degraded' and after['ingestion'] == []
+    assert [row['state'] for row in queue.rows()] == ['pending']
+
+
 @pytest.mark.parametrize('mode', ['policy_read_failure', 'malformed_reply'])
 def test_post_phase_stays_uncertain_and_never_reposts(tmp_path, mode):
     config = tmp_path / 'config.json'

@@ -16,7 +16,10 @@ and read-only SQLite cursor snapshots.
   bounded timeout (capped at 2.0s; 50ms when called from `_Handler._select`).
 - `cursor_snapshot` queries each registered reader SQLite database in `?mode=ro`
   with `PRAGMA query_only=ON` and a 100-opcode progress handler bound to the
-  shared deadline.
+  shared deadline. The connection keeps the project-wide `3.0s` minimum wait
+  (`timeout=max(3.0, remaining)` plus `busy_timeout=3000`), so a caller passing
+  a shorter budget bounds statement execution and the per-reader loop, not a
+  contended lock wait; callers must treat `None` as "cursors unknown".
 
 [Side-Effect Policy]
 - `cursor_snapshot` and `PressureReader` are strictly read-only and never create

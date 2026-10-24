@@ -13,8 +13,16 @@ signal backpressure to active log writers when retention limits remain exceeded.
   definitively exited (`ESRCH`).
 
 [Timeouts & Locks]
-- Enforces a 1.0s overall monotonic scan/prune deadline (`deadline = time.monotonic() + 1`),
-  with a 100ms `reader_guard` lock budget and 200ms `cursor_snapshot` budget.
+- A 1.0s monotonic deadline (`deadline = time.monotonic() + 1`) bounds the
+  directory scan and the delete loop, and caps the `reader_guard` lock wait at
+  100ms and the requested `cursor_snapshot` budget at 200ms.
+- That 1.0s is not a hard ceiling for the whole call: `cursor_snapshot` keeps
+  the project-wide `3.0s` floor on each reader database wait (WAL plus
+  `busy_timeout=3000`, see `reader_registry.py`), which a contended reader
+  store can spend inside the 200ms request. Prune stays conservative either
+  way - an unknown cursor snapshot deletes nothing - so the overrun costs
+  latency, never evidence. Aligning the two budgets is tracked in
+  `docs/outbound-reconciliation-followup.md`.
 
 [Side-Effect Policy]
 - Unlinks only verified consumed log segments and atomically updates

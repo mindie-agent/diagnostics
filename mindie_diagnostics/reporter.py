@@ -3,8 +3,7 @@
 [Role]
 Renders sanitized diagnostic issue payloads (`issue_payload`, `render_issue`),
 communicates with GitHub via `gh api --include` (`GitHub`), reconciles existing
-issue markers (`<!-- mindie-incident:<sha256> -->`), and publishes new issues
-with strict external-effect honesty (`publish_one`).
+issue markers (`<!-- mindie-incident:<sha256> -->`), and publishes via `publish_one`.
 
 [Invariants]
 - Re-projects and re-scans every bundle via `export_issue_event` and `scan_text`
@@ -21,8 +20,7 @@ with strict external-effect honesty (`publish_one`).
 - Leases `Outbox` items for `github.timeout + 20` seconds (`default 50s`),
   covering transport cleanup and the local receipt.
 - `GitHub.begin_cycle` enforces an overall cycle deadline (`default 30s`) and an
-  `8 MiB` response byte budget across pagination, reserving up to 15s for `POST`
-  after search pagination.
+  `8 MiB` response budget across pagination, reserving up to 15s for `POST`.
 - `_run_gh` spawns `gh` in an isolated process group (`start_new_session=True` /
   `CREATE_NEW_PROCESS_GROUP`) and reaps the entire process group on timeout/cancel
   (`SIGTERM` -> 2.0s grace -> `SIGKILL`).
@@ -592,7 +590,7 @@ def publish_one(queue: Outbox, github: GitHub) -> dict[str, Any]:
             github.end_cycle()
 
 
-def ingest(root: str | Path, queue: Outbox, *, max_files: int = 256, max_bytes: int = 8 * 1024 * 1024, since: float | None = None, config=None) -> dict[str, int]:
+def ingest(root: str | Path, queue: Outbox, *, max_files: int = 256, max_bytes: int = 8 * 1024 * 1024, since: float | None = None, config=None, cancel=None, deadline: float | None = None) -> dict[str, int]:
     from .ingestion import ingest as read_events
     return read_events(root, queue, max_files=max_files, max_bytes=max_bytes, since=since,
-                       config=config)
+                       config=config, cancel=cancel, deadline=deadline)

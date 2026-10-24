@@ -8,12 +8,17 @@ Provides the `mindie-diagnostics` command-line interface (`bundle`, `status`,
 [Invariants]
 - Each stage in `run_cycle` is isolated so an ingestion or retention failure
   does not prevent the outbox from draining (`publish_one`).
+- Once the owner stop event is observed, `run_cycle` keeps every result and
+  cursor already collected but starts no further root, retention or remote
+  stage, reporting that as `limited` + `degraded`.
 - The worker re-reads `reporting.json` at the start of every cycle and
   immediately withdraws unconsented items and exits 0 if reporting is disabled.
 
 [Timeouts & Locks]
 - Worker loop sleeps on `stop.wait(args.interval)` (minimum 5s) and handles
-  `SIGINT`/`SIGTERM` by setting the shared `stop` event passed to `GitHub`.
+  `SIGINT`/`SIGTERM` by setting the shared `stop` event passed to `GitHub` and
+  to `ingest`, so a stop ends the running scan between complete records and
+  admits no new stage, instead of finishing every root first.
 
 [Side-Effect Policy]
 - Emits single-line ASCII JSON results to stdout and exits non-zero on
@@ -33,7 +38,7 @@ from .outbox import Outbox
 from .reporter import DEFAULT_REPOSITORY, GitHub, ingest, publish_one
 
 
-def run_cycle(args, queue, github, recorder, health, *, since=None):
+def run_cycle(args, queue, github, recorder, health, *, since=None, cancel=None):
     """Independent stages: a full intake queue must still be able to drain."""
     result = {'ingestion': [], 'retention': [], 'reporter': None, 'status': 'ok'}
     with recorder.operation('worker.cycle') as operation:
@@ -52,14 +57,29 @@ def run_cycle(args, queue, github, recorder, health, *, since=None):
                 operation.fail('diagnostics', exception=exc)
                 return {'status': 'degraded', 'error_type': type(exc).__name__}
 
+        def admitted(stage):
+            """Keep what this cycle already collected; start no further stage."""
+            if cancel is None or not cancel.is_set():
+                return True
+            result['status'], result['limited'] = 'degraded', 1
+            operation.event('WARNING', 'worker.stage_not_started', stage=stage,
+                            error_code='worker_stop_requested')
+            return False
+
         from .maintenance import prune
         queue.maintain()
         result['consent'] = attempt('consent', lambda: {'withdrawn': queue.withdraw_unconsented()})
         for root in args.root:
+            if not admitted('ingest'):
+                break
             result['ingestion'].append(attempt('ingest', lambda: ingest(
-                root, queue, since=since, config=getattr(args, "reporting_config", None))))
+                root, queue, since=since, config=getattr(args, "reporting_config", None),
+                cancel=cancel)))
+            if not admitted('retention'):
+                break
             result['retention'].append(attempt('retention', lambda: prune(root, queue=queue)))
-        result['reporter'] = attempt('report', lambda: publish_one(queue, github))
+        if admitted('report'):
+            result['reporter'] = attempt('report', lambda: publish_one(queue, github))
     health.update(status='idle' if result['status'] == 'ok' else 'degraded', stage='waiting', last_cycle=result)
     return result
 
@@ -232,7 +252,7 @@ def main(argv: list[str] | None = None) -> int:
                             pass
                 return 0
             args.root = list(policy['roots'])
-            result = run_cycle(args, queue, github, recorder, health, since=since)
+            result = run_cycle(args, queue, github, recorder, health, since=since, cancel=stop)
             print(json.dumps(result, ensure_ascii=True), flush=True)
             if args.once:
                 return int(result['status'] != 'ok')

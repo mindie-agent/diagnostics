@@ -12,10 +12,16 @@ into redacted issue bundles, and enqueues them into `Outbox`.
 - Raises `ConsentUnavailable` without advancing the byte cursor if a scoped
   event's `reporting.json` policy cannot be read, preserving evidence for a
   subsequent cycle.
+- A stop or exhausted deadline ends the scan only between complete records: the
+  cursor never marks an unenqueued record consumed and the next cycle resumes.
 
 [Timeouts & Locks]
 - Bounded by `max_files=256`, `max_bytes=8 MiB`, and 4096 directory entries per
   ingestion cycle.
+- The owner's own `threading.Event` (`cancel`) and one absolute
+  `time.monotonic()` `deadline` are scan cutoffs reported via `limited`, not
+  completion guarantees: the enqueue and cursor settlement after a cutoff still
+  take their lawful `Outbox` SQLite wait (`3.0s`), reserved by the owner.
 
 [Side-Effect Policy]
 - Persists `(path, inode, offset, touched, discard)` in `Outbox` `cursors` and
@@ -29,6 +35,7 @@ import json
 import os
 from pathlib import Path
 import re
+import time
 
 from .bundle import _safe_open, collect_bundle, export_public_event
 from .outbox import Outbox
@@ -36,6 +43,13 @@ from .reporting import consent_status, ConsentUnavailable, scope_key
 from .reader_registry import register_reader
 
 _FILE = re.compile(r"\d+-[0-9a-f]{32}\.jsonl(?:\.[1-3])?\Z")
+
+
+def _stopped(cancel, deadline):
+    """The owner's own `threading.Event` and absolute monotonic scan cutoff."""
+    if cancel is not None and cancel.is_set():
+        return True
+    return deadline is not None and time.monotonic() >= deadline
 
 
 def _candidates(root, counts):
@@ -69,7 +83,7 @@ def _candidates(root, counts):
 
 
 def ingest(root, queue: Outbox, *, max_files=256, max_bytes=8 * 1024 * 1024, since=None,
-           config=None):
+           config=None, cancel=None, deadline=None):
     from .reporter import fingerprint, issue_payload
     root = Path(root).absolute()
     if root.is_symlink():
@@ -90,7 +104,8 @@ def ingest(root, queue: Outbox, *, max_files=256, max_bytes=8 * 1024 * 1024, sin
         if size > offset:
             candidates.append((cursor.get('touched', 0), modified, path, str(inode), offset, cursor.get('discard', 0) if offset else 0))
     for _, _, path, candidate_identity, offset, discard in sorted(candidates):
-        if counts['files'] >= max_files or counts['scanned_bytes'] >= max_bytes:
+        if (counts['files'] >= max_files or counts['scanned_bytes'] >= max_bytes
+                or _stopped(cancel, deadline)):
             counts['limited'] = 1
             break
         counts['files'] += 1
@@ -103,6 +118,11 @@ def ingest(root, queue: Outbox, *, max_files=256, max_bytes=8 * 1024 * 1024, sin
                 offset, discard = 0, 0
             stream.seek(offset)
             while counts['scanned_bytes'] < max_bytes:
+                if _stopped(cancel, deadline):
+                    # Between two complete records: the cursor below still ends
+                    # at the last enqueued one, so these bytes are read again.
+                    counts['limited'] = 1
+                    break
                 start = stream.tell()
                 line = stream.readline(min(65537, max_bytes - counts['scanned_bytes']))
                 if not line:

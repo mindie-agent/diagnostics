@@ -43,7 +43,7 @@ def _tail(path):
         os.close(fd)
 
 
-def recent_failures(roots):
+def recent_failures(roots, *, config=None):
     """Inspect <=256 entries, eight 16KiB tails, and 150ms; never create files."""
     deadline = time.monotonic() + .15
     result = {'recent': [], 'truncated': False, 'scanned_files': 0, 'status': 'ok', 'errors': []}
@@ -109,7 +109,9 @@ def recent_failures(roots):
                     iid = row.get('operation_id')
                     if not f._valid_incident(iid):
                         continue
-                    item = {'incident_id': iid, 'record_ref': name}
+                    item = {'incident_id': iid, 'record_ref': name,
+                            '_reportable': row.get('reportable') is True,
+                            '_reporting': row.get('reporting')}
                     for key in ('component', 'operation', 'package_version', 'package_revision'):
                         value = row.get(key)
                         if isinstance(value, str) and _LABEL.fullmatch(value):
@@ -119,7 +121,7 @@ def recent_failures(roots):
                         item['timestamp'] = stamp
                     attrs = row.get('attributes')
                     if isinstance(attrs, dict):
-                        for key in ('stage', 'category', 'error_type'):
+                        for key in ('stage', 'category', 'error_type', 'error_code'):
                             value = attrs.get(key)
                             if isinstance(value, str) and _LABEL.fullmatch(value):
                                 item[key] = value
@@ -128,6 +130,17 @@ def recent_failures(roots):
                     continue
         records.sort(key=lambda row: row.get('timestamp', ''), reverse=True)
         result['recent'] = records[:5]
+        for item in result['recent']:
+            reportable, consent = item.pop('_reportable'), item.pop('_reporting')
+            if not reportable:
+                eligibility = 'local_only'
+            elif not isinstance(consent, dict):
+                eligibility = 'not_authorized_at_capture'
+            elif config is not None and consent.get('config_file') != str(f.policy_path(config)):
+                eligibility = 'other_profile'
+            else:
+                eligibility = 'consent_' + f.consent_status(consent)
+            item['reporting_eligibility'] = eligibility
         result['truncated'] |= len(records) > 5
     except TimeoutError:
         raise

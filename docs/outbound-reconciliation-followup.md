@@ -3,25 +3,25 @@
 **中文** · [English](./outbound-reconciliation-followup.en.md) · [返回文档中心](./README.md)
 
 本文只记录设计意图与约束，**本轮没有改动任何生产传输或 API**（`reporter.py` 的请求形状、`Outbox` 的 schema 与状态机均保持原样）。
-行号基准：`838480a`。
+行号基准：当前分支工作树（基于 `838480a`，`reporter.py` 头部精简 2 行后更新）。
 
 ---
 
 ## 1. 现状中可复现的矛盾
 
-`GitHub.find_issue`（[`reporter.py:470-499`](../mindie_diagnostics/reporter.py)）用一条「全量列举 + 下载每条 Issue 正文」的读取同时承担两件事：跨会话去重，以及自己那次不确定 POST 的对账。它最多翻 20 页、每页 100 条（`reporter.py:483-484`），而整个发布周期（一次对账 + 一次 POST）共享 8 MiB 字节预算（`reporter.py:459-460`，`self._bytes` 只在 `begin_cycle` 清零）。
+`GitHub.find_issue`（[`reporter.py:468-497`](../mindie_diagnostics/reporter.py)）用一条「全量列举 + 下载每条 Issue 正文」的读取同时承担两件事：跨会话去重，以及自己那次不确定 POST 的对账。它最多翻 20 页、每页 100 条（`reporter.py:481-482`），而整个发布周期（一次对账 + 一次 POST）共享 8 MiB 字节预算（`reporter.py:457-458`，`self._bytes` 只在 `begin_cycle` 清零）。
 
-同时，本组件自己发布的 Issue 正文上限是 60000 字节（`reporter.py:418-419`）。用本地假 `gh` 脚本（真实子进程 + 真实 `_parse_response`，无网络）喂入 250 条、正文 52,698 字节的 Issue 列举后：第 1 页读入 6,074,551 字节，第 2 页因剩余预算不足直接抛 `github_output_limit`。
+同时，本组件自己发布的 Issue 正文上限是 60000 字节（`reporter.py:416-417`）。用本地假 `gh` 脚本（真实子进程 + 真实 `_parse_response`，无网络）喂入 250 条、正文 52,698 字节的 Issue 列举后：第 1 页读入 6,074,551 字节，第 2 页因剩余预算不足直接抛 `github_output_limit`。
 
 这只是**本地 fixture 层面的输入证据**，用来说明预算算术，不构成任何检索质量、NPU 或线上验收结论。
 
-后果（源码可推）：`github_output_limit` 不在 `publish_one` 的 `recoverable` 白名单内且 `permanent=False`（`reporter.py:576-579`），于是被记为可重试并按退避重放，而仓库体量只会变大——对账窗口实际不可能恢复，`pending` 走不到 POST、`uncertain` 也完不成对账，却被呈现为瞬时故障。
+后果（源码可推）：`github_output_limit` 不在 `publish_one` 的 `recoverable` 白名单内且 `permanent=False`（`reporter.py:574-577`），于是被记为可重试并按退避重放，而仓库体量只会变大——对账窗口实际不可能恢复，`pending` 走不到 POST、`uncertain` 也完不成对账，却被呈现为瞬时故障。
 
 ## 2. 任何方案都必须保留的既有不变量
 
-1. **不确定的 POST 永不重放**：`begin_post` 的租约栅栏（`outbox.py:428-434`）只接受 `pending`/`retry`，`uncertain` 行只能走只读对账分支（`reporter.py:545-549`）。
+1. **不确定的 POST 永不重放**：`begin_post` 的租约栅栏（`outbox.py:428-434`）只接受 `pending`/`retry`，`uncertain` 行只能走只读对账分支（`reporter.py:543-547`）。
 2. **“读不到”绝不等于“不存在”**：窗口不完整、字节耗尽、索引延迟都必须保持为可见的失败，不得折叠成「远端没有这条 Issue」。
-3. **本地回执失败不反杀已确认的远端结果**（`_record_publication_outcome`，`reporter.py:511-519`）。
+3. **本地回执失败不反杀已确认的远端结果**（`_record_publication_outcome`，`reporter.py:509-517`）。
 4. **公开身份仍是 Issue 正文里的 `<!-- mindie-incident:<sha256> -->`**，不因读取形状改变。
 
 ## 3. 为什么“改用 search 接口”不能单独成立
@@ -54,13 +54,13 @@
 ## 6. 有界读取与诚实的窗口上报
 
 - 每个用途各自声明页数、字节与单条正文上限，并计入同一个 `begin_cycle` 预算；
-- 字节/页数耗尽时使用 `github_reconciliation_window_exhausted`（`reporter.py:495` 已有此代码，目前因字节预算先行耗尽而几乎不可达），与传输异常 `github_output_limit` 区分开，让 `reporting status` 能分辨“窗口不足”与“网络异常”；
+- 字节/页数耗尽时使用 `github_reconciliation_window_exhausted`（`reporter.py:493` 已有此代码，目前因字节预算先行耗尽而几乎不可达），与传输异常 `github_output_limit` 区分开，让 `reporting status` 能分辨“窗口不足”与“网络异常”；
 - 窗口不完整时保持 `uncertain` / `retry`，绝不据此 POST。
 
 ## 7. 明确不属于本设计的主张
 
 - **不主张跨 profile / 跨主机的 exactly-once**：marker 稳定只能保证「当某个读取者已经能看到该 marker 时不会重复建单」，并不能排除两个 profile 同时处于 POST 中途的窗口。
-- **不动 `publications` / 限流 schema**：`publish_one` 目前确实不传 `hourly_limit`（`reporter.py:552`），该表因此为空；但在没有真实缺陷与迁移验证之前，不在本轮删除表或分支。
+- **不动 `publications` / 限流 schema**：`publish_one` 目前确实不传 `hourly_limit`（`reporter.py:550`），该表因此为空；但在没有真实缺陷与迁移验证之前，不在本轮删除表或分支。
 - **不合并健康判定模块**：`health.read_health` 与 `integration._worker_view` 的重复判定同理，留待带迁移验证的独立改动。
 
 ## 8. 相邻待办：`prune` 与 `cursor_snapshot` 的预算对齐

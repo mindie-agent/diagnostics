@@ -2,25 +2,25 @@
 
 [中文](./outbound-reconciliation-followup.md) · **English** · [Back to Documentation](./README.en.md)
 
-This note records intent and constraints only. **No production transport or API was changed**: the request shape in `reporter.py`, the `Outbox` schema and its state machine are untouched. Line references are against `838480a`.
+This note records intent and constraints only. **No production transport or API was changed**: the request shape in `reporter.py`, the `Outbox` schema and its state machine are untouched. Line references match the current working tree (based on `838480a`, updated for the 2-line header trim in `reporter.py`).
 
 ---
 
 ## 1. The reproducible contradiction today
 
-`GitHub.find_issue` ([`reporter.py:470-499`](../mindie_diagnostics/reporter.py)) uses a single "list everything and download every issue body" read for two different purposes: cross-session deduplication, and reconciling this worker's own uncertain POST. It pages up to 20 times at 100 issues per page (`reporter.py:483-484`), while one whole publication cycle (one reconciliation plus one POST) shares an 8 MiB byte budget (`reporter.py:459-460`; `self._bytes` is reset only in `begin_cycle`).
+`GitHub.find_issue` ([`reporter.py:468-497`](../mindie_diagnostics/reporter.py)) uses a single "list everything and download every issue body" read for two different purposes: cross-session deduplication, and reconciling this worker's own uncertain POST. It pages up to 20 times at 100 issues per page (`reporter.py:481-482`), while one whole publication cycle (one reconciliation plus one POST) shares an 8 MiB byte budget (`reporter.py:457-458`; `self._bytes` is reset only in `begin_cycle`).
 
-Meanwhile the issues this component itself publishes are capped at 60000 bytes of body (`reporter.py:418-419`). Feeding a local fake `gh` script (a real subprocess through the real `_parse_response`, no network) a listing of 250 issues with 52,698-byte bodies: page 1 reads 6,074,551 bytes and page 2 raises `github_output_limit` because the remaining budget is too small.
+Meanwhile the issues this component itself publishes are capped at 60000 bytes of body (`reporter.py:416-417`). Feeding a local fake `gh` script (a real subprocess through the real `_parse_response`, no network) a listing of 250 issues with 52,698-byte bodies: page 1 reads 6,074,551 bytes and page 2 raises `github_output_limit` because the remaining budget is too small.
 
 That is **local fixture evidence about budget arithmetic only**. It is not a retrieval-quality, NPU, or live-acceptance result.
 
-The consequence follows from the source: `github_output_limit` is not in `publish_one`'s `recoverable` set and is not `permanent` (`reporter.py:576-579`), so it is recorded as retryable and replayed under backoff — yet a repository only grows, so the reconciliation window never actually recovers. `pending` items never reach their POST and `uncertain` items never finish reconciling, while the surface reports a transient fault.
+The consequence follows from the source: `github_output_limit` is not in `publish_one`'s `recoverable` set and is not `permanent` (`reporter.py:574-577`), so it is recorded as retryable and replayed under backoff — yet a repository only grows, so the reconciliation window never actually recovers. `pending` items never reach their POST and `uncertain` items never finish reconciling, while the surface reports a transient fault.
 
 ## 2. Invariants any solution must keep
 
-1. **An uncertain POST is never replayed**: the `begin_post` lease fence (`outbox.py:428-434`) accepts only `pending`/`retry`, so an `uncertain` row can only take the read-only reconciliation path (`reporter.py:545-549`).
+1. **An uncertain POST is never replayed**: the `begin_post` lease fence (`outbox.py:428-434`) accepts only `pending`/`retry`, so an `uncertain` row can only take the read-only reconciliation path (`reporter.py:543-547`).
 2. **"Could not read" is never "does not exist"**: an incomplete window, an exhausted byte budget and search-index lag must all stay visible failures, never collapse into "the remote has no such issue".
-3. **A local receipt failure never overrides a confirmed remote result** (`_record_publication_outcome`, `reporter.py:511-519`).
+3. **A local receipt failure never overrides a confirmed remote result** (`_record_publication_outcome`, `reporter.py:509-517`).
 4. **Public identity stays the `<!-- mindie-incident:<sha256> -->` marker in the issue body**, independent of the read shape.
 
 ## 3. Why "just use the search endpoint" is not sufficient on its own
@@ -53,13 +53,13 @@ Do **not** add a second receipt/audit ledger or a second state machine for this:
 ## 6. Bounded reads and honest window reporting
 
 - Each purpose declares its own page, byte and per-body limits, all charged to the same `begin_cycle` budget;
-- when pages or bytes run out, use the existing `github_reconciliation_window_exhausted` (`reporter.py:495`, today nearly unreachable because the byte budget is spent first) as distinct from the transport-level `github_output_limit`, so `reporting status` can tell "window too small" from "network fault";
+- when pages or bytes run out, use the existing `github_reconciliation_window_exhausted` (`reporter.py:493`, today nearly unreachable because the byte budget is spent first) as distinct from the transport-level `github_output_limit`, so `reporting status` can tell "window too small" from "network fault";
 - while the window is incomplete, stay `uncertain`/`retry` and never POST on that basis.
 
 ## 7. What this design explicitly does not claim
 
 - **No cross-profile or cross-host exactly-once**: a stable marker only guarantees "no duplicate once a reader can already see that marker". It cannot rule out two profiles being mid-POST simultaneously.
-- **No change to `publications` / rate-limit schema**: `publish_one` does not pass `hourly_limit` today (`reporter.py:552`), so the table stays empty; that is recorded here, but no table or branch is removed before a real defect and a validated migration exist.
+- **No change to `publications` / rate-limit schema**: `publish_one` does not pass `hourly_limit` today (`reporter.py:550`), so the table stays empty; that is recorded here, but no table or branch is removed before a real defect and a validated migration exist.
 - **No merging of the health evaluators**: the duplicated judgement in `health.read_health` and `integration._worker_view` is the same kind of item, left to a separate change with migration validation.
 
 ## 8. Adjacent item: aligning the `prune` and `cursor_snapshot` budgets

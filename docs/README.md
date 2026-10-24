@@ -14,4 +14,4 @@
 
 | 文档主题 | 中文 | English | 你能在这里查到什么 |
 | --- | --- | --- | --- |
-| 出站对账读取的有界化跟进 | [outbound-reconciliation-followup.md](./outbound-reconciliation-followup.md) | [outbound-reconciliation-followup.en.md](./outbound-reconciliation-followup.en.md) | 为什么 8 MiB 周期预算与 20 页对账窗口不自洽？为什么只用搜索接口不能证明「不存在」？有界窗口需要哪一份单一归属的意图元数据？ |
+| 出站对账读取的有界化跟进 | [outbound-reconciliation-followup.md](./outbound-reconciliation-followup.md) | [outbound-reconciliation-followup.en.md](./outbound-reconciliation-followup.en.md) | 为什么 8 MiB 周期预算与 20 页对账窗口不自洽？为什么未知状态的 POST 绝不能重放、搜索未命中不能证明「不存在」？有界对账窗口需要哪一份单一归属的意图元数据？ |

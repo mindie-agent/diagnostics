@@ -1,4 +1,6 @@
 import json
+from contextlib import contextmanager
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -374,5 +376,150 @@ def test_windows_slot_replacement_closes_temp_before_rename(tmp_path, monkeypatc
         assert not recorder.logging_failed and recorder.dropped_records == 0
         assert len(list(tmp_path.glob('events/windows-slot/*.jsonl*'))) == 4
         assert rows(tmp_path)
+    finally:
+        recorder.close()
+
+
+def test_cold_first_write_is_not_vetoed_by_reader_setup_clock(tmp_path, monkeypatch):
+    """The old select() set a 100ms deadline before entering reader_guard."""
+    import time
+    from mindie_diagnostics import reader_registry
+
+    clock = [1_000.0]
+
+    def monotonic():
+        return clock[0]
+
+    monkeypatch.setattr(time, "monotonic", monotonic)
+    real_guard = reader_registry.reader_guard
+
+    @contextmanager
+    def guard_that_costs_101ms(*args, **kwargs):
+        clock[0] += 0.101
+        with real_guard(*args, **kwargs) as state:
+            yield state
+
+    monkeypatch.setattr(module, "reader_guard", guard_that_costs_101ms)
+    recorder = module.Recorder("cold-first", root=tmp_path)
+    try:
+        recorder.event("INFO", "cold", detail="x" * 40)
+    finally:
+        recorder.close()
+
+    paths = list(tmp_path.glob("events/cold-first/*.jsonl*"))
+    assert paths, (
+        f"cold first record was dropped before segment allocation: "
+        f"dropped_records={recorder.dropped_records}, "
+        f"logging_failed={recorder.logging_failed}"
+    )
+    assert recorder.dropped_records == 0 and not recorder.logging_failed
+    assert [row["event"] for row in rows(tmp_path)] == ["cold"]
+    assert not (tmp_path / ".readers").exists()
+
+
+@contextmanager
+def _locked_registry(tmp_path):
+    """Hold the real reader registry lock in a spawned process with bounded waits."""
+    import multiprocessing
+
+    tests_dir = str(Path(__file__).resolve().parent)
+    if tests_dir not in sys.path:
+        sys.path.insert(0, tests_dir)
+    from lock_worker import hold_registry_lock
+
+    context = multiprocessing.get_context("spawn")
+    ready_receive, ready_send = context.Pipe(duplex=False)
+    release_receive, release_send = context.Pipe(duplex=False)
+    process = context.Process(
+        target=hold_registry_lock,
+        args=(str(tmp_path), ready_send, release_receive),
+        name="diagnostics-registry-lock",
+        daemon=True,
+    )
+    process.start()
+    ready_send.close()
+    release_receive.close()
+    try:
+        if not ready_receive.poll(5.0):
+            raise AssertionError(
+                f"registry lock worker did not report within 5s: "
+                f"pid={process.pid}, exitcode={process.exitcode}"
+            )
+        try:
+            status, detail = ready_receive.recv()
+        except EOFError as exc:
+            raise AssertionError(
+                f"registry lock worker exited before reporting: "
+                f"pid={process.pid}, exitcode={process.exitcode}, error={exc}"
+            ) from None
+        assert status == "locked", (
+            f"registry lock worker failed: pid={process.pid}, "
+            f"exitcode={process.exitcode}, detail={detail}"
+        )
+        yield
+    finally:
+        try:
+            release_send.send("release")
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+        finally:
+            release_send.close()
+        process.join(5.0)
+        if process.is_alive():
+            process.terminate()
+            process.join(5.0)
+        if process.is_alive():
+            process.kill()
+            process.join(5.0)
+        ready_receive.close()
+
+
+def test_free_rotation_slot_allocates_while_reader_registry_is_busy(tmp_path, monkeypatch):
+    monkeypatch.setattr(module, "MAX_LOG_BYTES", 512)
+    recorder = module.Recorder("free-slot", root=tmp_path)
+    try:
+        recorder.event("INFO", "first", detail="x" * 200)
+        with _locked_registry(tmp_path):
+            recorder.event("INFO", "second", detail="x" * 200)
+        paths = list(tmp_path.glob("events/free-slot/*.jsonl*"))
+        assert len(paths) == 2, (
+            f"a free rotation slot was dropped while reader metadata was busy: "
+            f"paths={paths}, dropped_records={recorder.dropped_records}, "
+            f"logging_failed={recorder.logging_failed}"
+        )
+        assert not recorder.logging_failed and recorder.dropped_records == 0
+        assert sorted(row["event"] for row in rows(tmp_path)) == ["first", "second"]
+    finally:
+        recorder.close()
+
+
+def test_full_window_waits_for_registered_reader_cursors(tmp_path, monkeypatch):
+    from mindie_diagnostics.ingestion import ingest
+    from mindie_diagnostics.outbox import Outbox
+
+    monkeypatch.setattr(module, "MAX_LOG_BYTES", 512)
+    queue = Outbox(tmp_path / "queue.db")
+    # Real ingestion creates the WAL-backed cursors schema and registers the reader.
+    assert ingest(tmp_path, queue)["scanned_bytes"] == 0
+    recorder = module.Recorder("reader-window", root=tmp_path)
+    try:
+        for index in range(4):
+            recorder.event("INFO", "sample", index=index, detail="x" * 200)
+        assert not recorder.logging_failed
+        paths = sorted(tmp_path.glob("events/reader-window/*.jsonl*"))
+        assert len(paths) == 4
+        before = {path: path.stat().st_size for path in paths}
+
+        recorder.event("INFO", "unread", detail="x" * 200)
+        assert recorder.dropped_records == 1 and recorder.logging_failed
+        assert sorted(tmp_path.glob("events/reader-window/*.jsonl*")) == paths
+        assert {path: path.stat().st_size for path in paths} == before
+
+        consumed = ingest(tmp_path, queue)
+        assert consumed["scanned_bytes"] > 0 and consumed["files"] == 4
+        recorder.event("INFO", "consumed", detail="x" * 200)
+        assert recorder.dropped_records == 1
+        assert sorted(tmp_path.glob("events/reader-window/*.jsonl*")) == paths
+        assert "consumed" in {row["event"] for row in rows(tmp_path)}
     finally:
         recorder.close()

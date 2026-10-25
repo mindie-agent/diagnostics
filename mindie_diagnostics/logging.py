@@ -1,29 +1,32 @@
 """Structured JSONL process logging with bounded segment recycling.
 
 [Role]
-Provides `Recorder` and `Operation` for per-process structured JSONL logging
-under `<root>/events/<component>/<pid>-<process_id>.jsonl` with automatic redaction,
-bounded record/file sizes (`MAX_RECORD_BYTES = 16384`, `MAX_LOG_BYTES = 1048576`),
-and reader-aware segment recycling (`BACKUP_COUNT = 3`).
-
+Provides `Recorder`/`Operation` for per-process structured JSONL logging
+under `<root>/events/<component>/<pid>-<process_id>.jsonl` with redaction,
+bounded records/files (`MAX_RECORD_BYTES = 16384`, `MAX_LOG_BYTES = 1048576`)
+and reader-aware recycling (`BACKUP_COUNT = 3`).
 [Invariants]
 - Logging failures never raise into business callers; dropped records increment
   `dropped_records` and set `logging_failed = True`.
-- Sensitive attribute keys (`password`, `secret`, `token`, `command`, `stdout`,
-  etc.) are omitted before serialization, and string values are redacted before
-  truncation.
-- Only closed segments that have been fully consumed by active readers are
-  recycled.
-
+- Sensitive keys (`password`, `secret`, `token`, `command`, `stdout`, etc.) are
+  omitted before serialization; strings are redacted before truncation.
+- A never-existing slot is claimed with `O_EXCL`: a new file has no unread
+  bytes, so this path takes no reader-registry or cursor lock. Only recycling
+  an existing owned segment needs reader/cursor coordination.
+- Only fully consumed closed segments recycle; backpressure forbids new slots.
 [Timeouts & Locks]
-- `_mutex` and `_LOCK` are acquired with `blocking=False` on emit/append paths
-  so business operations never block behind another writer.
-- Segment selection (`_select`) uses a 100ms deadline and a 50ms `reader_guard`
-  timeout.
+- `_mutex` and `_LOCK` use `blocking=False` on emit/append paths.
+- Fresh-slot allocation is bounded by `BACKUP_COUNT + 1` and has no clock
+  deadline, so a cold first write cannot be vetoed by reader setup.
+- Recycling keeps the 100ms cooperative cutoff (50ms `reader_guard` wait;
+  `cursor_snapshot` gets the remainder). It is best-effort, not a hard latency
+  ceiling: `cursor_snapshot` keeps its 3.0s SQLite wait floor, so recycling can
+  overrun. Unknown/over-budget recycling drops with `logging_failed = True`;
+  fresh slots make no registry or SQLite call.
 
 [Side-Effect Policy]
-- Fork-safe via `os.register_at_fork(after_in_child=_after_fork)`, which resets
-  locks and assigns a fresh `process_instance_id` without closing parent files.
+- Fork-safe via `os.register_at_fork(after_in_child=_after_fork)`: resets locks
+  and assigns a fresh `process_instance_id` without closing parent files.
 """
 from __future__ import annotations
 
@@ -52,6 +55,8 @@ SCHEMA = 1
 MAX_RECORD_BYTES = 16_384
 MAX_LOG_BYTES = 1_048_576
 BACKUP_COUNT = 3
+_RECYCLE_BUDGET_S = 0.1
+_REGISTRY_WAIT_S = 0.05
 _COMPONENT = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,79}\Z")
 _SENSITIVE = re.compile(r"password|secret|token|credential|authorization|cookie|private.?key|api.?key|command|stdout|stderr|body|transcript|(?:^|_)(?:env|environment|args|argv|payload|text|headers)(?:$|_)", re.I)
 _LEVELS = {"DEBUG": 10, "INFO": 20, "WARN": 30, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}
@@ -192,15 +197,54 @@ class _Handler(std_logging.Handler):
         self.recorder.dropped_records += 1
         self.recorder._unavailable()
 
-    def _select(self, size, blocked):
-        deadline = time.monotonic() + .1
-        with reader_guard(self.root, timeout=.05) as state:
+    def _install(self, descriptor, path, credit):
+        try:
+            info = os.fstat(descriptor)
+            stream = os.fdopen(descriptor, 'wb', buffering=0)
+        except BaseException:
+            os.close(descriptor)
+            raise
+        previous = self.stream
+        self.stream = stream
+        self.current = path
+        self.owned[path] = (info.st_dev, info.st_ino)
+        self.credit = credit
+        self.recorder._path = path
+        if previous is not None:
+            previous.close()
+        return True
+
+    def _fresh(self, blocked):
+        """Claim a never-existing slot; no reader registry or cursor lock.
+
+        O_EXCL makes the claim race-safe and the fixed segment window bounds
+        the attempts. A new file has no unread bytes, so it cannot violate a
+        reader cursor. Backpressure still forbids growth.
+        """
+        if blocked:
+            return False
+        start = (self.paths.index(self.current) + 1) % len(self.paths) if self.current else 0
+        ordered = self.paths[start:] + self.paths[:start]
+        for path in ordered:
+            if path == self.current:
+                continue
+            try:
+                descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                                     | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+            except FileExistsError:
+                continue
+            return self._install(descriptor, path, None)
+        return False
+
+    def _recycle(self, size, blocked):
+        deadline = time.monotonic() + _RECYCLE_BUDGET_S
+        with reader_guard(self.root, timeout=_REGISTRY_WAIT_S) as state:
             if state['status'] != 'ok':
                 return False
             snapshot = None
             start = (self.paths.index(self.current) + 1) % len(self.paths) if self.current else 0
             ordered = self.paths[start:] + self.paths[:start]
-            # Fill the bounded window before recycling; then cycle all slots.
+            # Only existing owned segments can hold unread bytes.
             ordered.sort(key=lambda path: path.exists())
             for path in ordered:
                 if path == self.current:
@@ -210,56 +254,40 @@ class _Handler(std_logging.Handler):
                 try:
                     old = path.lstat()
                 except FileNotFoundError:
-                    if blocked:
-                        continue
-                    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL
-                                         | getattr(os, 'O_NOFOLLOW', 0), 0o600)
-                    credit = None
-                else:
-                    if (not stat.S_ISREG(old.st_mode)
-                            or self.owned.get(path) != (old.st_dev, old.st_ino)):
-                        continue
-                    if snapshot is None:
-                        snapshot = cursor_snapshot(state['readers'],
-                                                   timeout=max(0, deadline - time.monotonic()))
-                    if (not fully_consumed(snapshot, path, old.st_ino, old.st_size)
-                            or (blocked and size > old.st_size)):
-                        continue
-                    temporary = path.with_name('.segment-' + uuid.uuid4().hex)
-                    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL
-                                         | getattr(os, 'O_NOFOLLOW', 0), 0o600)
-                    try:
-                        if os.name == 'nt':
-                            os.close(descriptor)
-                            descriptor = None
-                        os.replace(temporary, path)
-                        if descriptor is None:
-                            descriptor = os.open(path, os.O_WRONLY | os.O_APPEND
-                                                 | getattr(os, 'O_NOFOLLOW', 0)
-                                                 | getattr(os, 'O_NONBLOCK', 0))
-                    except BaseException:
-                        if descriptor is not None:
-                            os.close(descriptor)
-                        raise
-                    finally:
-                        temporary.unlink(missing_ok=True)
-                    credit = old.st_size if blocked else None
+                    continue
+                if (not stat.S_ISREG(old.st_mode)
+                        or self.owned.get(path) != (old.st_dev, old.st_ino)):
+                    continue
+                if snapshot is None:
+                    snapshot = cursor_snapshot(state['readers'],
+                                               timeout=max(0, deadline - time.monotonic()))
+                if (not fully_consumed(snapshot, path, old.st_ino, old.st_size)
+                        or (blocked and size > old.st_size)):
+                    continue
+                temporary = path.with_name('.segment-' + uuid.uuid4().hex)
+                descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                                     | getattr(os, 'O_NOFOLLOW', 0), 0o600)
                 try:
-                    info = os.fstat(descriptor)
-                    stream = os.fdopen(descriptor, 'wb', buffering=0)
+                    if os.name == 'nt':
+                        os.close(descriptor)
+                        descriptor = None
+                    os.replace(temporary, path)
+                    if descriptor is None:
+                        descriptor = os.open(path, os.O_WRONLY | os.O_APPEND
+                                             | getattr(os, 'O_NOFOLLOW', 0)
+                                             | getattr(os, 'O_NONBLOCK', 0))
                 except BaseException:
-                    os.close(descriptor)
+                    if descriptor is not None:
+                        os.close(descriptor)
                     raise
-                previous = self.stream
-                self.stream = stream
-                self.current = path
-                self.owned[path] = (info.st_dev, info.st_ino)
-                self.credit = credit
-                self.recorder._path = path
-                if previous is not None:
-                    previous.close()
-                return True
+                finally:
+                    temporary.unlink(missing_ok=True)
+                return self._install(descriptor, path, old.st_size if blocked else None)
         return False
+
+    def _select(self, size, blocked):
+        # A cold/free slot needs no reader metadata; only recycling does.
+        return self._fresh(blocked) or self._recycle(size, blocked)
 
     def emit(self, record):
         try:

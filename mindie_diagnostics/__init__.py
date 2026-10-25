@@ -26,7 +26,7 @@ from .npu_fault_triage import (
     triage_npu_fault,
 )
 
-__version__ = "0.5.2"
+__version__ = "0.5.4"
 __all__ = ["configure", "get_recorder", "current_context", "bind_context",
            "wrap_context", "collect_bundle", "export_public_event", "redact_text", "capture_output",
            "decode_cann_error_code", "triage_ascend_plog", "triage_npu_fault"]

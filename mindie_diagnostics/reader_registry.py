@@ -16,10 +16,11 @@ and read-only SQLite cursor snapshots.
   bounded timeout (capped at 2.0s; 50ms when called from `_Handler._select`).
 - `cursor_snapshot` queries each registered reader SQLite database in `?mode=ro`
   with `PRAGMA query_only=ON` and a 100-opcode progress handler bound to the
-  shared deadline. The connection keeps the project-wide `3.0s` minimum wait
-  (`timeout=max(3.0, remaining)` plus `busy_timeout=3000`), so a caller passing
-  a shorter budget bounds statement execution and the per-reader loop, not a
-  contended lock wait; callers must treat `None` as "cursors unknown".
+  execution deadline and the project-wide `3.0s` SQLite wait. An explicit
+  `remaining_budget` admits each reader only with 3.0s plus 50ms for cleanup.
+  Schema and cursor reads share one transaction and one lock acquisition.
+  Legacy `timeout` alone bounds execution, not SQLite lock waits; callers
+  must treat `None` as "cursors unknown".
 
 [Side-Effect Policy]
 - `cursor_snapshot` and `PressureReader` are strictly read-only and never create
@@ -40,6 +41,8 @@ import uuid
 _MAX_READERS = 32
 _MAX_REGISTRY_BYTES = 32768
 _MAX_CURSOR_ROWS = 10000
+_SQLITE_WAIT_S = 3.0
+_SNAPSHOT_CLEANUP_S = .05
 
 
 def _real_path(value) -> Path:
@@ -230,11 +233,15 @@ def unregister_reader(root, queue_path, *, timeout: float = 2.0) -> None:
                   [value for value in state["readers"] if value != binding])
 
 
-def cursor_snapshot(readers, timeout: float = 2.0):
-    """Read existing cursor tables; never create/migrate a reader database."""
+def cursor_snapshot(readers, timeout: float = 2.0, *, remaining_budget: float | None = None):
+    """Read cursors; an insufficient outer budget yields unknown without opening SQLite."""
     if not isinstance(readers, list) or len(readers) > _MAX_READERS:
         return None
-    deadline = time.monotonic() + max(0, min(float(timeout), 2.0))
+    started = time.monotonic()
+    deadline = started + max(0, min(float(timeout), 2.0))
+    budget_deadline = None if remaining_budget is None else started + max(0, float(remaining_budget))
+    if budget_deadline is not None:
+        deadline = min(deadline, budget_deadline - _SNAPSHOT_CLEANUP_S)
     snapshots = []
     try:
         for binding in readers:
@@ -245,15 +252,22 @@ def cursor_snapshot(readers, timeout: float = 2.0):
             path = _real_path(binding)
             if not _regular(path.lstat()):
                 return None
-            remaining = max(0, deadline - time.monotonic())
-            db = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=max(3.0, remaining))
+            if (budget_deadline is not None
+                    and budget_deadline - time.monotonic() < _SQLITE_WAIT_S + _SNAPSHOT_CLEANUP_S):
+                return None
+            db = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=_SQLITE_WAIT_S)
             try:
                 db.execute("PRAGMA query_only=ON")
                 db.execute("PRAGMA busy_timeout=3000")
                 db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
+                # Keep the read lock across both statements so schema inspection
+                # cannot spend one busy timeout and the cursor query another.
+                db.execute("BEGIN")
                 table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='cursors'").fetchone()
+                if time.monotonic() >= deadline:
+                    return None
                 rows = db.execute("SELECT path,inode,offset FROM cursors LIMIT ?", (_MAX_CURSOR_ROWS + 1,)).fetchall() if table else []
-                if len(rows) > _MAX_CURSOR_ROWS:
+                if len(rows) > _MAX_CURSOR_ROWS or time.monotonic() >= deadline:
                     return None
                 snapshot = {}
                 for name, inode, offset in rows:
@@ -265,7 +279,7 @@ def cursor_snapshot(readers, timeout: float = 2.0):
                 snapshots.append(snapshot)
             finally:
                 db.close()
-        return snapshots
+        return snapshots if not readers or time.monotonic() < deadline else None
     except TimeoutError:
         raise
     except (OSError, sqlite3.Error, ValueError, TypeError):

@@ -1,13 +1,12 @@
-# 出站对账读取的有界化跟进（设计稿，本轮未实施）
+# 出站对账读取的有界化跟进
 
 **中文** · [English](./outbound-reconciliation-followup.en.md) · [返回文档中心](./README.md)
 
-本文只记录设计意图与约束，**本轮没有改动任何生产传输或 API**（`reporter.py` 的请求形状、`Outbox` 的 schema 与状态机均保持原样）。
-行号基准：当前分支工作树（基于 `838480a`，`reporter.py` 头部精简 2 行后更新）。
+**实施状态（2026-10-29）**：已实现尝试时间戳迁移、阳性搜索与有界列举、窗口耗尽分类，以及 prune 剩余预算准入。第 1–7 节保留实施前的设计依据；其中行号基于 `838480a`，不代表当前实现位置。当前行为及本地验证范围见第 8–9 节。
 
 ---
 
-## 1. 现状中可复现的矛盾
+## 1. 实施前可复现的矛盾
 
 `GitHub.find_issue`（[`reporter.py:468-497`](../mindie_diagnostics/reporter.py)）用一条「全量列举 + 下载每条 Issue 正文」的读取同时承担两件事：跨会话去重，以及自己那次不确定 POST 的对账。它最多翻 20 页、每页 100 条（`reporter.py:481-482`），而整个发布周期（一次对账 + 一次 POST）共享 8 MiB 字节预算（`reporter.py:457-458`，`self._bytes` 只在 `begin_cycle` 清零）。
 
@@ -63,6 +62,20 @@
 - **不动 `publications` / 限流 schema**：`publish_one` 目前确实不传 `hourly_limit`（`reporter.py:550`），该表因此为空；但在没有真实缺陷与迁移验证之前，不在本轮删除表或分支。
 - **不合并健康判定模块**：`health.read_health` 与 `integration._worker_view` 的重复判定同理，留待带迁移验证的独立改动。
 
-## 8. 相邻待办：`prune` 与 `cursor_snapshot` 的预算对齐
+## 8. 已实施：`prune` 与 `cursor_snapshot` 的预算对齐
 
-`maintenance.prune` 的 1.0s 期限与 `reader_registry.cursor_snapshot` 的 3.0s 数据库等待下限不自洽（见两处模块头部已更正的说明）。在没有可证实的真实锁等待路径之前，本轮只更正了文档承诺；真要对齐，应当是**按剩余预算做准入**（剩余时间不足以容纳一次合规的 3.0s 等待时直接跳过并记为 cursors 未知，从而保守地不删除任何分片），而不是把外层期限简单抬高、或把 SQLite 等待压到亚秒级重新引入热路径误杀。
+`maintenance.prune(timeout=1.0)` 保留默认期限，并预留 50ms 给释放锁与写入 retention marker。它将实际剩余时间传给 `cursor_snapshot(..., remaining_budget=...)`；每个 reader 在连接 SQLite 前必须还有 `3.0s + 50ms`，否则返回 `None`。schema 检查与 cursor 查询处于同一个只读事务，避免两次独立的数据库锁等待。
+
+默认预算下，有注册 reader 的 prune 会返回 `reader_unknown=True`、`limited=True`，不删除分片；没有 reader 时不需要 SQLite 等待。调用方可以明确传入更充足的 `timeout`。`reporting_commands.maintain` 将自身剩余预算减去 settlement reserve 后传入，因此有预算的显式维护仍可完成回收。没有降低 `busy_timeout=3000`，也没有提高 prune 的默认期限。
+
+既有日志回收调用只传 `timeout`，仍保留原先的协作式执行期限语义；本次不宣称关闭该热路径的所有延迟边界。
+
+## 9. 已实施：出站窗口与验证范围
+
+- `outbox.py`（本仓库没有 `storage.py`）在 `incidents` 追加可空 `attempt_timestamp REAL`。`begin_post` 在同一个 `BEGIN IMMEDIATE` 事务中写入尝试时间和 `uncertain`。历史 `uncertain` 行第一次被 claim 时在租约事务内回填 `first_seen`，后续对账不移动下界。
+- 公开标记保持 `<!-- mindie-incident:<sha256> -->`。搜索请求限定 `repo:`、`is:issue`、`in:body` 与指纹，一页最多 5 条，只以完整标记且非 PR 的结果确认命中；搜索未命中或 `incomplete_results` 不代表不存在。
+- 列举按 `created` 倒序，使用 `state=all`，每页 30 条、最多 5 页。下界是尝试时间（尚未尝试则为 `first_seen`）减去 300 秒时钟偏差，向下取整到秒；`since` 再前移一秒以包含恰好等于下界的记录。`since` 过滤的是更新时间，因此页面尾部创建时间早于下界时停止；短页也代表窗口完整。
+- 搜索、列举和 POST 共用一次 `begin_cycle` 的默认 8 MiB 响应预算，单条读取正文上限 256 KiB。可通过 `max_response_bytes` 设置更小预算。对账读取字节、正文或页数耗尽均返回 `github_reconciliation_window_exhausted`，至少退避 3600 秒，保持 `retry`／`uncertain`，不授权 POST。非对账传输保留 `github_output_limit`。
+- 验证使用纯内存标记匹配、真实 SQLite 迁移／回滚／租约，以及本地 HTTP 服务和真实 gh 替身子进程，保留生产字节计数器。覆盖搜索命中、延迟索引、边界时间、共享字节预算、页数耗尽、未知 POST 不重发和 prune 准入。测试入口为 `tests/test_reporter.py`、`tests/test_outbox.py`、`tests/test_reconciliation_http.py`、`tests/test_reader_registry.py` 与 `tests/test_maintenance.py`。
+
+这些证据属于本地 Tier 0／Tier 1，不构成线上 GitHub 检索质量、NPU 或跨主机 exactly-once 验收。

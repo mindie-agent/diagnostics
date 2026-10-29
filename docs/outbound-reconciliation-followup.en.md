@@ -1,12 +1,12 @@
-# Bounding the Outbound Reconciliation Read (Design Note, Not Implemented)
+# Bounding the Outbound Reconciliation Read
 
 [中文](./outbound-reconciliation-followup.md) · **English** · [Back to Documentation](./README.en.md)
 
-This note records intent and constraints only. **No production transport or API was changed**: the request shape in `reporter.py`, the `Outbox` schema and its state machine are untouched. Line references match the current working tree (based on `838480a`, updated for the 2-line header trim in `reporter.py`).
+**Implementation status (October 29, 2026):** attempt timestamps, positive-only search with bounded listing, window-exhaustion classification, and prune budget admission are implemented. Sections 1–7 retain the original design rationale; their line references describe `838480a`, not current source locations. Sections 8–9 describe the implementation and local verification scope.
 
 ---
 
-## 1. The reproducible contradiction today
+## 1. The reproducible contradiction before implementation
 
 `GitHub.find_issue` ([`reporter.py:468-497`](../mindie_diagnostics/reporter.py)) uses a single "list everything and download every issue body" read for two different purposes: cross-session deduplication, and reconciling this worker's own uncertain POST. It pages up to 20 times at 100 issues per page (`reporter.py:481-482`), while one whole publication cycle (one reconciliation plus one POST) shares an 8 MiB byte budget (`reporter.py:457-458`; `self._bytes` is reset only in `begin_cycle`).
 
@@ -62,6 +62,20 @@ Do **not** add a second receipt/audit ledger or a second state machine for this:
 - **No change to `publications` / rate-limit schema**: `publish_one` does not pass `hourly_limit` today (`reporter.py:550`), so the table stays empty; that is recorded here, but no table or branch is removed before a real defect and a validated migration exist.
 - **No merging of the health evaluators**: the duplicated judgement in `health.read_health` and `integration._worker_view` is the same kind of item, left to a separate change with migration validation.
 
-## 8. Adjacent item: aligning the `prune` and `cursor_snapshot` budgets
+## 8. Implemented: aligning the `prune` and `cursor_snapshot` budgets
 
-`maintenance.prune`'s 1.0s deadline is inconsistent with the 3.0s minimum database wait kept by `reader_registry.cursor_snapshot` (see the corrected notes in both module headers). With no demonstrable real lock-wait path, this pass only corrected the documented promise. A real alignment should be **admission based on the remaining budget** (when too little time remains to host one lawful 3.0s wait, skip and record cursors as unknown, which conservatively deletes nothing) rather than simply raising the outer deadline or pushing SQLite waits below a second and reintroducing hot-path false kills.
+`maintenance.prune(timeout=1.0)` keeps its default deadline and reserves 50ms for registry release and the retention marker. It passes the actual remaining time to `cursor_snapshot(..., remaining_budget=...)`. Each reader requires at least `3.0s + 50ms` before opening SQLite; otherwise the snapshot returns `None`. Schema inspection and cursor selection share one read transaction to avoid separate database lock waits.
+
+With the default budget and a registered reader, prune returns `reader_unknown=True` and `limited=True` without deleting segments. No reader means no SQLite wait is needed. Callers may explicitly provide a larger `timeout`; `reporting_commands.maintain` passes its own remaining budget minus the settlement reserve so explicit maintenance can still reclaim consumed logs. SQLite retains `busy_timeout=3000`, and prune's default deadline is unchanged.
+
+The existing log recycling caller passes only `timeout` and retains its cooperative execution deadline. This change does not claim to close every latency boundary in that hot path.
+
+## 9. Implemented: outbound window and verification scope
+
+- `outbox.py` (this repository has no `storage.py`) adds nullable `attempt_timestamp REAL` to `incidents`. `begin_post` writes the timestamp and `uncertain` in the same `BEGIN IMMEDIATE` transaction. A legacy uncertain row receives its `first_seen` lower bound inside its first claim transaction; later reconciliation never advances it.
+- Public identity remains `<!-- mindie-incident:<sha256> -->`. Search is restricted by `repo:`, `is:issue`, `in:body`, and the fingerprint, with at most five results on one page. Only a complete marker on a non-PR result confirms presence; a miss or `incomplete_results` does not establish absence.
+- Listing uses `state=all`, creation order descending, 30 items per page and at most five pages. Its lower bound is the attempt timestamp (or `first_seen` before an attempt), minus 300 seconds of clock skew, rounded down to a second. `since` moves one more second backward to include boundary timestamps. Because `since` filters update time, listing stops when the page's final creation time precedes the lower bound; a short page also completes the window.
+- Search, listing and POST share the default 8 MiB response budget of one `begin_cycle`; individual read bodies are capped at 256 KiB. `max_response_bytes` allows a smaller budget. Reconciliation byte, body or page exhaustion yields `github_reconciliation_window_exhausted`, backs off at least 3600 seconds, retains `retry`/`uncertain`, and never authorizes POST. Other transport calls retain `github_output_limit`.
+- Verification uses pure in-memory marker matching, real SQLite migration/rollback/leases, and a local HTTP server reached by a real gh substitute subprocess through the production byte counter. It covers positive search, delayed indexing, timestamp boundaries, cumulative bytes, exhausted pages, unknown POST non-replay and prune admission. Tests are in `tests/test_reporter.py`, `tests/test_outbox.py`, `tests/test_reconciliation_http.py`, `tests/test_reader_registry.py` and `tests/test_maintenance.py`.
+
+This is local Tier 0/Tier 1 evidence, not live GitHub retrieval-quality, NPU or cross-host exactly-once acceptance.

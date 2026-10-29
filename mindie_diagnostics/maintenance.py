@@ -13,16 +13,13 @@ signal backpressure to active log writers when retention limits remain exceeded.
   definitively exited (`ESRCH`).
 
 [Timeouts & Locks]
-- A 1.0s monotonic deadline (`deadline = time.monotonic() + 1`) bounds the
-  directory scan and the delete loop, and caps the `reader_guard` lock wait at
-  100ms and the requested `cursor_snapshot` budget at 200ms.
-- That 1.0s is not a hard ceiling for the whole call: `cursor_snapshot` keeps
-  the project-wide `3.0s` floor on each reader database wait (WAL plus
-  `busy_timeout=3000`, see `reader_registry.py`), which a contended reader
-  store can spend inside the 200ms request. Prune stays conservative either
-  way - an unknown cursor snapshot deletes nothing - so the overrun costs
-  latency, never evidence. Aligning the two budgets is tracked in
-  `docs/outbound-reconciliation-followup.md`.
+- The caller's monotonic budget (default 1.0s) reserves 50ms for releasing the
+  registry lock and writing the retention marker. Scanning and deletion share
+  the remainder; `reader_guard` waits at most 100ms.
+- `cursor_snapshot` receives the actual remaining budget. Its 3.0s SQLite
+  wait plus cleanup must fit before it opens each reader; otherwise cursors
+  are unknown and this call deletes nothing. Callers may explicitly provide
+  a larger budget without changing the default admission policy.
 
 [Side-Effect Policy]
 - Unlinks only verified consumed log segments and atomically updates
@@ -41,6 +38,7 @@ import time
 from .reader_registry import reader_guard, cursor_snapshot, fully_consumed
 
 _FILE = re.compile(r"(\d+)-[0-9a-f]{32}\.jsonl(?:\.[1-3])?\Z")
+_CLEANUP_S = .05
 
 
 def _writer_exited(pid: int) -> bool:
@@ -79,7 +77,8 @@ def _marker(root, result, blocked, now):
 
 
 def prune(root: str | Path, *, max_bytes: int = 128 * 1024 * 1024,
-          max_age_days: int = 7, max_files: int = 512, clock=time.time, queue=None) -> dict:
+          max_age_days: int = 7, max_files: int = 512, clock=time.time, queue=None,
+          timeout: float = 1.0) -> dict:
     root = Path(root).absolute()
     if root.is_symlink():
         raise ValueError("retention root must not traverse symlinks")
@@ -89,7 +88,7 @@ def prune(root: str | Path, *, max_bytes: int = 128 * 1024 * 1024,
               "unread_files": 0, "active_or_unknown_files": 0}
     if not root.exists():
         return result
-    deadline = time.monotonic() + 1
+    deadline = time.monotonic() + max(0, float(timeout) - _CLEANUP_S)
     files, visited, incomplete = [], 0, False
     total, remaining, now = 0, 0, clock()
     try:
@@ -122,10 +121,15 @@ def prune(root: str | Path, *, max_bytes: int = 128 * 1024 * 1024,
         total, remaining = sum(row[1] for row in files), len(files)
         with reader_guard(root, timeout=min(.1, max(0, deadline - time.monotonic())),
                           queue_path=queue.path if queue is not None else None) as state:
-            cursors = cursor_snapshot(state['readers'], timeout=min(.2, max(0, deadline - time.monotonic()))) if state['status'] == 'ok' else None
+            cursors = cursor_snapshot(
+                state['readers'], timeout=.2,
+                remaining_budget=max(0, deadline - time.monotonic()),
+            ) if state['status'] == 'ok' else None
             result['reader_unknown'] = cursors is None
+            if cursors is None:
+                result['unread_files'] = len(files)
             exited = {}
-            for modified, size, path, inode, device, modified_ns in sorted(files):
+            for modified, size, path, inode, device, modified_ns in sorted(files) if cursors is not None else ():
                 if time.monotonic() >= deadline:
                     incomplete = True
                     break

@@ -13,6 +13,7 @@ def isolated_runtime(tmp_path, monkeypatch):
         ('HOME', home),
         ('USERPROFILE', home),
         ('XDG_CONFIG_HOME', tmp_path.resolve() / 'xdg-config'),
+        ('XDG_DATA_HOME', tmp_path.resolve() / 'xdg-data'),
         ('XDG_STATE_HOME', tmp_path.resolve() / 'xdg-state'),
         ('LOCALAPPDATA', tmp_path.resolve() / 'localappdata'),
         ('MINDIE_DIAGNOSTICS_SERVICE_DIR', tmp_path.resolve() / 'service'),

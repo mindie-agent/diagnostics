@@ -86,7 +86,9 @@ def test_proven_not_sent_failure_recovers_to_one_publication(tmp_path, reporting
         if method == "GET":
             if broken[0] and mode == "read_error":
                 raise TransportError("github_timeout")
-            return 0, b"HTTP/2 200 OK\r\n\r\n[]", 22
+            reply = {"items": [], "total_count": 0, "incomplete_results": False} if command[-1].startswith("search/") else []
+            raw = b"HTTP/2 200 OK\r\n\r\n" + json.dumps(reply).encode()
+            return 0, raw, len(raw)
         if broken[0]:
             if mode == "not_started":
                 raise TransportError("github_client_missing", permanent=True)
@@ -118,15 +120,17 @@ def test_search_and_post_share_the_original_cycle_deadline(monkeypatch):
 
     def transport(command, data, **options):
         deadlines.append(options["deadline"])
-        clock[0] += 10
-        return 0, b"HTTP/2 200 OK\n\n[]", 18
+        clock[0] += 5
+        reply = {"items": [], "total_count": 0, "incomplete_results": False} if command[-1].startswith("search/") else []
+        raw = b"HTTP/2 200 OK\n\n" + json.dumps(reply).encode()
+        return 0, raw, len(raw)
 
     monkeypatch.setattr(reporter, "_run_gh", transport)
     monkeypatch.setattr(GitHub, "request", reporter_request)
     github.begin_cycle()
-    assert github.find_issue({"payload": payload()}) is None
+    assert github.find_issue({"payload": payload(), "first_seen": 1000.0}) is None
     github.create_issue("synthetic", "synthetic")
-    assert deadlines == [115.0, 130.0]
+    assert deadlines == [115.0, 115.0, 130.0]
     assert github._deadline == 130.0
     github.end_cycle()
 
@@ -141,8 +145,8 @@ def test_legacy_unknown_receipt_resumes_reconciliation_without_post(tmp_path, re
 
     def existing(self, method, path, data=None):
         calls.append(method)
-        return [{"number": 4, "html_url": f"https://github.com/{self.repository}/issues/4",
-                 "body": marker}]
+        return {"items": [{"number": 4, "html_url": f"https://github.com/{self.repository}/issues/4",
+                           "body": marker}], "total_count": 1, "incomplete_results": False}
 
     monkeypatch.setattr(GitHub, "request", existing)
     assert publish_one(reopened, GitHub(reporting_consent["repository"]))["status"] == "reconciled"
@@ -213,6 +217,8 @@ def test_sanitized_issue_marker_reconciles_an_uncertain_post(tmp_path, reporting
 
         def request(self, method, path, payload=None):
             if method == 'GET':
+                if path.startswith("search/"):
+                    return {"items": self.posts, "total_count": len(self.posts), "incomplete_results": False}
                 return self.posts
             assert method == 'POST'
             issue = dict(payload, number=7,
@@ -244,7 +250,7 @@ def test_create_issue_guarantees_post_budget_after_slow_find_issue():
             if method == 'GET':
                 # Simulate multi-page issue listing consuming nearly all of the initial cycle window.
                 self._deadline = time.monotonic() + 0.05
-                return []
+                return {"items": [], "total_count": 0, "incomplete_results": False} if path.startswith("search/") else []
             assert method == 'POST'
             observed_post_remaining.append(self._deadline - time.monotonic())
             return {'number': 42, 'html_url': f'https://github.com/{self.repository}/issues/42'}
@@ -252,11 +258,25 @@ def test_create_issue_guarantees_post_budget_after_slow_find_issue():
     gh = SlowSearchGitHub('owner/repo', timeout=30)
     gh.begin_cycle()
     try:
-        assert gh.find_issue({'payload': payload()}) is None
+        assert gh.find_issue({'payload': payload(), 'first_seen': 1000.0}) is None
         created = gh.create_issue('Title', 'Body')
     finally:
         gh.end_cycle()
     assert created['number'] == 42
     assert len(observed_post_remaining) == 1
     assert observed_post_remaining[0] >= 14.0
+
+
+def test_marker_confirmation_ignores_search_false_positives_and_pull_requests():
+    from mindie_diagnostics.reporter import _matching_issue
+
+    identity = fingerprint(payload())
+    marker = f"<!-- mindie-incident:{identity} -->"
+    rows = [
+        {"body": f"Fingerprint mentioned in discussion: {identity}"},
+        {"body": marker, "pull_request": {"url": "https://api.github.com/repos/owner/repo/pulls/1"}},
+    ]
+    assert _matching_issue(rows, marker, "github_invalid_issue_search") is None
+    match = {"number": 2, "body": marker + "\nSanitized diagnostic evidence"}
+    assert _matching_issue([*rows, match], marker, "github_invalid_issue_search") is match
 

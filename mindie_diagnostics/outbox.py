@@ -12,9 +12,9 @@ operation deduplication (`seen`), and hourly publication rate limits.
   and `uncertain` rows; unpublished active evidence is never evicted by terminal
   history pruning.
 - Transient failures and uncertain writes retain evidence until publication or withdrawal.
-- `begin_post` transitions leased rows to `uncertain` BEFORE any mutating GitHub
-  POST so uncertain external writes are never blindly retried without
-  reconciling the GitHub marker first.
+- `begin_post` atomically persists `uncertain` and its attempt timestamp BEFORE
+  any mutating GitHub POST. Legacy uncertain rows retain `first_seen` as their
+  reconciliation lower bound; unknown writes are never blindly replayed.
 
 [Timeouts & Locks]
 - Cross-process initialization is serialized by an `flock`/`msvcrt` lock on
@@ -56,7 +56,7 @@ _SCHEMA = """
                     state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
                     next_attempt REAL NOT NULL DEFAULT 0, lease_until REAL NOT NULL DEFAULT 0,
                     lease_token TEXT, issue_number INTEGER, issue_url TEXT, last_error TEXT,
-                    consent TEXT);
+                    consent TEXT, attempt_timestamp REAL);
                 CREATE TABLE seen (
                     operation_id TEXT PRIMARY KEY, observed REAL NOT NULL);
                 CREATE TABLE publications (at REAL NOT NULL);
@@ -119,6 +119,9 @@ class Outbox:
                 if fresh:
                     db.executescript(_SCHEMA)
                 self._validate_schema(db)
+                columns = {row[1] for row in db.execute("PRAGMA table_info(incidents)")}
+                if "attempt_timestamp" not in columns:
+                    db.execute("ALTER TABLE incidents ADD COLUMN attempt_timestamp REAL")
                 # Older releases stopped reconciliation after three reads.
                 # Their compact receipt still identifies the remote marker.
                 db.execute(
@@ -195,7 +198,7 @@ class Outbox:
                     # A fresh authorized event restores evidence discarded by
                     # the old read-attempt budget. Never replay unknown writes.
                     db.execute(
-                        "UPDATE incidents SET payload=?,state='pending',attempts=0,next_attempt=0,"
+                        "UPDATE incidents SET payload=?,state='pending',attempts=0,next_attempt=0,attempt_timestamp=NULL,"
                         "first_seen=?,last_seen=?,occurrences=occurrences+1 WHERE fingerprint=?",
                         (body, now, now, fingerprint),
                     )
@@ -321,12 +324,17 @@ class Outbox:
             consent = self._stored_consent(row["consent"])
             payload = json.loads(row["payload"])
             attempts = int(row["attempts"]) + 1
+            attempt_timestamp = row["attempt_timestamp"]
+            if row["state"] == "uncertain" and attempt_timestamp is None:
+                # A legacy unknown write predates this claim; using now could
+                # hide its Issue. Freeze the only known lower bound instead.
+                attempt_timestamp = row["first_seen"]
             db.execute(
-                "UPDATE incidents SET attempts=?, lease_until=?, lease_token=? WHERE fingerprint=?",
-                (attempts, now + lease_seconds, token, row["fingerprint"]),
+                "UPDATE incidents SET attempts=?, lease_until=?, lease_token=?, attempt_timestamp=? WHERE fingerprint=?",
+                (attempts, now + lease_seconds, token, attempt_timestamp, row["fingerprint"]),
             )
         return {**dict(row), "attempts": attempts, "lease_token": token, "payload": payload,
-                "consent": consent}
+                "consent": consent, "attempt_timestamp": attempt_timestamp}
 
     @staticmethod
     def _stored_consent(raw):
@@ -426,9 +434,9 @@ class Outbox:
                 if count >= hourly_limit:
                     return False
             cursor = db.execute(
-                "UPDATE incidents SET state='uncertain' WHERE fingerprint=? AND lease_token=? "
+                "UPDATE incidents SET state='uncertain',attempt_timestamp=? WHERE fingerprint=? AND lease_token=? "
                 "AND lease_until>? AND state IN ('pending','retry')",
-                (item["fingerprint"], item["lease_token"], now),
+                (now, item["fingerprint"], item["lease_token"], now),
             )
             if cursor.rowcount != 1:
                 raise RuntimeError("diagnostic worker lease expired before publication")

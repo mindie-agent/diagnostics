@@ -146,7 +146,8 @@ def test_each_github_reconciliation_page_rechecks_receipt(tmp_path,monkeypatch):
     calls=[]
     def run(command,data,**kwargs):
         calls.append(command);reporting_policy(path,False)
-        raw=b'HTTP/2 200 OK\r\ncontent-type: application/json\r\n\r\n'+json.dumps([{'body':''}]*100).encode()
+        raw=b'HTTP/2 200 OK\r\ncontent-type: application/json\r\n\r\n'+json.dumps({
+            'items': [], 'total_count': 0, 'incomplete_results': False}).encode()
         return 0,raw,len(raw)
     from mindie_diagnostics import reporter
     monkeypatch.setattr(GitHub,'request',_REAL_REQUEST)

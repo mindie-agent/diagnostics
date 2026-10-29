@@ -8,9 +8,8 @@ issue markers (`<!-- mindie-incident:<sha256> -->`), and publishes via `publish_
 [Invariants]
 - Re-projects and re-scans every bundle via `export_issue_event` and `scan_text`
   before rendering; never trusts a caller-supplied redaction flag.
-- Always searches existing repository issues (`find_issue`) before creating a
-  new issue; if an issue with the marker exists, transitions to `published`
-  (`status="reconciled"`) without posting a duplicate.
+- Search hits confirm markers; misses require a complete, time-bounded issue
+  listing. Incomplete windows never authorize a POST or replay unknown writes.
 - Calls `queue.begin_post(item)` BEFORE `POST repos/<repo>/issues` so any process
   death or transport failure after process start records `state="uncertain"`.
 - Never overwrites an acknowledged external publication (`published` / `reconciled`)
@@ -19,8 +18,8 @@ issue markers (`<!-- mindie-incident:<sha256> -->`), and publishes via `publish_
 [Timeouts & Locks]
 - Leases `Outbox` items for `github.timeout + 20` seconds (`default 50s`),
   covering transport cleanup and the local receipt.
-- `GitHub.begin_cycle` enforces an overall cycle deadline (`default 30s`) and an
-  `8 MiB` response budget across pagination, reserving up to 15s for `POST`.
+- `GitHub.begin_cycle` shares a deadline (default 30s) and 8 MiB response budget
+  across one search page, up to five listing pages, and POST (reserving up to 15s).
 - `_run_gh` spawns `gh` in an isolated process group (`start_new_session=True` /
   `CREATE_NEW_PROCESS_GROUP`) and reaps the entire process group on timeout/cancel
   (`SIGTERM` -> 2.0s grace -> `SIGKILL`).
@@ -42,14 +41,22 @@ import subprocess
 import tempfile
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 from .outbox import Outbox
 from .reporting import ConsentUnavailable, ConsentWithdrawn, check_remote_action, guard_consent, require_consent
 
 DEFAULT_REPOSITORY = "mindie-agent/mindie-agent"
 MARKER = "<!-- mindie-incident:"
+MAX_GITHUB_RESPONSE_BYTES = 8 * 1024 * 1024
+_SEARCH_PAGE_SIZE = 5
+_RECONCILIATION_PAGE_SIZE = 30
+_RECONCILIATION_MAX_PAGES = 5
+_MAX_ISSUE_BODY_BYTES = 256 * 1024
+_CLOCK_SKEW_MARGIN_SECONDS = 300
 
 
 class TransportError(RuntimeError):
@@ -420,12 +427,17 @@ def render_issue(item: dict[str, Any]) -> tuple[str, str]:
 
 class GitHub:
     """One bounded gh transport using the user's existing authentication."""
-    def __init__(self, repository: str = DEFAULT_REPOSITORY, *, executable: str = "gh", timeout: float = 30, cancel=None):
+    def __init__(self, repository: str = DEFAULT_REPOSITORY, *, executable: str = "gh",
+                 timeout: float = 30, cancel=None,
+                 max_response_bytes: int = MAX_GITHUB_RESPONSE_BYTES):
         if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
             raise ValueError("invalid GitHub repository")
         if not 0 < timeout <= 300:
             raise ValueError("invalid GitHub cycle timeout")
+        if not 0 < max_response_bytes <= MAX_GITHUB_RESPONSE_BYTES:
+            raise ValueError("invalid GitHub response budget")
         self.repository, self.executable, self.timeout = repository, executable, timeout
+        self.max_response_bytes = max_response_bytes
         self.cancel, self._deadline, self._bytes = cancel, None, 0
         self._searched_in_cycle = False
 
@@ -441,7 +453,15 @@ class GitHub:
 
     def request(self, method: str, path: str, payload: dict | None = None):
         check_remote_action()
-        if method not in {"GET", "POST"} or not isinstance(path, str) or not path.startswith(f"repos/{self.repository}/") or any(char in path for char in "\r\n#%") or ".." in path:
+        if method not in {"GET", "POST"} or not isinstance(path, str) or any(char in path for char in "\r\n#") or ".." in path:
+            raise TransportError("github_invalid_path", permanent=True)
+        endpoint = urlsplit(path)
+        query = parse_qs(endpoint.query)
+        search = (method == "GET" and endpoint.path == "search/issues"
+                  and len(query.get("q", [])) == 1
+                  and re.fullmatch(rf'repo:{re.escape(self.repository)} is:issue in:body "[0-9a-f]{{64}}"',
+                                   query["q"][0]))
+        if not search and (not path.startswith(f"repos/{self.repository}/") or "%" in path):
             raise TransportError("github_invalid_path", permanent=True)
         standalone = self._deadline is None
         if standalone:
@@ -455,7 +475,7 @@ class GitHub:
                 data = json.dumps(payload, ensure_ascii=True).encode()
             try:
                 code, raw, size = _run_gh(command, data, deadline=self._deadline,
-                                          max_bytes=8 * 1024 * 1024 - self._bytes, cancel=self.cancel)
+                                          max_bytes=self.max_response_bytes - self._bytes, cancel=self.cancel)
             except TransportError as exc:
                 exc.uncertain = method == "POST" and exc.started
                 raise
@@ -466,7 +486,7 @@ class GitHub:
                 self.end_cycle()
 
     def find_issue(self, item: dict[str, Any]):
-        # Listing all states avoids search-index lag; a full window is not absence.
+        # Search is positive-only: an index miss never proves remote absence.
         payload = item["payload"]
         saved = payload.get("public_fingerprint") if not payload.get("events") else None
         identity = saved if isinstance(saved, str) and re.fullmatch(r"[0-9a-f]{64}", saved) else fingerprint(payload)
@@ -478,19 +498,46 @@ class GitHub:
         cycle_deadline = self._deadline
         self._deadline -= min(float(self.timeout) / 2, 15.0)
         try:
-            for page in range(1, 21):
-                rows = self.request("GET", f"repos/{self.repository}/issues?state=all&sort=updated&direction=desc&per_page=100&page={page}")
-                if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
-                    raise TransportError("github_invalid_issue_listing")
-                for row in rows:
-                    body = row.get("body") or ""
-                    if not isinstance(body, str):
-                        raise TransportError("github_invalid_issue_listing")
-                    if "pull_request" not in row and marker in body:
-                        return row
-                if len(rows) < 100:
+            search_query = urlencode({
+                "q": f'repo:{self.repository} is:issue in:body "{identity}"',
+                "per_page": _SEARCH_PAGE_SIZE, "page": 1,
+            })
+            reply = self.request("GET", f"search/issues?{search_query}")
+            if not isinstance(reply, dict):
+                raise TransportError("github_invalid_issue_search")
+            match = _matching_issue(reply.get("items"), marker, "github_invalid_issue_search")
+            if match:
+                return match
+            # first_seen is a safe but potentially wide lower bound for pending
+            # rows and legacy unknown writes; it must never slide forward.
+            attempt = item.get("attempt_timestamp")
+            lower = datetime.fromtimestamp(
+                (item["first_seen"] if attempt is None else attempt) - _CLOCK_SKEW_MARGIN_SECONDS,
+                timezone.utc,
+            ).replace(microsecond=0)
+            # GitHub's since filter is exclusive at second precision.
+            since = (lower - timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            for page in range(1, _RECONCILIATION_MAX_PAGES + 1):
+                rows = self.request("GET", f"repos/{self.repository}/issues?state=all&sort=created"
+                                    f"&direction=desc&since={since}&per_page={_RECONCILIATION_PAGE_SIZE}&page={page}")
+                match = _matching_issue(rows, marker, "github_invalid_issue_listing")
+                if match:
+                    return match
+                if len(rows) < _RECONCILIATION_PAGE_SIZE:
                     return None
+                # since filters updated_at, so old issues updated recently can
+                # remain. Creation ordering lets us stop at the lower boundary.
+                try:
+                    last_created = datetime.fromisoformat(rows[-1]["created_at"].replace("Z", "+00:00"))
+                    if last_created < lower:
+                        return None
+                except (KeyError, ValueError, TypeError, AttributeError) as exc:
+                    raise TransportError("github_invalid_issue_listing") from exc
             raise TransportError("github_reconciliation_window_exhausted", retry_after=3600)
+        except TransportError as exc:
+            if exc.code == "github_output_limit":
+                raise TransportError("github_reconciliation_window_exhausted", retry_after=3600) from exc
+            raise
         finally:
             self._deadline = cycle_deadline
             if standalone:
@@ -498,6 +545,22 @@ class GitHub:
 
     def create_issue(self, title: str, body: str):
         return self.request("POST", f"repos/{self.repository}/issues", {"title": title, "body": body})
+
+
+def _matching_issue(rows, marker, error_code):
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise TransportError(error_code)
+    for row in rows:
+        body = row.get("body")
+        if body is None:
+            body = ""
+        if not isinstance(body, str):
+            raise TransportError(error_code)
+        if len(body.encode("utf-8")) > _MAX_ISSUE_BODY_BYTES:
+            raise TransportError("github_reconciliation_window_exhausted", retry_after=3600)
+        if "pull_request" not in row and marker in body:
+            return row
+    return None
 
 
 def _issue_reference(reply, repository):

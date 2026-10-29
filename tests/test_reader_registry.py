@@ -3,6 +3,8 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -97,4 +99,57 @@ def test_reader_guard_timeout_is_explicit_and_not_swallowed(tmp_path, monkeypatc
         register_reader(tmp_path, path, timeout=0.02)
     with pytest.raises(TimeoutError, match='diagnostic reader registry is busy'):
         unregister_reader(tmp_path, path, timeout=0.02)
+
+
+def test_snapshot_budget_admission_preserves_unread_and_consumed_cursors(tmp_path):
+    path = queue(tmp_path / 'reader.db')
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute('INSERT INTO cursors VALUES (?,?,?)', ('/log', '123', 42))
+    skipped = cursor_snapshot([str(path)], remaining_budget=1)
+    assert skipped is None and not fully_consumed(skipped, '/log', 123, 42)
+    assert cursor_snapshot([str(path)], remaining_budget=3.2) == [
+        {'/log': {'inode': '123', 'offset': 42}},
+    ]
+    # No database wait is needed when there are no registered consumers.
+    assert cursor_snapshot([], remaining_budget=0) == []
+
+
+def test_snapshot_does_not_enter_locked_database_without_wait_and_cleanup_budget(tmp_path):
+    path = queue(tmp_path / 'busy.db')
+    with closing(sqlite3.connect(path)) as db:
+        db.execute('BEGIN EXCLUSIVE')
+        started = time.monotonic()
+        assert cursor_snapshot([str(path)], remaining_budget=3.0) is None
+        assert time.monotonic() - started < .5
+
+
+def test_snapshot_readers_share_actual_remaining_budget(tmp_path, monkeypatch):
+    import mindie_diagnostics.reader_registry as rr
+
+    a, b = queue(tmp_path / 'a.db'), queue(tmp_path / 'b.db')
+    clock = [0.0]
+    opened = []
+    transactions = []
+    original_connect = sqlite3.connect
+
+    def connect(database, **kwargs):
+        db = original_connect(database, **kwargs)
+        opened.append(database)
+
+        def after_query(sql):
+            if sql.startswith('SELECT path,inode,offset'):
+                # The first reader really queries SQLite in one transaction;
+                # advancing the injected clock makes its cost deterministic.
+                transactions.append(db.in_transaction)
+                clock[0] += .2
+        db.set_trace_callback(after_query)
+        return db
+
+    with closing(original_connect(b)) as locked:
+        locked.execute('BEGIN EXCLUSIVE')
+        monkeypatch.setattr(rr, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
+        monkeypatch.setattr(rr.sqlite3, 'connect', connect)
+        assert cursor_snapshot([str(a), str(b)], remaining_budget=3.2) is None
+    assert opened == [a.as_uri() + '?mode=ro']
+    assert transactions == [True]
 

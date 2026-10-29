@@ -1,3 +1,5 @@
+# Enforce Unix LF (\n) line endings across native Windows, WSL, macOS, and Linux.
+# Windows CRLF (\r\n) is strictly prohibited in all text files; retain Git's binary-file detection.
 * text=auto eol=lf
 
 # Evidence hashes refer to the captured bytes, independent of host line endings.

@@ -19,6 +19,8 @@ provisioning (`ensure`), and bounded automatic runtime handoff (`upgrade_running
   capping wall clock: roots, intake and retention start only with
   `_SETTLEMENT_RESERVE_S = 3.0s` left, intake scans until `deadline - 3.0s`, and
   work already inside a lawful 3-5s SQLite wait may outlive the budget.
+- Retention receives the remaining budget minus that settlement reserve;
+  reader snapshots admit their SQLite wait only when it fits.
 - `upgrade_running` reserves `_ROLLBACK_RESERVE_S = 20.0s` for rollback before
   `deadline`, caps lock acquisition at `_LOCK_WAIT_S = 12.0s`, and polls worker
   readback for up to `_READBACK_S = 8.0s`.
@@ -154,7 +156,10 @@ def maintain(config=None, *, update_running=False, unit_dir=None, budget_seconds
             result['retention'].append({'status': 'unavailable', 'category': 'budget_exhausted', 'limited': True})
             continue
         try:
-            result['retention'].append(prune(root, queue=active_queue))
+            result['retention'].append(prune(
+                root, queue=active_queue,
+                timeout=max(0, deadline - time.monotonic() - _SETTLEMENT_RESERVE_S),
+            ))
         except TimeoutError:
             raise
         except (OSError, ValueError, RuntimeError) as exc:

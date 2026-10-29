@@ -1,4 +1,6 @@
 import os
+import sqlite3
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -44,8 +46,39 @@ def test_worker_retention_preserves_unread_old_evidence(tmp_path, monkeypatch):
     consumed = ingest(tmp_path, queue)
     assert consumed['scanned_bytes'] > 0 and consumed['enqueued'] == 0
     # Retention consumes local-only records without authorizing an Issue.
-    assert prune(tmp_path, max_bytes=1, queue=queue)['removed_files'] == 1
+    skipped = prune(tmp_path, max_bytes=1, queue=queue)
+    assert skipped['reader_unknown'] and skipped['removed_files'] == 0
+    assert prune(tmp_path, max_bytes=1, queue=queue, timeout=4)['removed_files'] == 1
     assert not path.exists()
+
+
+def test_prune_skips_locked_reader_when_remaining_budget_cannot_admit_sqlite(tmp_path):
+    from mindie_diagnostics.reader_registry import register_reader
+
+    folder = tmp_path / 'events' / 'test'
+    folder.mkdir(parents=True)
+    path = folder / ('1-' + 'a' * 32 + '.jsonl')
+    path.write_text('evidence')
+    os.utime(path, (1, 1))
+    db_path = tmp_path / 'reader.db'
+    db = sqlite3.connect(db_path)
+    try:
+        db.execute('CREATE TABLE cursors (path TEXT PRIMARY KEY,inode TEXT,offset INTEGER)')
+        db.execute('INSERT INTO cursors VALUES (?,?,?)',
+                   (str(path), str(path.stat().st_ino), path.stat().st_size))
+        db.commit()
+        register_reader(tmp_path, db_path)
+        # A rollback-journal exclusive lock would make the real SQLite reader
+        # wait 3s if prune admitted it into the default 1s outer budget.
+        db.execute('BEGIN EXCLUSIVE')
+        started = time.monotonic()
+        result = prune(tmp_path, max_bytes=1)
+        assert time.monotonic() - started < 1
+        assert result['reader_unknown'] and result['limited']
+        assert result['removed_files'] == 0 and result['unread_files'] == 1
+        assert path.read_text() == 'evidence'
+    finally:
+        db.close()
 
 
 def test_retention_keeps_actual_live_writer_and_rotated_family(tmp_path):

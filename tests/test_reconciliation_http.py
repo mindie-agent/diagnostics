@@ -105,11 +105,34 @@ def github_http(tmp_path, monkeypatch, reporting_consent):
         target=server.serve_forever, kwargs={"poll_interval": .01}, daemon=True,
     )
     thread.start()
-    helper = Path(__file__).with_name("http_gh_stub.py")
+    helper_dir = str(Path(__file__).resolve().parent)
     if os.name == "nt":
-        executable = tmp_path / "gh.cmd"
-        executable.write_text(f'@"{sys.executable}" "{helper}" %*\n', encoding="utf-8", newline="\n")
+        (tmp_path / "sitecustomize.py").write_text(
+            "import os, sys\n"
+            "if sys.argv[:2] == ['api', '--include']:\n"
+            "    rc = 1\n"
+            "    try:\n"
+            "        sys.argv = ['gh', *sys.argv]\n"
+            "        import http_gh_stub\n"
+            "        rc = int(http_gh_stub.main() or 0)\n"
+            "        sys.stdout.flush()\n"
+            "        sys.stderr.flush()\n"
+            "    except SystemExit as exc:\n"
+            "        rc = exc.code if isinstance(exc.code, int) else 1\n"
+            "    except BaseException:\n"
+            "        rc = 1\n"
+            "    os._exit(rc)\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        existing_pythonpath = os.environ.get("PYTHONPATH", "")
+        pythonpath_entries = [str(tmp_path), helper_dir]
+        if existing_pythonpath:
+            pythonpath_entries.append(existing_pythonpath)
+        monkeypatch.setenv("PYTHONPATH", os.pathsep.join(pythonpath_entries))
+        executable = Path(sys.executable)
     else:
+        helper = Path(__file__).with_name("http_gh_stub.py")
         executable = tmp_path / "gh"
         executable.write_text(f"#!{sys.executable}\n" + helper.read_text(), encoding="utf-8", newline="\n")
         executable.chmod(0o700)

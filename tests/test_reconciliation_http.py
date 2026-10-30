@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
 import sys
 import threading
@@ -105,9 +106,13 @@ def github_http(tmp_path, monkeypatch, reporting_consent):
     )
     thread.start()
     helper = Path(__file__).with_name("http_gh_stub.py")
-    executable = tmp_path / "gh"
-    executable.write_text(f"#!{sys.executable}\n" + helper.read_text(), encoding="utf-8")
-    executable.chmod(0o700)
+    if os.name == "nt":
+        executable = tmp_path / "gh.cmd"
+        executable.write_text(f'@"{sys.executable}" "{helper}" %*\n', encoding="utf-8", newline="\n")
+    else:
+        executable = tmp_path / "gh"
+        executable.write_text(f"#!{sys.executable}\n" + helper.read_text(), encoding="utf-8", newline="\n")
+        executable.chmod(0o700)
     monkeypatch.setenv("DIAGNOSTICS_TEST_HTTP_PORT", str(server.server_port))
     monkeypatch.setattr(GitHub, "request", _REQUEST)
     state.executable = str(executable)

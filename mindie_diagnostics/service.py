@@ -45,9 +45,27 @@ MAX_UNIT_BYTES = 32768
 
 
 class ServiceError(RuntimeError):
-    def __init__(self, category, *, action=None, returncode=None):
+    def __init__(self, category, *, action=None, returncode=None, detail=None):
         self.category, self.action, self.returncode = category, action, returncode
-        super().__init__(category + (f" ({action}, exit {returncode})" if action else ""))
+        suffix = f": {detail}" if detail else ""
+        super().__init__(category + (f" ({action}, exit {returncode}){suffix}" if action else suffix))
+
+
+_OTHER_UNIT_PREFIX = re.compile(
+    r"^(?:/.*|\S+\.(?:service|socket|target|timer|mount|automount|swap|path|slice|scope)):"
+)
+
+
+def _unit_verification_warnings(stderr: str, temporary: str) -> list[str]:
+    unit_name = Path(temporary).name
+    warnings = []
+    for raw_line in stderr.splitlines():
+        line = raw_line.strip()
+        if not line or "is marked world-inaccessible" in line:
+            continue
+        if temporary in line or unit_name in line or not _OTHER_UNIT_PREFIX.match(line):
+            warnings.append(line)
+    return warnings
 
 
 def _linux():
@@ -277,15 +295,17 @@ def _publish(path, text, runner):
             stream.write(text)
             stream.flush()
             os.fsync(stream.fileno())
+        os.chmod(temporary, 0o644)
         # Parse the exact staged file before replacing a working installation.
         # This does not contact a service manager or execute ExecStart. Some
         # minimal systemd installations omit this optional inspection binary.
         analyzer = shutil.which("systemd-analyze")
         if analyzer:
             checked = _run(runner, [analyzer, "verify", "--man=no", temporary], action="unit.verify")
-            if checked.stderr.strip():
+            warnings = _unit_verification_warnings(checked.stderr, temporary)
+            if warnings:
                 # Invalid non-fatal directives may be ignored with exit zero.
-                raise ServiceError('unit_verification_warning', action='unit.verify')
+                raise ServiceError("unit_verification_warning", action="unit.verify", detail="; ".join(warnings))
         os.replace(temporary, path)
         return "verified" if analyzer else "unavailable"
     finally:

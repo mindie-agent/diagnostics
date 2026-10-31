@@ -52,9 +52,7 @@ flowchart LR
 
 ## Quick Start
 
-### Option 1: One-Sentence Setup via Your AI Agent (Recommended)
-
-Copy and paste this sentence to Claude Code, Codex, Kimi Code, or Cursor to let your agent install `mindie-diagnostics` and inspect local diagnostic status:
+Copy and paste this sentence to Claude Code, Codex, Kimi Code, or DeepSeek Harness (DSH) so your AI Agent installs `mindie-diagnostics` and inspects local diagnostic status automatically:
 
 ```text
 Please install and configure https://github.com/mindie-agent/diagnostics for me
@@ -87,20 +85,6 @@ If you are an AI Agent receiving the prompt above, follow these steps to install
 4. **Report Back**: Show the user the output of `reporting status` and let them know how to export offline bundles or toggle opt-in reporting anytime.
 
 </details>
-
-### Option 2: One-Line Terminal Install for Humans
-
-Requires Python `>= 3.11` (and an authenticated `gh` CLI if you choose to enable automatic GitHub Issue reporting):
-
-```bash
-# Install directly from Git
-uv pip install git+https://github.com/mindie-agent/diagnostics@main
-
-# Or install in editable mode from a local clone
-git clone https://github.com/mindie-agent/diagnostics.git
-cd diagnostics
-uv pip install -e .
-```
 
 ---
 

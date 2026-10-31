@@ -52,9 +52,7 @@ flowchart LR
 
 ## 快速开始
 
-### 方式一：直接把链接发给你的 Agent 自动安装/接入（推荐）
-
-复制下面这句话发给你的 Claude Code、Codex、Kimi Code 或 Cursor，让它帮你完成安装、查看状态或按需配置：
+直接复制下面这句话发给你的 Claude Code、Codex、Kimi Code 或 DeepSeek Harness（DSH），由 AI Agent 自动完成安装、查看状态或按需配置：
 
 ```text
 帮我安装并配置 https://github.com/mindie-agent/diagnostics
@@ -87,20 +85,6 @@ flowchart LR
 4. **告知用户**：向用户展示当前 `reporting status` 的结果，并说明如何随时开启/关闭自动上报或导出离线诊断包。
 
 </details>
-
-### 方式二：终端手动一行安装（适合人类开发者）
-
-需要 Python `>= 3.11`（如果要开启自动提 GitHub Issue 功能，还需要本地装好并登录 `gh` CLI）：
-
-```bash
-# 直接从 Git 安装最新版本
-uv pip install git+https://github.com/mindie-agent/diagnostics@main
-
-# 或者克隆仓库本地可编辑安装
-git clone https://github.com/mindie-agent/diagnostics.git
-cd diagnostics
-uv pip install -e .
-```
 
 ---
 

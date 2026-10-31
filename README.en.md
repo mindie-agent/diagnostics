@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/mindie-agent/mindie-agent/main/assets/brand/mindie-agent-logo.png" alt="MindIE Agent logo" width="128" height="128">
+  <img src="assets/brand/diagnostics-logo.png" alt="mindie-diagnostics logo" width="128" height="128">
 </p>
 
 <h1 align="center">MindIE Agent Diagnostics (<code>mindie-diagnostics</code>)</h1>
@@ -52,7 +52,7 @@ flowchart LR
 
 ## Quick Start
 
-Copy and paste this sentence to Claude Code, Codex, Kimi Code, or DeepSeek Harness (DSH) so your AI Agent installs `mindie-diagnostics` and inspects local diagnostic status automatically:
+Copy and paste this sentence to Claude Code, Codex, Kimi Code, DeepSeek Harness (DSH), or Google Antigravity (AGY) so your AI Agent installs `mindie-diagnostics` and inspects local diagnostic status automatically:
 
 ```text
 Please install and configure https://github.com/mindie-agent/diagnostics for me

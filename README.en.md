@@ -179,6 +179,7 @@ result = record_failure(
 | --- | --- | --- |
 | Documentation Index | [docs/README.md](./docs/README.md) | [docs/README.en.md](./docs/README.en.md) |
 | Architecture, Privacy Allowlist & Log Rotation | [docs/architecture-and-privacy.md](./docs/architecture-and-privacy.md) | [docs/architecture-and-privacy.en.md](./docs/architecture-and-privacy.en.md) |
+| Bounded Outbound Reconciliation & Prune Budget Alignment | [docs/outbound-reconciliation-followup.md](./docs/outbound-reconciliation-followup.md) | [docs/outbound-reconciliation-followup.en.md](./docs/outbound-reconciliation-followup.en.md) |
 
 ---
 

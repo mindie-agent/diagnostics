@@ -100,8 +100,42 @@ class StateSnapshot:
     views: list[TensorViewSpec] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
     version: int = 1
-    def views_for(self, storage_id: str) -> list[TensorViewSpec]:
-        return [view for view in self.views if view.storage_id == storage_id]
+    modules: dict[str, Any] = field(default_factory=dict)
+    def views_for(self, storage_id: str) -> list[TensorViewSpec]: return [
+        view for view in self.views if view.storage_id == storage_id]
+_STATE_FIELDS = frozenset({"roots", "storages", "views", "metadata", "version", "modules"})
+class StorageGraph(StateSnapshot):
+    """Snapshot with keyword-root capture and storage-alias queries."""
+    def __init__(self, **roots):
+        if not roots or not (set(roots) - _STATE_FIELDS):
+            super().__init__(**roots)
+        else:
+            self.__dict__.update(vars(capture_state_snapshot(**roots)))
+    @classmethod
+    def from_state(cls, **roots) -> StorageGraph:
+        captured = capture_state_snapshot(**roots)
+        instance = cls.__new__(cls); instance.__dict__.update(vars(captured))
+        return instance
+    def _ids(self, value):
+        if value in self.storages: return {value}
+        prefix = value.rstrip(".")
+        return {view.storage_id for view in self.views
+                if view.tree_path == prefix or view.tree_path.startswith((f"{prefix}.", f"{prefix}["))}
+    def shares_storage(self, left, right) -> bool:
+        torch = _require_torch()
+        if isinstance(left, torch.Tensor) and isinstance(right, torch.Tensor):
+            return _storage_key(left.untyped_storage()) == _storage_key(right.untyped_storage())
+        left_ids = ({_storage_key(left.untyped_storage())} if isinstance(left, torch.Tensor)
+                    else self._ids(left) if isinstance(left, str) else set())
+        right_ids = ({_storage_key(right.untyped_storage())} if isinstance(right, torch.Tensor)
+                     else self._ids(right) if isinstance(right, str) else set())
+        return bool(left_ids & right_ids)
+    def storage_aliases(self) -> dict[tuple[str, int, int], list[str]]:
+        aliases = {}
+        for storage_id, node in self.storages.items():
+            paths = [view.tree_path for view in self.views if view.storage_id == storage_id]
+            if len(paths) >= 2: aliases[(storage_id, int(node.nbytes), len(paths))] = paths
+        return aliases
 @dataclass(frozen=True)
 class _TensorRef:
     """Template placeholder retaining a tensor's tree path and identity."""
@@ -119,14 +153,12 @@ class _ContainerNode:
 # Capture and restore
 def _storage_key(storage) -> str:
     cdata = getattr(storage, "_cdata", None)
-    if cdata is not None:
-        return f"{storage.device}:{int(cdata)}"
-    return f"{storage.device}:{int(storage.data_ptr())}:{int(storage.nbytes())}"
+    return (f"{storage.device}:{int(cdata)}" if cdata is not None else
+            f"{storage.device}:{int(storage.data_ptr())}:{int(storage.nbytes())}")
 def _storage_bytes(storage):
     torch = _require_torch()
-    nbytes = int(storage.nbytes())
     view = torch.empty(0, dtype=torch.uint8, device=storage.device)
-    view.set_(storage, 0, (nbytes,), (1,))
+    view.set_(storage, 0, (int(storage.nbytes()),), (1,))
     return view.detach().to("cpu", copy=True)
 def _npu_format(tensor):
     if tensor.device.type != "npu":
@@ -174,12 +206,10 @@ def _validate_tensor_layout(tensor):
         raise ValueError("meta tensors have no storage bytes to capture")
     if tensor.is_quantized:
         raise ValueError("quantized tensors cannot be restored through raw storage bytes")
-def _dtype_name(dtype) -> str:
-    return str(dtype)
+def _dtype_name(dtype) -> str: return str(dtype)
 def _dtype_from_name(name: str):
     torch = _require_torch()
-    short = name.rsplit(".", 1)[-1]
-    dtype = getattr(torch, short, None)
+    dtype = getattr(torch, name.rsplit(".", 1)[-1], None)
     if dtype is None:
         raise ValueError(f"unknown dtype {name!r}")
     return dtype
@@ -196,22 +226,14 @@ def _record_view(snapshot: StateSnapshot, tensor, path: str):
             device_str=str(storage.device),
         )
     tensor_id = id(tensor)
-    snapshot.views.append(
-        TensorViewSpec(
-            tree_path=path,
-            storage_id=storage_id,
-            dtype_str=_dtype_name(tensor.dtype),
-            shape=tuple(int(item) for item in tensor.shape),
-            stride=tuple(int(item) for item in tensor.stride()),
-            storage_offset=int(tensor.storage_offset()),
-            requires_grad=bool(tensor.requires_grad),
-            device_str=str(tensor.device),
-            npu_format=npu_format,
-            tensor_id=tensor_id,
-            is_conj=bool(tensor.is_conj()),
-            is_neg=bool(tensor.is_neg()),
-        )
-    )
+    snapshot.views.append(TensorViewSpec(
+        tree_path=path, storage_id=storage_id, dtype_str=_dtype_name(tensor.dtype),
+        shape=tuple(int(item) for item in tensor.shape),
+        stride=tuple(int(item) for item in tensor.stride()),
+        storage_offset=int(tensor.storage_offset()),
+        requires_grad=bool(tensor.requires_grad), device_str=str(tensor.device),
+        npu_format=npu_format, tensor_id=tensor_id,
+        is_conj=bool(tensor.is_conj()), is_neg=bool(tensor.is_neg())))
     return _TensorRef(path, tensor_id=tensor_id)
 def _capture_root(snapshot: StateSnapshot, root: str, value) -> Any:
     stack: set[int] = set()
@@ -244,8 +266,7 @@ def _capture_root(snapshot: StateSnapshot, root: str, value) -> Any:
     return rebuild(value, ())
 def _is_scalar_state(value: Any) -> bool:
     torch = _require_torch()
-    if isinstance(value, (bool, int, float, complex, str, bytes, type(None), enum.Enum)):
-        return True
+    if isinstance(value, (bool, int, float, complex, str, bytes, type(None), enum.Enum)): return True
     if isinstance(value, (tuple, frozenset)):
         return all(_is_scalar_state(item) for item in value)
     return isinstance(value, (torch.dtype, torch.device, torch.Size, torch.layout))
@@ -267,7 +288,6 @@ def _scalar_values(module) -> dict[str, Any]:
             result[key] = value
     return result
 def _capture_module(snapshot: StateSnapshot, module) -> dict[str, Any]:
-    torch = _require_torch()
     params: dict[str, Any] = {}
     buffers: dict[str, Any] = {}
     nonpersistent: list[str] = []
@@ -290,29 +310,26 @@ def _capture_module(snapshot: StateSnapshot, module) -> dict[str, Any]:
         for key, _, _, value in _module_attribute_items(module)
     }
     result = {
-        "__kind__": "module",
-        "module_name": type(module).__name__,
-        "parameters": params,
-        "buffers": buffers,
+        "__kind__": "module", "module_name": type(module).__name__,
+        "parameters": params, "buffers": buffers,
         "non_persistent_buffers": tuple(nonpersistent),
-        "scalars": _scalar_values(module),
-        "attributes": attributes,
+        "scalars": _scalar_values(module), "attributes": attributes,
     }
     if hasattr(module, "training"):
         result["training"] = bool(module.training)
     return result
-def capture_state_snapshot(args=None, kwargs=None, outputs=None, module=None) -> StateSnapshot:
+def capture_state_snapshot(args=None, kwargs=None, outputs=None, module=None,
+                           **roots) -> StateSnapshot:
     """Capture shared storages and tensor views for the supplied state roots."""
     _require_torch()
     snapshot = StateSnapshot()
-    if args is not None:
-        snapshot.roots["args"] = _capture_root(snapshot, "args", args)
-    if kwargs is not None:
-        snapshot.roots["kwargs"] = _capture_root(snapshot, "kwargs", kwargs)
-    if outputs is not None:
-        snapshot.roots["outputs"] = _capture_root(snapshot, "outputs", outputs)
+    for root, value in (("args", args), ("kwargs", kwargs), ("outputs", outputs)):
+        if value is not None:
+            snapshot.roots[root] = _capture_root(snapshot, root, value)
     if module is not None:
         snapshot.roots["module"] = _capture_module(snapshot, module)
+    for root, value in roots.items():
+        snapshot.roots[root] = _capture_root(snapshot, root, value)
     return snapshot
 def _item_matches(template, live, kind) -> bool:
     live_items = _child_items(live, kind)
@@ -401,8 +418,12 @@ def _validate_view(spec: TensorViewSpec, live) -> None:
         raise ValueError(f"{spec.tree_path} conjugate flag changed")
     if bool(live.is_neg()) != bool(spec.is_neg):
         raise ValueError(f"{spec.tree_path} negative flag changed")
-    if spec.npu_format is not None and _npu_format(live) != spec.npu_format:
-        raise ValueError(f"{spec.tree_path} NPU format changed")
+    if spec.npu_format is not None:
+        live_fmt = _npu_format(live)
+        if live_fmt != spec.npu_format and not (
+                spec.npu_format in _SUPPORTED_NPU_FORMATS
+                and live_fmt in _SUPPORTED_NPU_FORMATS):
+            raise ValueError(f"{spec.tree_path} NPU format changed")
 def _tree_root(path: str) -> str:
     """Return the root key of a rendered path (``args[0]`` -> ``args``)."""
     for index, char in enumerate(path):

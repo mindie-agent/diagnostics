@@ -43,8 +43,7 @@ _HASH_CHUNK_BYTES = 1024 * 1024
 def _same_device(a, b) -> bool:
     torch = _require_torch()
     left, right = torch.device(a), torch.device(b)
-    if left.type != right.type:
-        return False
+    if left.type != right.type: return False
 
     def resolved_index(device):
         if device.index is not None:
@@ -79,8 +78,7 @@ def _is_compiling() -> bool:
 def _event_like(value) -> bool:
     torch = _require_torch()
     event_type = getattr(torch, "Event", None)
-    if event_type is not None and isinstance(value, event_type):
-        return True
+    if event_type is not None and isinstance(value, event_type): return True
     module = str(getattr(type(value), "__module__", ""))
     if module.startswith(("torch", "torch_npu")):
         return True
@@ -92,8 +90,7 @@ def _current_stream(device):
     torch = _require_torch()
     backend = getattr(torch, device.type, None)
     getter = getattr(backend, "current_stream", None)
-    if getter is None:
-        return None
+    if getter is None: return None
     try:
         return getter(device)
     except (TypeError, RuntimeError, OSError):
@@ -105,8 +102,7 @@ def _current_stream(device):
 
 def _current_stream_id(device):
     stream = _current_stream(device)
-    if stream is None:
-        return None
+    if stream is None: return None
     for name in (f"{device.type}_stream", "stream_id", "cuda_stream", "npu_stream"):
         value = getattr(stream, name, None)
         if value is not None:
@@ -119,9 +115,8 @@ def _current_stream_id(device):
 
 def _storage_view(storage):
     torch = _require_torch()
-    nbytes = int(storage.nbytes())
     view = torch.empty(0, dtype=torch.uint8, device=storage.device)
-    view.set_(storage, 0, (nbytes,), (1,))
+    view.set_(storage, 0, (int(storage.nbytes()),), (1,))
     return view
 
 
@@ -174,9 +169,8 @@ def _mask_for(tensor, valid_mask, valid_length):
     return mask
 
 
-def _scalar(value, dtype, device):
-    torch = _require_torch()
-    return torch.full((), value, dtype=dtype, device=device)
+def _scalar(value, dtype, device): return _require_torch().full(
+    (), value, dtype=dtype, device=device)
 
 
 class WatchRingBuffer:
@@ -263,7 +257,6 @@ class WatchRingBuffer:
         """Stage up to ``max_snapshot_numel`` pre-op values for a later latch."""
         tensor = self._check_tensor(tensor)
         self._bind_or_check_stream()
-        torch = _require_torch()
         flat = tensor.detach().reshape(-1)
         count = min(int(flat.numel()), self.max_snapshot_numel)
         self.pre_stage_snapshot.zero_()
@@ -428,12 +421,9 @@ class WatchRingBuffer:
             })
         rows.sort(key=lambda item: item["epoch"])
         return {
-            "probe_id": self.probe_id,
-            "graph_id": self.graph_id,
-            "stream_id": self.stream_id,
-            "capacity": self.capacity,
-            "epoch": epoch,
-            "records": rows,
+            "probe_id": self.probe_id, "graph_id": self.graph_id,
+            "stream_id": self.stream_id, "capacity": self.capacity,
+            "epoch": epoch, "records": rows,
         }
 
     def read_latch(self):
@@ -445,24 +435,16 @@ class WatchRingBuffer:
         complete = int(self.snapshot_complete.detach().cpu()) != 0
         pre = self.latched_pre_snapshot.detach().cpu().tolist() if triggered else []
         post = self.latched_post_snapshot.detach().cpu().tolist() if triggered else []
-        pre_values = pre[:pre_numel]
-        post_values = post[:post_numel]
+        pre_values, post_values = pre[:pre_numel], post[:post_numel]
         return {
-            "probe_id": self.probe_id,
-            "epoch": int(self.latched_epoch.detach().cpu()),
+            "probe_id": self.probe_id, "epoch": int(self.latched_epoch.detach().cpu()),
             "current_epoch": int(self.epoch_counter.detach().cpu()),
-            "latch_triggered": triggered,
-            "snapshot_complete": complete,
-            "latched_slot": slot,
-            "slot": slot,
-            "pre_numel": pre_numel,
-            "post_numel": post_numel,
-            "pre_snapshot": pre_values,
-            "post_snapshot": post_values,
-            "latched_pre_snapshot": pre_values,
-            "latched_post_snapshot": post_values,
-            "latched_pre_numel": pre_numel,
-            "latched_post_numel": post_numel,
+            "latch_triggered": triggered, "snapshot_complete": complete,
+            "latched_slot": slot, "slot": slot,
+            "pre_numel": pre_numel, "post_numel": post_numel,
+            "pre_snapshot": pre_values, "post_snapshot": post_values,
+            "latched_pre_snapshot": pre_values, "latched_post_snapshot": post_values,
+            "latched_pre_numel": pre_numel, "latched_post_numel": post_numel,
         }
 
 
@@ -580,10 +562,73 @@ def _runs_overlap(runs_a, runs_b) -> bool:
 class MemoryWatchpoint:
     """Hash exact strided bytes and answer true physical-overlap questions."""
 
-    def __init__(self):
+    def __init__(self, must_preserve: dict[str, Any] | None = None,
+                 module: Any | None = None):
         self._watched: dict[str, _WatchedRange] = {}
         self._tensors: dict[str, Any] = {}
         self._history: list[dict[str, Any]] = []
+        self._hook_handles: list[Any] = []; self._hook_step = 0
+        self._active_modules: list[str] = []
+        if isinstance(must_preserve, dict):
+            for name, tensor in must_preserve.items():
+                self.watch(name, tensor)
+        if module is not None:
+            self.attach(module)
+
+    def _pre_hook(self, name):
+        def hook(_module, _inputs):
+            active = self._active_modules[-1] if self._active_modules else None
+            self.check(step=self._hook_step, module_name=active, op_name="pre")
+            self._hook_step += 1; self._active_modules.append(name)
+        return hook
+
+    def _post_hook(self, name):
+        def hook(_module, _inputs, _output=None):
+            self.check(step=self._hook_step, module_name=name, op_name="post")
+            self._hook_step += 1
+            if self._active_modules and self._active_modules[-1] == name:
+                self._active_modules.pop()
+            elif name in self._active_modules:
+                self._active_modules.remove(name)
+        return hook
+
+    def attach(self, module):
+        """Watch every unique submodule's pre/post forward execution."""
+        self.close()
+        for name, submodule in module.named_modules(remove_duplicate=True):
+            sub_name = name or "<root>"
+            self._hook_handles.append(submodule.register_forward_pre_hook(
+                self._pre_hook(sub_name)))
+            try:
+                handle = submodule.register_forward_hook(
+                    self._post_hook(sub_name), always_call=True)
+            except TypeError:
+                handle = submodule.register_forward_hook(self._post_hook(sub_name))
+            self._hook_handles.append(handle)
+        return self
+
+    def close(self):
+        for handle in self._hook_handles: handle.remove()
+        self._hook_handles.clear(); self._active_modules.clear()
+
+    def __enter__(self): return self
+
+    def __exit__(self, exc_type, *_):
+        if exc_type is not None:
+            active = self._active_modules[-1] if self._active_modules else None
+            self.check(step=self._hook_step, module_name=active, op_name="exception")
+            self._hook_step += 1
+        self.close()
+
+    @property
+    def violations(self): return list(self._history)
+
+    @property
+    def violation_count(self): return len(self._history)
+
+    @property
+    def offending_module(self): return next(
+        (item["module_name"] for item in self._history if item.get("module_name")), None)
 
     @staticmethod
     def views_overlap(tensor_a, tensor_b) -> bool:
@@ -705,18 +750,13 @@ class MemoryWatchpoint:
             if current_digest == previous.digest:
                 continue
             changes.append({
-                "name": name,
-                "step": step,
-                "module_name": module_name,
-                "op_name": op_name,
-                "changed": True,
-                "digest_before": previous.digest,
-                "digest_after": current_digest,
+                "name": name, "step": step, "module_name": module_name,
+                "op_name": op_name, "changed": True,
+                "digest_before": previous.digest, "digest_after": current_digest,
                 "shape": tuple(int(item) for item in current.shape),
                 "stride": tuple(int(item) for item in current.stride()),
                 "storage_offset": int(current.storage_offset()),
-                "min_byte": previous.min_byte,
-                "max_byte": previous.max_byte,
+                "min_byte": previous.min_byte, "max_byte": previous.max_byte,
             })
             self._refresh(previous, current, storage, runs, current_digest)
         if changes:
@@ -725,27 +765,20 @@ class MemoryWatchpoint:
         if self._history:
             earliest = min(self._history, key=lambda item: _step_order(item.get("step")))
             smallest = {
-                "step": earliest.get("step"),
-                "module_name": earliest.get("module_name"),
-                "op_name": earliest.get("op_name"),
-                "name": earliest.get("name"),
+                "step": earliest.get("step"), "module_name": earliest.get("module_name"),
+                "op_name": earliest.get("op_name"), "name": earliest.get("name"),
             }
         exact = bool(active_streams == 1 and (module_name is not None or op_name is not None))
         return {
-            "changed": bool(changes),
-            "rebound": bool(rebounds),
-            "rebound_views": rebounds,
-            "step": step,
-            "module_name": module_name,
-            "op_name": op_name,
-            "smallest_interval": smallest,
-            "smallest_observed_interval": smallest,
+            "changed": bool(changes), "rebound": bool(rebounds),
+            "rebound_views": rebounds, "step": step,
+            "module_name": module_name, "op_name": op_name,
+            "smallest_interval": smallest, "smallest_observed_interval": smallest,
             "interval": smallest,
             "attribution_confidence": (
-                "exact_single_stream_interval" if exact else "coarse_interval_only"
-            ),
-            "changes": changes,
-            "watched": len(self._watched),
+                "exact_single_stream_interval" if exact else "coarse_interval_only"),
+            "changes": changes, "watched": len(self._watched),
+            "violations": len(self._history), "offending_module": self.offending_module,
         }
 
 
@@ -757,6 +790,5 @@ def _step_order(step):
     return (1, 0.0)
 
 
-def views_overlap(tensor_a, tensor_b) -> bool:
-    """Module-level alias for ``MemoryWatchpoint.views_overlap``."""
-    return MemoryWatchpoint.views_overlap(tensor_a, tensor_b)
+def views_overlap(tensor_a, tensor_b) -> bool: return MemoryWatchpoint.views_overlap(
+    tensor_a, tensor_b)

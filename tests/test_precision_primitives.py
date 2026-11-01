@@ -591,3 +591,161 @@ def test_codex_guardrail_regressions():
     )
     assert const_asym.tolist() == pytest.approx([1.0, 1.0])
 
+    # 8. Aliased BF16 reference execution + unsupported verdict + parent/exception watchpoint
+    base = torch.tensor([1.0, 2.0], dtype=torch.bfloat16)
+    alias_fn = lambda a, b: (a.add_(1.0), b.clone())[1]
+    cap_alias = capture_call(alias_fn, base[:], base[:])
+    rep_alias = replay_call(cap_alias, alias_fn, mode="reference_check")
+    assert rep_alias["verdict"] == "pass"
+    rep_unsup = replay_call(cap_alias, alias_fn, quant_bits=8)
+    assert rep_unsup["verdict"] == "unsupported"
+
+    watched = torch.zeros(2)
+
+    class _ParentWithChild(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.child = torch.nn.Identity()
+
+        def forward(self, x):
+            watched.add_(1.0)
+            return self.child(x)
+
+    parent = _ParentWithChild()
+    with MemoryWatchpoint(must_preserve={"w": watched}, module=parent) as wp:
+        parent(torch.ones(2))
+    assert wp.offending_module == "<root>"
+
+    # 9. Pre-root mutation remains unattributed; parameterized + attribute BF16 auto-ref; mixed-dtype storage
+    pre_watched = torch.zeros(2)
+    wp_pre = MemoryWatchpoint(must_preserve={"w": pre_watched}, module=torch.nn.Identity())
+    pre_watched.add_(1.0)
+    wp_pre.close()
+    outside_mod = torch.nn.Identity()
+    with MemoryWatchpoint(must_preserve={"w": pre_watched}, module=outside_mod) as wp_out:
+        pre_watched.add_(1.0)
+        outside_mod(torch.ones(2))
+    assert wp_out.violation_count == 1
+    assert wp_out.offending_module is None
+    with pytest.raises(RuntimeError, match="outside forward"):
+        with MemoryWatchpoint(must_preserve={"w": pre_watched}, module=outside_mod) as wp_exc:
+            pre_watched.add_(1.0)
+            raise RuntimeError("outside forward")
+    assert wp_exc.violation_count == 1
+    assert wp_exc.offending_module is None
+
+    class _BF16LinearWithAttr(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = torch.nn.Linear(4, 4, dtype=torch.bfloat16)
+            self.cache = {"scale": torch.ones(4, dtype=torch.bfloat16), "count": 0}
+
+        def forward(self, x):
+            self.cache["count"] += 1
+            return self.proj(x) * self.cache["scale"]
+
+    bf16_mod = torch.nn.Sequential(_BF16LinearWithAttr())
+    bf16_x = torch.ones((2, 4), dtype=torch.bfloat16)
+    cap_mod = capture_call(bf16_mod, bf16_x)
+    rep_mod = replay_call(cap_mod, bf16_mod, mode="reference_check", reference_atol=5e-2)
+    assert rep_mod["reference_check"]["status"] == "pass"
+    assert rep_mod["verdict"] == "pass"
+    assert "0.cache" not in vars(bf16_mod)
+    assert bf16_mod[0].cache["count"] == 1
+
+    class _ComplexStateMod(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("state", torch.zeros(2, dtype=torch.bfloat16))
+            base = torch.ones((2, 2), dtype=torch.bfloat16)
+            shared = {"x": torch.ones(2, dtype=torch.bfloat16)}
+            self.first = {"shared": shared}
+            self.second = {
+                "shared": shared,
+                "own": torch.ones(2, dtype=torch.float16),
+            }
+            self.cache = {
+                "stats": torch.tensor([1.001], dtype=torch.float32),
+                "bf16": base,
+                "bf16_view": base.view(-1),
+                "fp16": torch.ones(1, dtype=torch.float16),
+                "count": 0,
+            }
+            self.alias = self.cache
+
+        def forward(self, x):
+            self.state = self.state + 1
+            self.first["shared"]["x"] = self.first["shared"]["x"] + 1
+            self.second["own"] = self.second["own"] + 1
+            self.cache["count"] += 1
+            self.cache["fp16"] = self.cache["fp16"] + 1
+            self.cache["bf16"] = self.cache["bf16"].view(2, 2)
+            self.cache["bf16"][0, 0] = self.cache["bf16"][0, 0] + 1
+            self.cache["bf16_view"] = self.cache["bf16_view"].view(-1)
+            return (
+                x + self.state + self.alias["count"]
+                + self.cache["bf16_view"][0] + self.second["shared"]["x"]
+            )
+
+    complex_mod = _ComplexStateMod()
+    cap_complex = capture_call(complex_mod, torch.ones(2, dtype=torch.bfloat16))
+    rep_complex1 = replay_call(cap_complex, complex_mod, mode="reference_check")
+    rep_complex2 = replay_call(cap_complex, complex_mod, mode="reference_check")
+    assert rep_complex1["verdict"] == "pass" and rep_complex2["verdict"] == "pass"
+    assert complex_mod.cache is complex_mod.alias
+    assert complex_mod.first["shared"] is complex_mod.second["shared"]
+    assert complex_mod.first["shared"]["x"].dtype == torch.bfloat16
+    assert complex_mod.second["own"].dtype == torch.float16
+    assert complex_mod.cache["stats"].dtype == torch.float32
+    assert complex_mod.cache["fp16"].dtype == torch.float16
+
+    for arg, fn in (
+        ({"x": torch.ones(2, dtype=torch.bfloat16)}, lambda st: st["x"] + 1),
+        ([torch.ones(2, dtype=torch.bfloat16)], lambda st: st[0] + 1),
+        (
+            {
+                "left": torch.ones(2, dtype=torch.bfloat16),
+                "right": torch.ones(2, dtype=torch.float16),
+            },
+            lambda st: (
+                st.__setitem__("left", st["right"]),
+                st.__setitem__("right", torch.ones(2, dtype=torch.bfloat16)),
+                st["left"] + st["right"],
+            )[-1],
+        ),
+        (
+            {"x": torch.ones(2, dtype=torch.bfloat16)},
+            lambda st: (st.__setitem__("x", st["x"].float()), st["x"] + 1)[-1],
+        ),
+        (
+            {"old": {"x": torch.ones(2, dtype=torch.bfloat16)}},
+            lambda st: (
+                st.__setitem__("new", st.pop("old")),
+                st["new"].__setitem__("added", st["new"]["x"] + 1),
+                st["new"]["added"],
+            )[-1],
+        ),
+    ):
+        cap_in = capture_call(fn, arg)
+        assert replay_call(cap_in, fn, mode="reference_check")["verdict"] == "pass"
+
+    for dt in (torch.bfloat16, torch.float16):
+        shared_in = torch.ones(2, dtype=dt)
+        widen_state = {"x": shared_in, "saved": shared_in}
+        widen_fn = lambda st: (
+            st.__setitem__("x", st["x"].float()),
+            st["x"].add_(1),
+            st["saved"].clone(),
+        )[-1]
+        cap_widen = capture_call(widen_fn, widen_state)
+        assert replay_call(cap_widen, widen_fn, mode="reference_check")["verdict"] == "pass"
+
+    mixed_bf16 = torch.tensor([1.0, 2.0], dtype=torch.bfloat16)
+    mixed_i16 = mixed_bf16.view(torch.int16)
+    mixed_fn = lambda a, b: (a.add_(1.0), b.clone())[1]
+    cap_mixed = capture_call(mixed_fn, mixed_bf16, mixed_i16)
+    rep_mixed = replay_call(cap_mixed, mixed_fn, mode="reference_check")
+    assert rep_mixed["reference_check"]["status"] == "unsupported"
+    assert rep_mixed["reference_check"]["reason"] == "mixed_dtype_storage_alias"
+    assert rep_mixed["verdict"] == "unsupported"
+

@@ -20,6 +20,7 @@
 """
 from .storage_graph import (
     StateSnapshot,
+    StorageGraph,
     StorageNode,
     TensorViewSpec,
     _require_torch,
@@ -45,7 +46,7 @@ from .call_repro import (
 from .stimulus import build_deterministic_stimulus, slim_moe_checkpoint
 
 __all__ = [
-    "StateSnapshot", "StorageNode", "TensorViewSpec", "_require_torch",
+    "StateSnapshot", "StorageGraph", "StorageNode", "TensorViewSpec", "_require_torch",
     "capture_state_snapshot", "restore_state_snapshot", "reconstruct_from_snapshot",
     "snapshot_tensor_map", "walk_tree", "map_tree", "flatten_tree_with_paths",
     "path_to_string", "WatchRingBuffer", "MemoryWatchpoint", "views_overlap",

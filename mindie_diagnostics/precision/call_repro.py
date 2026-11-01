@@ -12,7 +12,8 @@
   * Every repeat trial re-enters from the pre-call snapshot and restores RNG
     state, so in-place input/parameter mutations never accumulate.
   * ``reference_check`` without an explicit reference function reports
-    ``unsupported``; no universal BF16/FP32 enclosure is claimed.
+    ``unsupported`` unless ``mode='reference_check'`` requests the automatic
+    FP32 enclosure (intermediate half-precision casts stay FP32).
   * ``fakequant_check`` without a contract reports ``unsupported``; original
     weight loss is reported only when original weights are explicitly supplied.
   * Det-lock is reported with a warning when a distributed backend was already
@@ -48,6 +49,12 @@ from .storage_graph import (
     snapshot_tensor_map,
 )
 from .lockstep_diff import _tensor_metrics
+from .fp32_reference import (
+    _UnsupportedAutoReferenceError,
+    _auto_fp32_reference,
+    _fakequant_verdict,
+    _replay_verdict,
+)
 _EVAL_UNSUPPORTED = "unsupported"
 @dataclass
 class FakeQuantContract:
@@ -363,6 +370,8 @@ def _reference_check(capsule, module, reference_fn, actual_post,
             reference_fn, args, kwargs, capsule.execution_state, module)
         ref_post = capture_state_snapshot(
             args=args, kwargs=kwargs, outputs=reference_output, module=module)
+    except _UnsupportedAutoReferenceError as exc:
+        return {"status": _EVAL_UNSUPPORTED, "reason": str(exc)}
     except Exception as exc:
         return {"status": "error", "reason": type(exc).__name__}
     def scalar_leaves(snapshot):
@@ -661,6 +670,7 @@ def _distributed_mismatch_result(capsule, det_report, repeat, *, expected_rank=N
                             "reason": "distributed_topology_mismatch"},
         "fakequant_check": {"status": _EVAL_UNSUPPORTED,
                             "reason": "distributed_topology_mismatch"},
+        "verdict": "error",
         "det_lock": det_report, "det_lock_warning": det_report.get("warning"),
     }
     if expected_trace is not None:
@@ -668,13 +678,22 @@ def _distributed_mismatch_result(capsule, det_report, repeat, *, expected_rank=N
         result["observed_collective_trace"] = [
             list(item) for item in (observed_trace or ())]
     return result
+
+
 def replay_call(capsule_or_path, fn_or_module=None, *, repeat=1, det_lock=False,
                 reference_fn=None, reference_atol=1e-3, reference_rtol=1e-3,
-                fakequant_contract=None, original_float_weight=None):
+                fakequant_contract=None, original_float_weight=None,
+                mode: str | None = None, quant_bits: int | None = None):
     """Replay a captured call from its pre-call storage state."""
     torch = _require_torch()
     if int(repeat) < 1:
         raise ValueError("repeat must be >= 1")
+    if quant_bits is not None and fakequant_contract is None:
+        fakequant_contract = FakeQuantContract(
+            bits=int(quant_bits), symmetric=True, scale_axis=0)
+    reference_requested = bool(reference_fn is not None or mode == "reference_check")
+    fakequant_requested = bool(fakequant_contract is not None)
+    auto_reference = (mode == "reference_check" and reference_fn is None)
     det_report = _apply_det_lock(torch, det_lock)
     capsule = _load_capsule(capsule_or_path)
     if capsule.execution_state.get("distributed_initialized"):
@@ -742,6 +761,19 @@ def replay_call(capsule_or_path, fn_or_module=None, *, repeat=1, det_lock=False,
         torch.set_grad_enabled(previous_grad)
     trials.accumulator = accumulator
     warm = timings[1:]
+    if auto_reference:
+        reference_fn = _auto_fp32_reference(
+            fn, module, actual_output, actual_post)
+    reference_result = _reference_check(
+        capsule, module, reference_fn, actual_post, reference_atol, reference_rtol)
+    fakequant_result = _fakequant_check(
+        capsule, fn, fakequant_contract, original_float_weight, actual_output)
+    if reference_result.get("status") in {"pass", "fail"}:
+        reference_result["verdict"] = (
+            "pass" if reference_result["status"] == "pass" else "real_numerical_bug")
+    if fakequant_result.get("status") == "ok":
+        fakequant_result["verdict"] = _fakequant_verdict(
+            fakequant_result, reference_atol)
     result = {
         "status": "ok",
         "repeat": int(repeat),
@@ -752,10 +784,12 @@ def replay_call(capsule_or_path, fn_or_module=None, *, repeat=1, det_lock=False,
         "det_lock": det_report,
         "det_lock_warning": det_report.get("warning"),
         "jitter_repeat": _jitter_repeat(trials),
-        "reference_check": _reference_check(
-            capsule, module, reference_fn, actual_post, reference_atol, reference_rtol),
-        "fakequant_check": _fakequant_check(
-            capsule, fn, fakequant_contract, original_float_weight, actual_output),
+        "reference_check": reference_result,
+        "fakequant_check": fakequant_result,
+        "verdict": _replay_verdict(
+            reference_result, fakequant_result, reference_atol,
+            reference_requested=reference_requested,
+            fakequant_requested=fakequant_requested),
         "outputs": actual_output,
     }
     return result

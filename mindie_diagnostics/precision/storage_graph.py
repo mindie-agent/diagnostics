@@ -151,10 +151,11 @@ class _ContainerNode:
     context: Any = None
 # ---------------------------------------------------------------------------
 # Capture and restore
+def _storage_identity(storage) -> int:
+    ptr = int(storage.data_ptr())
+    return ptr if ptr != 0 else int(getattr(storage, "_cdata", id(storage)))
 def _storage_key(storage) -> str:
-    cdata = getattr(storage, "_cdata", None)
-    return (f"{storage.device}:{int(cdata)}" if cdata is not None else
-            f"{storage.device}:{int(storage.data_ptr())}:{int(storage.nbytes())}")
+    return f"{storage.device}:{_storage_identity(storage)}:{int(storage.nbytes())}"
 def _storage_bytes(storage):
     torch = _require_torch()
     view = torch.empty(0, dtype=torch.uint8, device=storage.device)

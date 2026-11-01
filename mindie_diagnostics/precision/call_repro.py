@@ -390,9 +390,6 @@ def _reference_check(capsule, module, reference_fn, actual_post,
         path for path in actual_leaves
         if not _scalar_equal(ref_leaves[path], actual_leaves[path])
     ]
-    if scalar_mismatches:
-        return {"status": "fail", "reason": "scalar_state_mismatch",
-                "scalar_mismatch_paths": sorted(scalar_mismatches)[:16]}
     ref = snapshot_tensor_map(ref_post, device="cpu")
     act = snapshot_tensor_map(actual_post, device="cpu")
     if set(ref) != set(act):
@@ -423,15 +420,17 @@ def _reference_check(capsule, module, reference_fn, actual_post,
         max_abs = max(max_abs, float(metric.get("max_abs_err", 0.0)))
         max_rel = max(max_rel, float(metric.get("rel_l2_err", 0.0)))
         per_path.append({"tree_path": path, "mismatch_count": count, **metric})
-    return {
-        "status": "pass" if mismatches == 0 else "fail",
-        "atol": float(reference_atol),
-        "rtol": float(reference_rtol),
-        "mismatch_count": mismatches,
-        "max_abs_err": max_abs,
-        "rel_l2_err": max_rel,
-        "per_path": per_path,
+    report = {
+        "status": "pass" if (mismatches == 0 and not scalar_mismatches) else "fail",
+        "atol": float(reference_atol), "rtol": float(reference_rtol),
+        "mismatch_count": mismatches, "max_abs_err": max_abs,
+        "rel_l2_err": max_rel, "per_path": per_path,
     }
+    if scalar_mismatches:
+        if mismatches == 0:
+            report["reason"] = "scalar_state_mismatch"
+        report["scalar_mismatch_paths"] = sorted(scalar_mismatches)[:16]
+    return report
 def _round_values(values, mode):
     if mode == "nearest":
         return values.round()

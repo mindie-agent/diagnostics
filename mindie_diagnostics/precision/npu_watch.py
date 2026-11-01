@@ -35,7 +35,7 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
-from .storage_graph import _require_torch, _storage_bytes, _storage_key  # noqa: F401
+from .storage_graph import _require_torch, _storage_bytes, _storage_identity, _storage_key  # noqa: F401
 
 _HASH_CHUNK_BYTES = 1024 * 1024
 
@@ -654,7 +654,7 @@ class MemoryWatchpoint:
         record.digest = digest
         record.storage_key = _storage_key(storage)
         record.storage_ref = storage
-        record.storage_cdata = int(storage._cdata)
+        record.storage_cdata = _storage_identity(storage)
         record.data_ptr = int(storage.data_ptr())
         record.runs = tuple(runs)
         record.shape = tuple(int(item) for item in tensor.shape)
@@ -693,7 +693,7 @@ class MemoryWatchpoint:
             max_byte=max((end for _, end in runs), default=0),
             runs=tuple(runs),
             storage_ref=storage_ref,
-            storage_cdata=int(storage_ref._cdata),
+            storage_cdata=_storage_identity(storage_ref),
             data_ptr=int(storage_ref.data_ptr()),
         )
         self._watched[name] = record
@@ -717,7 +717,7 @@ class MemoryWatchpoint:
                 or int(current.storage_offset()) != previous.storage_offset
                 or str(current.dtype) != previous.dtype
                 or int(current.element_size()) != previous.itemsize)
-            rebound = int(storage._cdata) != previous.storage_cdata or layout_changed
+            rebound = _storage_identity(storage) != previous.storage_cdata or layout_changed
             if rebound:
                 try:
                     old_digest = (
@@ -735,7 +735,7 @@ class MemoryWatchpoint:
                     "stride": tuple(int(item) for item in current.stride()),
                     "storage_offset": int(current.storage_offset()),
                     "storage_cdata_before": previous.storage_cdata,
-                    "storage_cdata_after": int(storage._cdata),
+                    "storage_cdata_after": _storage_identity(storage),
                     "data_ptr_before": previous.data_ptr,
                     "data_ptr_after": int(storage.data_ptr()),
                 }

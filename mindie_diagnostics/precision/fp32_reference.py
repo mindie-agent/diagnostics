@@ -31,7 +31,7 @@ import contextlib
 import functools
 import threading
 
-from .storage_graph import _module_attribute_items, _require_torch
+from .storage_graph import _module_attribute_items, _require_torch, _storage_identity
 from .tree_utils import (
     _child_items,
     _classify,
@@ -149,7 +149,7 @@ class _FP32StorageMapper:
         if kind in {"leaf", "tensor"}:
             if isinstance(value, torch.Tensor) and value.is_floating_point():
                 if value.layout == torch.strided:
-                    self.storage_real_dtype[int(value.untyped_storage()._cdata)] = (
+                    self.storage_real_dtype[_storage_identity(value.untyped_storage())] = (
                         value.dtype
                     )
                 if value.dtype != torch.float32:
@@ -182,7 +182,7 @@ class _FP32StorageMapper:
                     storage = leaf.untyped_storage()
                     if int(storage.nbytes()) == 0:
                         continue
-                    key = (str(leaf.device), int(storage._cdata))
+                    key = (str(leaf.device), _storage_identity(storage))
                     dtypes_by_storage.setdefault(key, set()).add(leaf.dtype)
 
         visit(args)
@@ -219,7 +219,7 @@ class _FP32StorageMapper:
             self.reverse_tensor_memo[id(converted)] = tensor
             return converted
         storage = tensor.untyped_storage()
-        skey = (str(tensor.device), int(storage._cdata), tensor.dtype)
+        skey = (str(tensor.device), _storage_identity(storage), tensor.dtype)
         entry = self.storages.get(skey)
         if entry is None:
             itemsize = int(tensor.element_size())
@@ -230,7 +230,7 @@ class _FP32StorageMapper:
             fp32_initial = fp32_flat.clone()
             entry = (orig_flat, fp32_flat, fp32_initial)
             self.storages[skey] = entry
-            fp32_cdata = int(fp32_flat.untyped_storage()._cdata)
+            fp32_cdata = _storage_identity(fp32_flat.untyped_storage())
             self.fp32_cdata_to_orig[fp32_cdata] = orig_flat
             self.storage_real_dtype[fp32_cdata] = tensor.dtype
         _, fp32_flat, _ = entry
@@ -294,7 +294,7 @@ class _FP32StorageMapper:
                     casted, requires_grad=bool(tensor.requires_grad))
             return casted
         fp32_storage = tensor.untyped_storage()
-        fp32_cdata = int(fp32_storage._cdata)
+        fp32_cdata = _storage_identity(fp32_storage)
         orig_flat = self.fp32_cdata_to_orig.get(fp32_cdata)
         if orig_flat is not None and orig_flat.dtype == target_dtype:
             narrow_storage = orig_flat.untyped_storage()
@@ -406,7 +406,7 @@ def _real_dtype(tensor):
     if mapper is None or tensor.layout != mapper.torch.strided:
         return tensor.dtype
     return mapper.storage_real_dtype.get(
-        int(tensor.untyped_storage()._cdata), tensor.dtype)
+        _storage_identity(tensor.untyped_storage()), tensor.dtype)
 
 
 def _finalize_cast(tensor, out, target_dtype):
@@ -418,10 +418,10 @@ def _finalize_cast(tensor, out, target_dtype):
     if (target_dtype is not None
             and src_dtype != target_dtype
             and tensor.layout == out.layout == torch.strided
-            and int(out.untyped_storage()._cdata) == int(tensor.untyped_storage()._cdata)):
+            and _storage_identity(out.untyped_storage()) == _storage_identity(tensor.untyped_storage())):
         out = out.clone()
     if mapper is not None and target_dtype is not None and out.layout == torch.strided:
-        mapper.storage_real_dtype[int(out.untyped_storage()._cdata)] = target_dtype
+        mapper.storage_real_dtype[_storage_identity(out.untyped_storage())] = target_dtype
     return out
 
 
@@ -503,7 +503,7 @@ def _make_dtype_tracker_mode(torch, mapper):
                     if (isinstance(leaf, torch.Tensor)
                             and leaf.is_floating_point()
                             and leaf.layout == torch.strided):
-                        cdata = int(leaf.untyped_storage()._cdata)
+                        cdata = _storage_identity(leaf.untyped_storage())
                         mapper.storage_real_dtype.setdefault(cdata, inferred)
             return out
 

@@ -227,55 +227,64 @@ def test_collect_source_reads_real_distribution_tree_and_rejects_symlinks(tmp_pa
     outside = tmp_path / "outside.py"
     outside.write_text("VALUE = 99\n", encoding="utf-8")
     (pkg_dir / "helper.py").unlink()
-    (pkg_dir / "helper.py").symlink_to(outside)
+    try:
+        (pkg_dir / "helper.py").symlink_to(outside)
+    except TimeoutError:
+        raise
+    except OSError:
+        pytest.skip("symlink creation unavailable")
     with pytest.raises(RuntimeError, match="source_rejected"):
         runtime._collect_source()
 
 
-def test_real_generation_atomic_pointer_switch_and_retire_other_generations(tmp_path):
-    config = tmp_path / "diagnostics.json"
-    configure_reporting(True, config=config, repository="owner/repo", roots=[str(tmp_path / "logs")])
+def test_real_generation_atomic_pointer_switch_and_retire_other_generations():
+    import tempfile
 
-    def make_source(version, rev_char):
-        files = [
-            ("mindie_diagnostics/__init__.py", f'__version__ = "{version}"\n'.encode()),
-            (
-                f"mindie_diagnostics-{version}.dist-info/METADATA",
-                f"Metadata-Version: 2.1\nName: mindie-diagnostics\nVersion: {version}\n".encode(),
-            ),
-            (
-                f"mindie_diagnostics-{version}.dist-info/RECORD",
-                f"mindie_diagnostics/__init__.py,,\nmindie_diagnostics-{version}.dist-info/METADATA,,\n".encode(),
-            ),
-        ]
-        import hashlib
-        digest = hashlib.sha256()
-        digest.update(version.encode() + b"\0" + (rev_char * 40).encode() + b"\0")
-        digest.update(b"mindie_diagnostics/__init__.py\0" + files[0][1] + b"\0")
-        return version, rev_char * 40, files, digest.hexdigest()
+    with tempfile.TemporaryDirectory(prefix="md-rt-") as raw_tmp:
+        short_tmp = Path(raw_tmp)
+        config = short_tmp / "d.json"
+        configure_reporting(True, config=config, repository="owner/repo", roots=[str(short_tmp / "logs")])
 
-    src_v1 = make_source("0.3.0", "1")
-    src_v2 = make_source("0.4.0", "2")
+        def make_source(version, rev_char):
+            files = [
+                ("mindie_diagnostics/__init__.py", f'__version__ = "{version}"\n'.encode()),
+                (
+                    f"mindie_diagnostics-{version}.dist-info/METADATA",
+                    f"Metadata-Version: 2.1\nName: mindie-diagnostics\nVersion: {version}\n".encode(),
+                ),
+                (
+                    f"mindie_diagnostics-{version}.dist-info/RECORD",
+                    f"mindie_diagnostics/__init__.py,,\nmindie_diagnostics-{version}.dist-info/METADATA,,\n".encode(),
+                ),
+            ]
+            import hashlib
+            digest = hashlib.sha256()
+            digest.update(version.encode() + b"\0" + (rev_char * 40).encode() + b"\0")
+            digest.update(b"mindie_diagnostics/__init__.py\0" + files[0][1] + b"\0")
+            return version, rev_char * 40, files, digest.hexdigest()
 
-    with runtime.runtime_transaction(config) as root:
-        first = runtime._prepare_locked(config, publish=True, source=src_v1)
-        assert first["published"] is True and first["changed"] is True
-        current = runtime._read_current(root)
-        assert current["source_hash"] == src_v1[3] and current["version"] == "0.3.0"
-        assert (root / "generations" / src_v1[3] / "source.json").is_file()
+        src_v1 = make_source("0.3.0", "1")
+        src_v2 = make_source("0.4.0", "2")
 
-        # Prepare v2 with publish=False: v2 generation is materialized & verified,
-        # but current.json still points to v1 until explicitly published.
-        second = runtime._prepare_locked(config, publish=False, source=src_v2)
-        assert second["published"] is False and second["changed"] is True
-        assert runtime._read_current(root)["source_hash"] == src_v1[3]
-        assert (root / "generations" / src_v2[3] / "source.json").is_file()
+        with runtime.runtime_transaction(config) as root:
+            first = runtime._prepare_locked(config, publish=True, source=src_v1)
+            assert first["published"] is True and first["changed"] is True
+            current = runtime._read_current(root)
+            assert current["source_hash"] == src_v1[3] and current["version"] == "0.3.0"
+            assert (root / "generations" / src_v1[3] / "source.json").is_file()
 
-        # Atomically switch current.json pointer and retire superseded generations.
-        runtime._publish(root, {"schema": 1, "source_hash": src_v2[3], "version": src_v2[0], "revision": src_v2[1]})
-        assert runtime._read_current(root)["source_hash"] == src_v2[3]
-        retired = runtime.retire_other_generations(root, src_v2[3])
-        assert retired == [src_v1[3]]
-        assert not (root / "generations" / src_v1[3]).exists()
-        assert (root / "generations" / src_v2[3]).is_dir()
+            # Prepare v2 with publish=False: v2 generation is materialized & verified,
+            # but current.json still points to v1 until explicitly published.
+            second = runtime._prepare_locked(config, publish=False, source=src_v2)
+            assert second["published"] is False and second["changed"] is True
+            assert runtime._read_current(root)["source_hash"] == src_v1[3]
+            assert (root / "generations" / src_v2[3] / "source.json").is_file()
+
+            # Atomically switch current.json pointer and retire superseded generations.
+            runtime._publish(root, {"schema": 1, "source_hash": src_v2[3], "version": src_v2[0], "revision": src_v2[1]})
+            assert runtime._read_current(root)["source_hash"] == src_v2[3]
+            retired = runtime.retire_other_generations(root, src_v2[3])
+            assert retired == [src_v1[3]]
+            assert not (root / "generations" / src_v1[3]).exists()
+            assert (root / "generations" / src_v2[3]).is_dir()
 

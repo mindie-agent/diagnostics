@@ -16,7 +16,7 @@
       ]
     },
     {
-      "id": "npu-fault-triage",
+      "id": "public-event-projection",
       "kind": "microbenchmark",
       "required": true,
       "repetitions": 5,
@@ -24,7 +24,7 @@
       "command": [
         "{python}",
         "benchmarks/release.py",
-        "npu-fault-triage"
+        "public-event-projection"
       ]
     }
   ]

@@ -121,10 +121,13 @@ def recent_failures(roots, *, config=None):
                         item['timestamp'] = stamp
                     attrs = row.get('attributes')
                     if isinstance(attrs, dict):
-                        for key in ('stage', 'category', 'error_type', 'error_code'):
+                        for key in ('stage', 'category', 'error_type', 'error_code', 'path'):
                             value = attrs.get(key)
                             if isinstance(value, str) and _LABEL.fullmatch(value):
                                 item[key] = value
+                        errno_value = attrs.get('errno')
+                        if type(errno_value) is int and -2147483648 <= errno_value <= 2147483647:
+                            item['errno'] = errno_value
                     records.append(item)
                 except (ValueError, TypeError):
                     continue

@@ -50,10 +50,10 @@ _LABEL = re.compile(r"[A-Za-z][A-Za-z0-9_.:-]{0,119}\Z")
 _LOG = re.compile(r"[0-9]+-[0-9a-f]{32}\.jsonl(?:\.[1-3])?\Z")
 _COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}\Z")
 _NUMERIC = frozenset({"duration_ms", "elapsed_ms", "input_bytes", "output_bytes", "bytes", "count",
-                      "attempt", "exit_code", "file_count", "dropped_count", "timeout_seconds", "omitted_bytes"})
+                      "attempt", "exit_code", "errno", "file_count", "dropped_count", "timeout_seconds", "omitted_bytes"})
 _BOOLEAN = frozenset({"retryable", "quiet", "resources_released", "cache_hit", "ready", "timed_out",
                       "attributes_omitted"})
-_LABELS = frozenset({"category", "submission_state", "error_type", "error_code", "tool", "stage", "status", "reason"})
+_LABELS = frozenset({"category", "submission_state", "error_type", "error_code", "tool", "stage", "status", "reason", "path"})
 _HASHES = frozenset({"source_sha256", "content_sha256"})
 _TOP = frozenset({"schema", "timestamp", "monotonic_ns", "pid", "component", "severity", "event",
                   "operation_id", "trace_id", "parent_operation_id", "operation", "status",

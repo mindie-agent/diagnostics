@@ -408,6 +408,18 @@ def update_failure_policy(exception):
     return "internal", True, "update_internal_failure"
 
 
+def _public_os_attributes(exception, attributes):
+    """Copy errno and an explicit safe path label. Never copy an absolute filename."""
+    if not isinstance(exception, OSError) or isinstance(exception, TimeoutError):
+        return
+    number = _int32(getattr(exception, "errno", None))
+    if number is not None:
+        attributes["errno"] = number
+    label = getattr(exception, "diagnostic_path", None)
+    if _label(label, 120) and "/" not in label and "\\" not in label:
+        attributes["path"] = label
+
+
 def _build_event(
     incident,
     component,
@@ -441,6 +453,7 @@ def _build_event(
         if not isinstance(error_type, str) or _ERROR_TYPE_RE.fullmatch(error_type) is None:
             error_type = "Exception"
         attributes["error_type"] = error_type
+        _public_os_attributes(exception, attributes)
     if host is not None:
         if not _label(host, 120):
             return None

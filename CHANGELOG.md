@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.7 (2026-11-04)
+
+- Publish `errno` and a safe path label (`mcp-binds.sqlite3`) for OSError events (`#35`).
+
 ## 0.5.6 (2026-11-04)
 
 - Enforce `subprocess.CREATE_NO_WINDOW` across all Windows background reporting, Task Scheduler (`schtasks`), and `gh` CLI subprocess calls (`reporter.py`, `platform_service.py`, `reporting_commands.py`, `reporting_runtime.py`) to eliminate console window popups.

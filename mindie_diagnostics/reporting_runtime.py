@@ -310,6 +310,7 @@ def _verify(py, version, site, work, deadline=None):
                 timeout=10 if remaining is None else min(10, remaining),
                 env=env,
                 cwd=str(work),
+                **({"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if os.name == "nt" else {}),
             )
         if proc.returncode != 0 or out.stat().st_size > _OUT_CAP or err.stat().st_size > _OUT_CAP:
             _fail("verify_failed")
@@ -532,6 +533,7 @@ def _create_venv(target, deadline=None):
             timeout=30 if remaining is None else min(30, remaining),
             env=env,
             check=False,
+            **({"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if os.name == "nt" else {}),
         )
     except subprocess.TimeoutExpired:
         _fail("runtime_deadline_exceeded")

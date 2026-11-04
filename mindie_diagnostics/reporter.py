@@ -127,7 +127,10 @@ def _run_gh(command, data, *, deadline, max_bytes, cancel=None):
                 stdin_fp.seek(0)
             popen_kwargs = {"stdin": stdin_fp, "stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "bufsize": 0}
             if os.name == "nt":
-                popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+                popen_kwargs["creationflags"] = (
+                    subprocess.CREATE_NEW_PROCESS_GROUP
+                    | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                )
             else:
                 popen_kwargs["start_new_session"] = True
             try:
@@ -197,6 +200,7 @@ def _run_gh(command, data, *, deadline, max_bytes, cancel=None):
                 subprocess.run(
                     ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
                     timeout=1, capture_output=True, check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
             else:
                 try:

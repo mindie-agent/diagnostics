@@ -143,7 +143,9 @@ def _write(path, data):
 def _run(runner, argv, *, action, check=True):
     if os.name == "nt":
         underlying = runner
-        runner = lambda command, **kwargs: underlying(command, **kwargs, creationflags=subprocess.CREATE_NO_WINDOW)
+        runner = lambda command, **kwargs: underlying(
+            command, **{**kwargs, "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+        )
     return common._run(runner, argv, action=action, check=check)
 
 
@@ -321,7 +323,12 @@ def install_service(roots, state, repository, *, python=None, gh=None, interval=
             if environment_file is None:
                 environment_file = existing["environment_file"]
         fixed_since = existing["since"] if existing else common._since(since)
-        interpreter, version = common._interpreter(runner, python)
+        interpreter, version = common._interpreter(
+            (lambda command, **kwargs: runner(
+                command, **{**kwargs, "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+            )) if os.name == "nt" else runner,
+            python,
+        )
         launcher = _physical(interpreter)
         if sys.platform == "win32":
             launcher = launcher.with_name("pythonw.exe")

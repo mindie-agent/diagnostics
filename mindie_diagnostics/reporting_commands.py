@@ -264,6 +264,8 @@ def _bounded_runner(deadline):
             raise subprocess.TimeoutExpired(command, 0)
         timeout = kwargs.pop('timeout', None)
         bounded_timeout = remaining if timeout is None else min(timeout, remaining)
+        if os.name == 'nt':
+            kwargs.setdefault('creationflags', getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         return subprocess.run(command, timeout=bounded_timeout, **kwargs)
 
     run.deadline = deadline

@@ -13,6 +13,7 @@ from unittest import mock
 import pytest
 
 from mindie_diagnostics import platform_service as native, service
+from windows_launcher_fixture import write_launcher
 
 
 class Runner:
@@ -79,6 +80,7 @@ def installation(request, tmp_path, monkeypatch):
     for path in (python, prefix / "pythonw.exe", prefix / "gh.exe"):
         path.write_bytes(b"fixture executable")
         path.chmod(0o700)
+    write_launcher(prefix / "pythonw.exe")
     runner = Runner(prefix)
     values = {"roots": [tmp_path / "logs $fixture"], "state": tmp_path / "state with spaces",
               "repository": "owner/project", "python": python, "gh": prefix / "gh.exe",
@@ -89,6 +91,28 @@ def installation(request, tmp_path, monkeypatch):
 
 def scripts(runner):
     return [base64.b64decode(argv[-1]).decode("utf-16-le") for argv, _ in runner.calls if argv[0] == "powershell.exe"]
+
+
+def test_console_pythonw_never_registers_or_restarts_a_worker(installation):
+    values, runner = installation
+    if sys.platform != "win32":
+        pytest.skip("Windows scheduled worker entry")
+    launcher = values["python"].with_name("pythonw.exe")
+    write_launcher(launcher, subsystem=3)
+    with pytest.raises(service.ServiceError, match="windowless_python_required"):
+        service.install_service(**values)
+    assert not scripts(runner)
+    write_launcher(launcher)
+    installed = service.install_service(**values)
+    before = Path(installed["manifest"]).read_bytes()
+    runner.calls.clear()
+    write_launcher(launcher, subsystem=3)
+    with pytest.raises(service.ServiceError, match="windowless_python_required"):
+        service.start_service(unit_dir=values["unit_dir"], runner=runner)
+    assert not any("Start-ScheduledTask" in script for script in scripts(runner))
+    assert Path(installed["manifest"]).read_bytes() == before
+    write_launcher(launcher)
+    assert service.start_service(unit_dir=values["unit_dir"], runner=runner)["status"] == "start_requested"
 
 
 def test_install_reuse_status_start_and_remove_preserve_data(installation):

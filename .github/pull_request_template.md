@@ -16,6 +16,8 @@
   - **显存（HBM/VRAM）安全**：控制与元数据路径保持“零权重、零设备上下文”；上卡操作启动前完成静态显存预算核验（`vram_free_mb >= Expected VRAM`）。
   - **跨平台规格分流（Windows / macOS / Linux）**：无 `sys.platform == "darwin"` 等操作系统硬编码特判；重计算/重内存/需显存任务声明 `WorkloadExpectation`，按本机与远端（`fleet_probe.py`）的真实可用硬件规格自动分流（本机规格充裕则本地跑，不足则分流远端）。
 - [ ] **15. 自动更新、Windows 零弹窗与文件格式规范（Auto-Update, Zero Console Popup & PR Format Hygiene）**：涉及子进程调用、自动更新器、Hook、MCP 服务或后台任务时，已核验 Windows 下所有 Node.js `spawn`/`exec`/`execFile` 均显式设置 `windowsHide: true` 且 Python `subprocess.Popen`/`subprocess.run` 均包含 `CREATE_NO_WINDOW`（杜绝后台定时或工具调用闪现黑框弹窗）；全仓文本文件严格使用 Unix `LF`（`\n`）换行格式（严禁 Windows `CRLF` `\r\n` 或混合换行，Python 跨平台写文本/脚本显式指定 `newline="\n"`），并通过 `python3 .github/scripts/check_lf_eol.py` 校验。
+> 计划任务等直接执行入口还须验证 `pythonw.exe` 的真实 PE GUI 子系统（`Subsystem == 2`），覆盖新注册与旧注册恢复；文件名、文件存在和任务 `Hidden` 不能代替此检查。
+
 - **自查结论与证据**：
 
 ## 验证结果 (Verification)

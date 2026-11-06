@@ -43,6 +43,7 @@ from xml.etree import ElementTree as ET
 from . import service as common
 from .fallback import _private_mkdir
 from . import service_environment
+from .windows_interpreter import require_windowless
 
 MARKER = "mindie-diagnostics.native-service.v1"
 MANIFEST = "mindie-diagnostics-service.json"
@@ -332,8 +333,7 @@ def install_service(roots, state, repository, *, python=None, gh=None, interval=
         launcher = _physical(interpreter)
         if sys.platform == "win32":
             launcher = launcher.with_name("pythonw.exe")
-            if not launcher.is_file():
-                raise common.ServiceError("windowless_python_required")
+            require_windowless(launcher)
             loaded = _task(runner, label)
             _verify_task(loaded, manifest, existing)
         else:
@@ -473,6 +473,7 @@ def start_service(*, unit_dir=None, runner=None):
             _verify_task(loaded, manifest, config)
             if loaded is None:
                 raise common.ServiceError("service_not_installed")
+            require_windowless(config["launcher"])
             _ps(runner, "Start-ScheduledTask -TaskName " + _ps_quote(label), action="task.start")
         else:
             loaded = _launchd_status(runner, label, manifest, config)

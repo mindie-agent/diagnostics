@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.8 (2026-11-06)
+
+- Validate the actual PE GUI subsystem before installing or starting a Windows scheduled worker; reject console executables named `pythonw.exe` and allow a normal retry after environment repair.
+
 ## 0.5.7 (2026-11-04)
 
 - Publish `errno` and a safe path label (`mcp-binds.sqlite3`) for OSError events (`#35`).

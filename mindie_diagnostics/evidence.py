@@ -1,4 +1,21 @@
-"""Pure, bounded exception evidence; never serialize messages or source paths."""
+"""Pure, bounded exception evidence for child-process JSON transport.
+
+[Role]
+Capture owned exception frames and validate evidence received by record_failure.
+
+[Invariants]
+Only canonical component frames, exception class identifiers, and integer errno
+are retained. Never serialize messages, source paths, source text, or locals.
+Transport is untrusted: unknown fields are dropped and fingerprints recomputed.
+
+[Timeouts & Locks]
+No locks; walks stop after eight exceptions and 128 traceback links per exception.
+Output is bounded to 24 frames and eight exception class names.
+
+[Side-Effect Policy]
+No file or network I/O, writes, reporting, or consent changes. source_root is a
+caller-declared trusted absolute source directory used only for lexical mapping.
+"""
 import hashlib
 import json
 import os
@@ -76,7 +93,12 @@ def exception_evidence(component, exception, *, source_root=None):
                 filename = frame.f_code.co_filename
                 if root and os.path.isabs(filename):
                     path = os.path.normpath(filename)
-                    if os.path.commonpath((root, path)) == root:
+                    try:
+                        owned = os.path.commonpath((root, path)) == root
+                    except ValueError:
+                        # Windows paths on different drives have no common root.
+                        owned = False
+                    if owned:
                         relative = os.path.relpath(path, root)
                         if relative.endswith('.py'):
                             parts = relative[:-3].split(os.sep)

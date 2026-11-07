@@ -60,3 +60,24 @@ def test_source_mapping_is_lexically_confined(tmp_path):
     except ValueError as exc:
         assert 'stack_frames' not in exception_evidence('mindie-agent-codex', exc, source_root=root)
         assert 'stack_frames' not in exception_evidence('mindie-agent-codex', exc, source_root='relative')
+
+
+def test_different_drive_frame_does_not_discard_owned_evidence(tmp_path, monkeypatch):
+    import mindie_diagnostics.evidence as evidence_module
+    original = evidence_module.os.path.commonpath
+    root = str(tmp_path)
+
+    def commonpath(paths):
+        if paths[1] != str(tmp_path / 'release_activation.py'):
+            raise ValueError('Paths are on different drives')
+        return original(paths)
+
+    monkeypatch.setattr(evidence_module.os.path, 'commonpath', commonpath)
+    source = compile('raise ValueError("private")', str(tmp_path / 'release_activation.py'), 'exec')
+    try:
+        exec(source, {'__name__': '__main__'})
+    except ValueError as exc:
+        result = exception_evidence('mindie-agent-codex', exc, source_root=root)
+    assert result['exception_chain'] == ['ValueError']
+    assert result['stack_frames'] == [dict(module='mindie_agent_codex.release_activation',
+                                          function='<module>', line=1)]

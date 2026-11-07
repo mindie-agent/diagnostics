@@ -81,3 +81,31 @@ def test_different_drive_frame_does_not_discard_owned_evidence(tmp_path, monkeyp
     assert result['exception_chain'] == ['ValueError']
     assert result['stack_frames'] == [dict(module='mindie_agent_codex.release_activation',
                                           function='<module>', line=1)]
+
+
+def test_child_evidence_takes_precedence_over_caught_wrapper(tmp_path, monkeypatch):
+    monkeypatch.setenv('MINDIE_DIAGNOSTICS_CONFIG', str(tmp_path / 'policy'))
+    child_code = compile('def prepare():\n raise KeyError("private child")\nprepare()\n',
+                         str(tmp_path / 'release_activation.py'), 'exec')
+    try:
+        exec(child_code, {'__name__': '__main__'})
+    except KeyError as child:
+        transported = json.loads(json.dumps(exception_evidence(
+            'mindie-agent-codex', child, source_root=tmp_path)))
+    wrapper_code = compile('def activate():\n raise RuntimeError("private wrapper")\nactivate()\n',
+                           str(tmp_path / 'wrapper.py'), 'exec')
+    root = tmp_path / 'logs'
+    try:
+        exec(wrapper_code, {'__name__': 'mindie_agent_codex.wrapper'})
+    except RuntimeError as wrapper:
+        assert record_failure('mindie-agent-codex', 'activate', stage='end', category='internal',
+                              exception=wrapper, evidence=transported, root=root)['recorded']
+    event = json.loads(next(root.glob('events/*/*.jsonl')).read_text().splitlines()[-1])
+    projected = export_issue_event(event)
+    attrs = projected['attributes']
+    assert attrs['exception_chain'] == ['KeyError']
+    assert attrs['stack_frames'][-1]['module'] == 'mindie_agent_codex.release_activation'
+    assert attrs['stack_frames'][-1]['function'] == 'prepare'
+    assert attrs['stack_fingerprint'] == transported['stack_fingerprint']
+    assert 'private child' not in json.dumps(projected)
+    assert 'private wrapper' not in json.dumps(projected)

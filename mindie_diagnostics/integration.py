@@ -248,9 +248,9 @@ def record_failure(
                 "error": "invalid_arguments",
             }
         _attach_frames(event, component, exception)
-        event["attributes"].update(validate_evidence(component, evidence))
         if isinstance(exception, BaseException):
             event["attributes"].update(exception_evidence(component, exception, source_root=source_root))
+        event["attributes"].update(validate_evidence(component, evidence))
         from .logging import append_failure_event
         selected_root = f._as_local_absolute(f.default_root() if root is None else root)
         if selected_root is not None and append_failure_event(component, selected_root, event):

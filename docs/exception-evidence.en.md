@@ -30,5 +30,5 @@ use the capture API. Validation permits only component frames, not arbitrary
 user-code namespaces.
 
 Recording remains best-effort and preserves existing consent and incident-ID
-deduplication behavior. Evidence does not grant reporting consent. Directly
-captured exception fields take precedence over matching transported fields.
+deduplication behavior. Evidence does not grant reporting consent. Validated
+transported fields take precedence over matching locally captured wrapper fields.

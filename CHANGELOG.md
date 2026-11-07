@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.9 (2026-11-07)
+
+- Preserve bounded, privacy-safe exception evidence across standalone child-process activation failures, including owned code frames, exception class chains, stack fingerprints and typed errno.
+- Prefer original child evidence over wrapper exception fields without changing reporting consent, incident deduplication or failure outcomes.
+
 ## 0.5.8 (2026-11-06)
 
 - Validate the actual PE GUI subsystem before installing or starting a Windows scheduled worker; reject console executables named `pythonw.exe` and allow a normal retry after environment repair.

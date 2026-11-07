@@ -36,6 +36,7 @@ import uuid
 from pathlib import Path
 
 from . import fallback as f
+from .evidence import exception_evidence, validate_evidence
 
 _MAX_FRAMES = 24
 _META_CACHE_MAX = 32
@@ -197,6 +198,8 @@ def record_failure(
     reportable=True,
     root=None,
     incident_id=None,
+    source_root=None,
+    evidence=None,
 ) -> dict:
     """Record one failure. Existing incident ids are not written again."""
     try:
@@ -245,6 +248,9 @@ def record_failure(
                 "error": "invalid_arguments",
             }
         _attach_frames(event, component, exception)
+        event["attributes"].update(validate_evidence(component, evidence))
+        if isinstance(exception, BaseException):
+            event["attributes"].update(exception_evidence(component, exception, source_root=source_root))
         from .logging import append_failure_event
         selected_root = f._as_local_absolute(f.default_root() if root is None else root)
         if selected_root is not None and append_failure_event(component, selected_root, event):

@@ -1,4 +1,6 @@
 """Fault-boundary regressions; native launchd acceptance is recorded separately."""
+from contextlib import contextmanager
+import errno
 import json
 import subprocess
 import sys
@@ -27,6 +29,47 @@ def prepared(tmp_path, monkeypatch):
     native_calls = []
     monkeypatch.setattr(service, 'ensure_reporter_service', lambda *args, **kwargs: native_calls.append(kwargs))
     return config, root, state, native_calls
+
+
+def test_prepare_runtime_preserves_root_cause_instead_of_erasing_it(tmp_path, monkeypatch):
+    @contextmanager
+    def unlocked(config=None, **kwargs):
+        yield tmp_path
+
+    private = '/Users/private/state/venv'
+    def boom(*args, **kwargs):
+        raise OSError(errno.ENOSPC, 'No space left on device', private)
+
+    monkeypatch.setattr(runtime, 'runtime_transaction', unlocked)
+    monkeypatch.setattr(runtime, '_prepare_locked', boom)
+    with pytest.raises(RuntimeError, match=r'^runtime_unavailable: OSError:' + str(errno.ENOSPC) + r'$') as caught:
+        runtime.prepare_runtime(tmp_path / 'diagnostics.json')
+    text = str(caught.value)
+    assert private not in text
+    assert 'No space left on device' not in text
+    cause = caught.value.__cause__
+    assert isinstance(cause, OSError) and cause.errno == errno.ENOSPC
+    assert cause.__traceback__ is not None
+    assert cause.filename == private
+
+
+@pytest.mark.parametrize('error', [
+    RuntimeError('source_rejected'),
+    TimeoutError('runtime lock'),
+])
+def test_prepare_runtime_does_not_wrap_runtime_or_timeout_errors(tmp_path, monkeypatch, error):
+    @contextmanager
+    def unlocked(config=None, **kwargs):
+        yield tmp_path
+
+    def boom(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(runtime, 'runtime_transaction', unlocked)
+    monkeypatch.setattr(runtime, '_prepare_locked', boom)
+    with pytest.raises(type(error), match=str(error)) as caught:
+        runtime.prepare_runtime(tmp_path / 'diagnostics.json')
+    assert caught.value is error
 
 
 def test_timed_out_preparation_is_visible_and_allows_idempotent_retry(prepared, monkeypatch):

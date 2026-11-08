@@ -215,29 +215,42 @@ def test_nonregular_reader_stays_registered_but_is_not_live(tmp_path):
         assert state == {'status': 'ok', 'readers': []}
 
 
+def _profile_queue(tmp_path, *, policy_text=None):
+    (tmp_path / 'profile.state').mkdir()
+    path = queue(tmp_path / 'profile.state' / 'reporter.sqlite3')
+    if policy_text is not None:
+        policy = tmp_path / 'profile.json'
+        policy.write_text(policy_text)
+        policy.chmod(0o600)
+    register_reader(tmp_path, path)
+    return path
+
+
+def _unread_log(tmp_path, reader, text='unread-evidence'):
+    folder = tmp_path / 'events' / 'test'
+    folder.mkdir(parents=True)
+    old = folder / ('1-' + 'b' * 32 + '.jsonl')
+    old.write_text(text)
+    os.utime(old, (1, 1))
+    inode = str(old.stat().st_ino)
+    with closing(sqlite3.connect(reader)) as db, db:
+        db.execute('INSERT INTO cursors VALUES (?,?,?)', (str(old), inode, 0))
+    return old, inode
+
+
 def test_policy_unavailable_reader_is_retained_not_disabled_or_live(tmp_path, monkeypatch):
     from mindie_diagnostics.maintenance import prune
 
     monkeypatch.setattr('mindie_diagnostics.maintenance._writer_exited', lambda pid: True)
-    (tmp_path / 'profile.state').mkdir()
-    path = queue(tmp_path / 'profile.state' / 'reporter.sqlite3')
-    (tmp_path / 'profile.json').write_text('{')
-    (tmp_path / 'profile.json').chmod(0o600)
-    register_reader(tmp_path, path)
+    path = _profile_queue(tmp_path, policy_text='{')
     kind, detail = _reader_presence(str(path))
     assert kind == 'retain' and detail == {'error_type': 'PolicyUnavailable'}
-    folder = tmp_path / 'events' / 'test'
-    folder.mkdir(parents=True)
-    old = folder / ('1-' + 'b' * 32 + '.jsonl')
-    old.write_text('unread-evidence')
-    os.utime(old, (1, 1))
-    inode = str(old.stat().st_ino)
-    with closing(sqlite3.connect(path)) as db, db:
-        db.execute('INSERT INTO cursors VALUES (?,?,?)', (str(old), inode, 0))
+    old, inode = _unread_log(tmp_path, path)
     with reader_guard(tmp_path) as state:
         assert state['status'] == 'ok'
         assert state['readers'] == [str(path)]
         assert state['policy_unavailable'] is True
+        assert state['reader_error'] == 'PolicyUnavailable'
         assert 'unreadable_readers' not in state
         snapshot = cursor_snapshot(state['readers'])
         assert snapshot == [{str(old): {'inode': inode, 'offset': 0}}]
@@ -245,8 +258,50 @@ def test_policy_unavailable_reader_is_retained_not_disabled_or_live(tmp_path, mo
     result = prune(tmp_path, max_bytes=1, timeout=4)
     assert old.exists() and result['removed_files'] == 0
     assert result['policy_unavailable'] is True
+    assert result['reader_error'] == 'PolicyUnavailable'
     assert result['unread_files'] == 1
     assert result['reader_unknown'] is False
+
+
+def test_missing_policy_does_not_drop_unread_reader(tmp_path, monkeypatch):
+    from mindie_diagnostics.maintenance import prune
+
+    monkeypatch.setattr('mindie_diagnostics.maintenance._writer_exited', lambda pid: True)
+    path = _profile_queue(tmp_path)
+    kind, detail = _reader_presence(str(path))
+    assert kind == 'retain' and detail == {'error_type': 'policy_missing'}
+    old, _inode = _unread_log(tmp_path, path)
+    with reader_guard(tmp_path, queue_path=path) as state:
+        assert str(path) in state['readers']
+        assert state['policy_unavailable'] is True
+        assert state['reader_error'] == 'policy_missing'
+        snapshot = cursor_snapshot(state['readers'])
+        assert not fully_consumed(snapshot, old, old.stat().st_ino, old.stat().st_size)
+    result = prune(tmp_path, max_bytes=1, queue=SimpleNamespace(path=path), timeout=4)
+    assert old.exists() and result['removed_files'] == 0
+    assert result['policy_unavailable'] is True
+    assert result['reader_error'] == 'policy_missing'
+    saved = json.loads((tmp_path / '.readers' / 'registry.json').read_text())
+    assert str(path) in saved['readers']
+
+
+def test_queue_argument_does_not_hide_policy_unavailable(tmp_path, monkeypatch):
+    from mindie_diagnostics.maintenance import prune
+
+    monkeypatch.setattr('mindie_diagnostics.maintenance._writer_exited', lambda pid: True)
+    path = _profile_queue(tmp_path, policy_text='{')
+    old, _inode = _unread_log(tmp_path, path)
+    with reader_guard(tmp_path, queue_path=path) as state:
+        assert state['policy_unavailable'] is True
+        assert state['reader_error'] == 'PolicyUnavailable'
+        assert str(path) in state['readers']
+        snapshot = cursor_snapshot(state['readers'])
+        assert not fully_consumed(snapshot, old, old.stat().st_ino, old.stat().st_size)
+    result = prune(tmp_path, max_bytes=1, queue=SimpleNamespace(path=path), timeout=4)
+    assert old.exists() and result['removed_files'] == 0
+    assert result['policy_unavailable'] is True
+    assert result['reader_error'] == 'PolicyUnavailable'
+    assert result['unread_files'] == 1
 
 
 def test_reader_lstat_timeout_is_not_classified_live(tmp_path, monkeypatch):

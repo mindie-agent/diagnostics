@@ -133,6 +133,8 @@ def prune(root: str | Path, *, max_bytes: int = 128 * 1024 * 1024,
                     result['reader_errno'] = state['errno']
             if state.get('policy_unavailable'):
                 result['policy_unavailable'] = True
+                if state.get('reader_error') and 'reader_error' not in result:
+                    result['reader_error'] = state['reader_error']
             if cursors is None:
                 result['unread_files'] = len(files)
             exited = {}

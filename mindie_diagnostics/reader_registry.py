@@ -10,8 +10,8 @@ and read-only SQLite cursor snapshots.
   age or directory scanning.
 - Lock acquisition failure or timeout yields `status="unknown"`, never an empty
   reader list, so log segments are never prematurely recycled or deleted.
-- Unreadable or non-regular bindings are not classified live; PolicyUnavailable
-  retains the consumer and is not treated as disabled or as confirmed-enabled.
+- Unreadable or non-regular bindings are not classified live; a missing or
+  PolicyUnavailable sibling policy retains the consumer, never as disabled.
 
 [Timeouts & Locks]
 - `reader_guard` acquires `flock`/`msvcrt` on `.readers/registry.lock` with a
@@ -151,9 +151,9 @@ def _reader_presence(binding: str) -> tuple[str, dict]:
     """Classify a registry binding without pretending inspection failure is live.
 
     `gone` is safe to prune (deleted DB or disabled profile). `live` is a
-    confirmed consumer. `retain` keeps a PolicyUnavailable profile queue so
-    unread evidence is not discarded. `unreadable` stays registered but is
-    never treated as live; callers must fail closed instead of recycling.
+    confirmed consumer. `retain` keeps a queue whose sibling policy is missing
+    or PolicyUnavailable so unread evidence is not discarded. `unreadable`
+    stays registered but is never treated as live; callers fail closed.
     """
     path = _real_path(binding)
     try:
@@ -175,7 +175,9 @@ def _reader_presence(binding: str) -> tuple[str, dict]:
             policy = read_policy(path.parent.with_suffix(".json"))
         except PolicyUnavailable:
             return "retain", {"error_type": "PolicyUnavailable"}
-        if policy is None or policy.get("decision") != "enabled":
+        if policy is None:
+            return "retain", {"error_type": "policy_missing"}
+        if policy.get("decision") != "enabled":
             return "gone", {}
     return "live", {}
 
@@ -204,19 +206,15 @@ def reader_guard(root, timeout: float = 2.0, queue_path=None):
         binding = _queue_path(queue_path) if queue_path is not None else None
         readers = []
         unreadable = None
-        retained = False
+        retained = None
         for item in existing:
-            if item == binding:
-                readers.append(item)
-                continue
             kind, detail = _reader_presence(item)
-            if kind == "gone":
-                continue
-            readers.append(item)
             if kind == "unreadable" and unreadable is None:
                 unreadable = detail
-            elif kind == "retain":
-                retained = True
+            elif kind == "retain" and retained is None:
+                retained = detail
+            if item == binding or kind != "gone":
+                readers.append(item)
         if binding is not None and binding not in readers:
             readers.append(binding)
         if readers != existing:
@@ -227,8 +225,9 @@ def reader_guard(root, timeout: float = 2.0, queue_path=None):
             state["reader_error"] = unreadable["error_type"]
             if "errno" in unreadable:
                 state["errno"] = unreadable["errno"]
-        if retained:
+        if retained is not None:
             state["policy_unavailable"] = True
+            state.setdefault("reader_error", retained["error_type"])
     except TimeoutError:
         state = {"status": "unknown", "reason": "timeout", "readers": []}
     except (OSError, ValueError, TypeError, UnicodeError):

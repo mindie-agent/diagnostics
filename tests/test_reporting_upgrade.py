@@ -36,17 +36,21 @@ def test_prepare_runtime_preserves_root_cause_instead_of_erasing_it(tmp_path, mo
     def unlocked(config=None, **kwargs):
         yield tmp_path
 
+    private = '/Users/private/state/venv'
     def boom(*args, **kwargs):
-        raise OSError(errno.ENOSPC, 'No space left on device')
+        raise OSError(errno.ENOSPC, 'No space left on device', private)
 
     monkeypatch.setattr(runtime, 'runtime_transaction', unlocked)
     monkeypatch.setattr(runtime, '_prepare_locked', boom)
-    with pytest.raises(RuntimeError, match=r'^runtime_unavailable: OSError:') as caught:
+    with pytest.raises(RuntimeError, match=r'^runtime_unavailable: OSError:' + str(errno.ENOSPC) + r'$') as caught:
         runtime.prepare_runtime(tmp_path / 'diagnostics.json')
+    text = str(caught.value)
+    assert private not in text
+    assert 'No space left on device' not in text
     cause = caught.value.__cause__
     assert isinstance(cause, OSError) and cause.errno == errno.ENOSPC
     assert cause.__traceback__ is not None
-    assert 'No space left on device' in str(caught.value)
+    assert cause.filename == private
 
 
 @pytest.mark.parametrize('error', [

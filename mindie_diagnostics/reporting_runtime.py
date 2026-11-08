@@ -626,6 +626,7 @@ def prepare_runtime(config=None):
     except TimeoutError:
         raise
     except Exception as exc:
-        raise RuntimeError(
-            f"runtime_unavailable: {type(exc).__name__}: {exc}"
-        ) from exc
+        label = type(exc).__name__
+        if isinstance(exc, OSError) and exc.errno is not None:
+            label = f"{label}:{int(exc.errno)}"
+        raise RuntimeError(f"runtime_unavailable: {label}") from exc

@@ -10,6 +10,8 @@ and read-only SQLite cursor snapshots.
   age or directory scanning.
 - Lock acquisition failure or timeout yields `status="unknown"`, never an empty
   reader list, so log segments are never prematurely recycled or deleted.
+- Unreadable or non-regular bindings are not classified live; PolicyUnavailable
+  retains the consumer and is not treated as disabled or as confirmed-enabled.
 
 [Timeouts & Locks]
 - `reader_guard` acquires `flock`/`msvcrt` on `.readers/registry.lock` with a
@@ -145,28 +147,37 @@ def _unlock(fd: int) -> None:
         fcntl.flock(fd, fcntl.LOCK_UN)
 
 
-def _active_reader(binding: str) -> bool:
-    """Prune deleted reader DBs or disabled profile queues so retention never self-bricks."""
+def _reader_presence(binding: str) -> tuple[str, dict]:
+    """Classify a registry binding without pretending inspection failure is live.
+
+    `gone` is safe to prune (deleted DB or disabled profile). `live` is a
+    confirmed consumer. `retain` keeps a PolicyUnavailable profile queue so
+    unread evidence is not discarded. `unreadable` stays registered but is
+    never treated as live; callers must fail closed instead of recycling.
+    """
     path = _real_path(binding)
     try:
         info = path.lstat()
     except FileNotFoundError:
-        return False
+        return "gone", {}
     except TimeoutError:
         raise
-    except OSError:
-        return True
+    except OSError as exc:
+        detail = {"error_type": type(exc).__name__}
+        if exc.errno is not None:
+            detail["errno"] = int(exc.errno)
+        return "unreadable", detail
     if not _regular(info):
-        return True
+        return "unreadable", {"error_type": "not_regular"}
     if path.name == "reporter.sqlite3" and path.parent.suffix == ".state":
         from .fallback import PolicyUnavailable, read_policy
         try:
             policy = read_policy(path.parent.with_suffix(".json"))
         except PolicyUnavailable:
-            return True
+            return "retain", {"error_type": "PolicyUnavailable"}
         if policy is None or policy.get("decision") != "enabled":
-            return False
-    return True
+            return "gone", {}
+    return "live", {}
 
 
 @contextmanager
@@ -191,12 +202,33 @@ def reader_guard(root, timeout: float = 2.0, queue_path=None):
         locked = True
         existing = _readers(folder)
         binding = _queue_path(queue_path) if queue_path is not None else None
-        readers = [r for r in existing if r == binding or _active_reader(r)]
+        readers = []
+        unreadable = None
+        retained = False
+        for item in existing:
+            if item == binding:
+                readers.append(item)
+                continue
+            kind, detail = _reader_presence(item)
+            if kind == "gone":
+                continue
+            readers.append(item)
+            if kind == "unreadable" and unreadable is None:
+                unreadable = detail
+            elif kind == "retain":
+                retained = True
         if binding is not None and binding not in readers:
             readers.append(binding)
         if readers != existing:
             _save(folder, readers)
         state = {"status": "ok", "readers": readers}
+        if unreadable is not None:
+            state["unreadable_readers"] = True
+            state["reader_error"] = unreadable["error_type"]
+            if "errno" in unreadable:
+                state["errno"] = unreadable["errno"]
+        if retained:
+            state["policy_unavailable"] = True
     except TimeoutError:
         state = {"status": "unknown", "reason": "timeout", "readers": []}
     except (OSError, ValueError, TypeError, UnicodeError):
@@ -247,8 +279,11 @@ def cursor_snapshot(readers, timeout: float = 2.0, *, remaining_budget: float | 
         for binding in readers:
             if time.monotonic() >= deadline:
                 return None
-            if not _active_reader(binding):
+            kind, _detail = _reader_presence(binding)
+            if kind == "gone":
                 continue
+            if kind == "unreadable":
+                return None
             path = _real_path(binding)
             if not _regular(path.lstat()):
                 return None

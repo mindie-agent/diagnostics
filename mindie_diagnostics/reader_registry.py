@@ -35,6 +35,7 @@ import json
 import os
 from pathlib import Path
 from .fallback import _private_mkdir
+from .filesystem import path_identity, sqlite_file_uri
 import sqlite3
 import stat
 import time
@@ -205,6 +206,7 @@ def reader_guard(root, timeout: float = 2.0, queue_path=None):
         existing = _readers(folder)
         binding = _queue_path(queue_path) if queue_path is not None else None
         readers = []
+        identities = set()
         unreadable = None
         retained = None
         for item in existing:
@@ -213,9 +215,12 @@ def reader_guard(root, timeout: float = 2.0, queue_path=None):
                 unreadable = detail
             elif kind == "retain" and retained is None:
                 retained = detail
-            if item == binding or kind != "gone":
+            identity = path_identity(item)
+            selected = binding is not None and identity == path_identity(binding)
+            if (selected or kind != "gone") and identity not in identities:
                 readers.append(item)
-        if binding is not None and binding not in readers:
+                identities.add(identity)
+        if binding is not None and path_identity(binding) not in identities:
             readers.append(binding)
         if readers != existing:
             _save(folder, readers)
@@ -259,9 +264,11 @@ def unregister_reader(root, queue_path, *, timeout: float = 2.0) -> None:
             if state.get("reason") == "timeout":
                 raise TimeoutError("diagnostic reader registry is busy")
             raise RuntimeError("diagnostic reader registration unavailable")
-        if binding in state["readers"]:
+        readers = [value for value in state["readers"]
+                   if path_identity(value) != path_identity(binding)]
+        if readers != state["readers"]:
             _save(_real_path(root) / ".readers",
-                  [value for value in state["readers"] if value != binding])
+                  readers)
 
 
 def cursor_snapshot(readers, timeout: float = 2.0, *, remaining_budget: float | None = None):
@@ -289,7 +296,7 @@ def cursor_snapshot(readers, timeout: float = 2.0, *, remaining_budget: float | 
             if (budget_deadline is not None
                     and budget_deadline - time.monotonic() < _SQLITE_WAIT_S + _SNAPSHOT_CLEANUP_S):
                 return None
-            db = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=_SQLITE_WAIT_S)
+            db = sqlite3.connect(sqlite_file_uri(path) + "?mode=ro", uri=True, timeout=_SQLITE_WAIT_S)
             try:
                 db.execute("PRAGMA query_only=ON")
                 db.execute("PRAGMA busy_timeout=3000")
@@ -309,7 +316,13 @@ def cursor_snapshot(readers, timeout: float = 2.0, *, remaining_budget: float | 
                             or not isinstance(inode, str) or not inode.isdecimal()
                             or type(offset) is not int or offset < 0):
                         return None
-                    snapshot[name] = {"inode": inode, "offset": offset}
+                    key = path_identity(name)
+                    cursor = {"inode": inode, "offset": offset}
+                    if key in snapshot:
+                        if snapshot[key]['inode'] != inode:
+                            return None
+                        cursor['offset'] = min(snapshot[key]['offset'], offset)
+                    snapshot[key] = cursor
                 snapshots.append(snapshot)
             finally:
                 db.close()
@@ -324,7 +337,7 @@ def fully_consumed(snapshot, path, inode, size) -> bool:
     if snapshot is None:
         return False
     for reader in snapshot:
-        cursor = reader.get(str(path), {})
+        cursor = reader.get(path_identity(path), {})
         if cursor.get("inode") != str(inode) or cursor.get("offset", -1) < size:
             return False
     return True

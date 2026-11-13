@@ -159,7 +159,8 @@ class Outbox:
     def connect(self):
         if self.path.is_symlink() or (self.path.exists() and not self.path.is_file()):
             raise ValueError("diagnostic queue path must be a regular SQLite file")
-        db = sqlite3.connect(self.path.as_uri() + '?mode=rw', uri=True, timeout=3.0)
+        from .filesystem import sqlite_file_uri
+        db = sqlite3.connect(sqlite_file_uri(self.path) + '?mode=rw', uri=True, timeout=3.0)
         db.row_factory = sqlite3.Row
         try:
             db.execute("PRAGMA journal_mode=WAL")

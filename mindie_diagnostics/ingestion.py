@@ -85,6 +85,7 @@ def _candidates(root, counts):
 def ingest(root, queue: Outbox, *, max_files=256, max_bytes=8 * 1024 * 1024, since=None,
            config=None, cancel=None, deadline=None):
     from .reporter import fingerprint, issue_payload
+    from .filesystem import path_identity
     root = Path(root).absolute()
     if root.is_symlink():
         raise ValueError('diagnostic root must not traverse symlinks')
@@ -94,10 +95,22 @@ def ingest(root, queue: Outbox, *, max_files=256, max_bytes=8 * 1024 * 1024, sin
         db.execute('CREATE TABLE IF NOT EXISTS cursors (path TEXT PRIMARY KEY, inode TEXT, offset INTEGER, touched REAL, discard INTEGER DEFAULT 0)')
         db.execute('DELETE FROM cursors WHERE touched < ?', (queue.clock() - 30 * 86400,))
         db.execute('DELETE FROM cursors WHERE path IN (SELECT path FROM cursors ORDER BY touched DESC LIMIT -1 OFFSET 10000)')
-        cursors = {row['path']: dict(row) for row in db.execute('SELECT * FROM cursors')}
+        cursors, aliases = {}, {}
+        for row in db.execute('SELECT * FROM cursors'):
+            key, cursor = path_identity(row['path']), dict(row)
+            aliases.setdefault(key, []).append(row['path'])
+            previous = cursors.get(key)
+            if previous is not None:
+                # Concurrent ordinary/extended readers may have left two keys.
+                # Resume conservatively; existing incident receipts deduplicate.
+                if previous['inode'] != cursor['inode']:
+                    cursor.update(inode=None, offset=0, discard=0)
+                elif previous['offset'] < cursor['offset']:
+                    cursor = previous
+            cursors[key] = cursor
     candidates = []
     for modified, path, inode, size in _candidates(root, counts):
-        cursor = cursors.get(str(path), {})
+        cursor = cursors.get(path_identity(path), {})
         offset = cursor.get('offset', 0) if cursor.get('inode') == str(inode) else 0
         if size < offset:
             offset = 0
@@ -156,7 +169,8 @@ def ingest(root, queue: Outbox, *, max_files=256, max_bytes=8 * 1024 * 1024, sin
                     consent = raw.get('reporting')
                     if config is not None and (
                         not isinstance(consent, dict)
-                        or consent.get("config_file") != str(Path(config).absolute())
+                        or not isinstance(consent.get("config_file"), str)
+                        or path_identity(consent["config_file"]) != path_identity(Path(config).absolute())
                     ):
                         counts['consent_skipped'] += 1
                         continue
@@ -189,5 +203,8 @@ def ingest(root, queue: Outbox, *, max_files=256, max_bytes=8 * 1024 * 1024, sin
                 except (ValueError, KeyError, TypeError):
                     counts['invalid'] += 1
             with queue.connect() as db:
+                for previous in aliases.get(path_identity(path), []):
+                    if previous != str(path):
+                        db.execute('DELETE FROM cursors WHERE path = ?', (previous,))
                 db.execute('INSERT OR REPLACE INTO cursors VALUES (?,?,?,?,?)', (str(path), identity, offset, queue.clock(), discard))
     return counts

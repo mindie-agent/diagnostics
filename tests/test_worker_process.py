@@ -18,12 +18,13 @@ from mindie_diagnostics import fallback, integration, worker_process
     ((None, None), 123456, "unverified"),
     ((True, 123456), None, "unverified"),
 ])
+@pytest.mark.parametrize("initial", ["idle", "degraded"])
 def test_windows_worker_health_requires_matching_process_identity(
-        tmp_path, monkeypatch, observed, expected, status):
+        tmp_path, monkeypatch, observed, expected, status, initial):
     config = tmp_path / "reporting.json"
     state = fallback.state_path(config)
     state.mkdir()
-    health = dict(schema=1, pid=123, status="idle", interval=60,
+    health = dict(schema=1, pid=123, status=initial, interval=60,
                   heartbeat_at=time.time(), progress_at=time.time())
     if expected is not None:
         health["process_created"] = expected
@@ -31,8 +32,9 @@ def test_windows_worker_health_requires_matching_process_identity(
     monkeypatch.setattr(integration, "os", SimpleNamespace(name="nt"))
     monkeypatch.setattr(worker_process, "windows_process", lambda pid: observed)
     view = integration._worker_view(config)
-    assert view["status"] == status
-    assert view["healthy"] is (status == "idle")
+    assert view["status"] == (initial if status == "idle" else status)
+    assert view["healthy"] is (status == "idle" and initial == "idle")
+    assert view["running"] is (status == "idle")
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="native Windows process APIs")

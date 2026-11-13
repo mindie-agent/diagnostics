@@ -13,13 +13,13 @@ signal backpressure to active log writers when retention limits remain exceeded.
   definitively exited (`ESRCH`).
 
 [Timeouts & Locks]
-- The caller's monotonic budget (default 1.0s) reserves 50ms for releasing the
+- The caller's monotonic budget (default 5.0s) reserves 50ms for releasing the
   registry lock and writing the retention marker. Scanning and deletion share
   the remainder; `reader_guard` waits at most 100ms.
 - `cursor_snapshot` receives the actual remaining budget. Its 3.0s SQLite
   wait plus cleanup must fit before it opens each reader; otherwise cursors
   are unknown and this call deletes nothing. Callers may explicitly provide
-  a larger budget without changing the default admission policy.
+  a smaller budget; that call explicitly reports incomplete reader inspection.
 
 [Side-Effect Policy]
 - Unlinks only verified consumed log segments and atomically updates
@@ -78,7 +78,7 @@ def _marker(root, result, blocked, now):
 
 def prune(root: str | Path, *, max_bytes: int = 128 * 1024 * 1024,
           max_age_days: int = 7, max_files: int = 512, clock=time.time, queue=None,
-          timeout: float = 1.0) -> dict:
+          timeout: float = 5.0) -> dict:
     root = Path(root).absolute()
     if root.is_symlink():
         raise ValueError("retention root must not traverse symlinks")

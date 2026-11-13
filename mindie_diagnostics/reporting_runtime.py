@@ -1,9 +1,10 @@
 """Immutable generation-based runtime preparation for the diagnostics worker.
 
 [Role]
-Copies the installed `mindie_diagnostics` distribution into a user-owned,
-content-addressed generation virtualenv (`<policy>.runtime/generations/<sha256>/venv`)
-and atomically updates `current.json` under an exclusive transaction lock.
+Copies the installed distribution into a user-owned generation virtualenv.
+Windows uses a short per-profile artifact directory under LOCALAPPDATA so
+native Python/GUI launchers stay below MAX_PATH. The historical policy-side
+current.json and transaction lock remain the only activation authority.
 
 [Invariants]
 - Rejects editable installs (`direct_url.json` `editable=True`), symlinked package
@@ -36,6 +37,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from .fallback import _private_mkdir
+from .filesystem import path_identity
 
 _PKG = "mindie_diagnostics"
 _DIST = "mindie-diagnostics"
@@ -309,8 +311,11 @@ def _verify(py, version, site, work, deadline=None):
                 stderr=ferr,
                 timeout=10 if remaining is None else min(10, remaining),
                 env=env,
-                cwd=str(work),
-                **({"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if os.name == "nt" else {}),
+                # CreateProcess rejects a long current directory even when
+                # file I/O accepts it. -I binds imports to the candidate Python.
+                cwd=Path(path_identity(work)).anchor if os.name == "nt" else str(work),
+                **({"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    "executable": str(py)} if os.name == "nt" else {}),
             )
         if proc.returncode != 0 or out.stat().st_size > _OUT_CAP or err.stat().st_size > _OUT_CAP:
             _fail("verify_failed")
@@ -410,34 +415,47 @@ def _source_order(current, version, source_hash):
 def _generation_python(root, source_hash):
     from mindie_diagnostics.fallback import _owned
 
-    dest = root / "generations" / source_hash
+    dest = _generations(root) / source_hash
+    if not dest.exists() and not dest.is_symlink():
+        dest = root / "generations" / source_hash
     _require_dir(dest, _owned)
     return str(_python(dest, _owned))
 
 
+def _generations(root):
+    """Place generated Windows executables within the native launcher limit."""
+    root = Path(root)
+    if os.name != "nt":
+        return root / "generations"
+    local = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData/Local")
+    profile = hashlib.sha256(path_identity(root.resolve()).encode("utf-8")).hexdigest()[:20]
+    path = local.absolute() / "mindie" / "diagnostics" / profile
+    return path if str(path).startswith("\\\\?\\") else Path("\\\\?\\" + str(path))
+
+
 def retire_other_generations(root, keep_source_hash):
-    """Retire superseded generation directories under root/generations after handoff."""
+    """Retire owned artifacts after handoff, including the legacy layout."""
     from mindie_diagnostics.fallback import _owned
 
     if not _is_source_hash(keep_source_hash):
         _fail("runtime_untrusted")
     root = Path(root)
     _require_dir(root, _owned)
-    generations = root / "generations"
-    if not generations.exists() and not generations.is_symlink():
-        return []
-    _require_dir(generations, _owned)
     retired = []
-    for entry in sorted(generations.iterdir(), key=lambda p: p.name):
-        if entry.name == keep_source_hash:
+    for generations in dict.fromkeys((_generations(root), root / "generations")):
+        if not generations.exists() and not generations.is_symlink():
             continue
-        if entry.is_symlink() or not _is_source_hash(entry.name) or not entry.is_dir():
-            continue
-        if not _owned(entry.lstat()):
-            continue
-        shutil.rmtree(entry, ignore_errors=True)
-        if not entry.exists():
-            retired.append(entry.name)
+        _require_dir(generations, _owned)
+        for entry in sorted(generations.iterdir(), key=lambda p: p.name):
+            if entry.name == keep_source_hash:
+                continue
+            if entry.is_symlink() or not _is_source_hash(entry.name) or not entry.is_dir():
+                continue
+            if not _owned(entry.lstat()):
+                continue
+            shutil.rmtree(entry, ignore_errors=True)
+            if not entry.exists():
+                retired.append(entry.name)
     return retired
 
 
@@ -533,7 +551,8 @@ def _create_venv(target, deadline=None):
             timeout=30 if remaining is None else min(30, remaining),
             env=env,
             check=False,
-            **({"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if os.name == "nt" else {}),
+            **({"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                "executable": sys.executable} if os.name == "nt" else {}),
         )
     except subprocess.TimeoutExpired:
         _fail("runtime_deadline_exceeded")
@@ -563,7 +582,9 @@ def _prepare_locked(config, *, publish=True, source=None, deadline=None):
     _remaining(deadline)
     version, revision, files, source_hash = source if source is not None else _collect_source()
     root = _ensure_dir(_root_path(config), _as_local_absolute, _owned)
-    generations = _ensure_dir(root / "generations", _as_local_absolute, _owned)
+    generations = _ensure_dir(_generations(root), _as_local_absolute, _owned)
+    if os.name == "nt" and len(str(generations / source_hash / "venv/Scripts/pythonw.exe")) >= 260:
+        _fail("runtime_artifact_path_too_long")
     current = _read_current(root)
     if current is not None:
         old, new = _triple(current["version"]), _triple(version)

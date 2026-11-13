@@ -8,8 +8,8 @@ provisioning (`ensure`), and bounded automatic runtime handoff (`upgrade_running
 - Never invoked automatically when a tool records a local failure.
 - `maintain` phases (consent, intake, retention) are independent: each degrades
   the status without cancelling the others; intake needs an enabled policy.
-- `upgrade_running` only upgrades an already-active healthy worker when the
-  installed distribution is strictly newer (`_source_order == "newer"`) and at
+- `upgrade_running` upgrades only a verified live worker, including degraded
+  workers, when the installed distribution is strictly newer (`_source_order == "newer"`) and at
   least 60s of budget remain (`61s` from `maintain`).
 - `current.json` is published only AFTER the replaced service passes health and
   `runtime_source` readback verification; otherwise rolls back to `old_python`.
@@ -331,7 +331,7 @@ def upgrade_running(config=None, *, unit_dir=None, deadline=None):
         worker = _worker_view(config)
         if worker.get('status') == 'unavailable':
             return {'status': 'degraded', 'reason': 'reporter_worker_unavailable'}
-        if not worker.get('healthy'):
+        if not (worker.get('healthy') or worker.get('running')):
             return {'status': 'skipped', 'reason': 'reporter_worker_not_running',
                     'worker_status': worker.get('status')}
         wait = max(0.0, min(_LOCK_WAIT_S, forward - time.monotonic()))
@@ -375,7 +375,8 @@ def upgrade_running(config=None, *, unit_dir=None, deadline=None):
                 if policy is None:
                     return {'status': 'skipped', 'reason': 'policy_withdrawn',
                             'previous': previous, 'new': target}
-                if not _worker_view(config).get('healthy'):
+                worker = _worker_view(config)
+                if not (worker.get('healthy') or worker.get('running')):
                     return {'status': 'skipped', 'reason': 'reporter_worker_not_running',
                             'previous': previous, 'new': target}
                 state = _state(config)

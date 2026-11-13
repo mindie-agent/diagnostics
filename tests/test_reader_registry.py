@@ -253,7 +253,8 @@ def test_policy_unavailable_reader_is_retained_not_disabled_or_live(tmp_path, mo
         assert state['reader_error'] == 'PolicyUnavailable'
         assert 'unreadable_readers' not in state
         snapshot = cursor_snapshot(state['readers'])
-        assert snapshot == [{str(old): {'inode': inode, 'offset': 0}}]
+        from mindie_diagnostics.filesystem import path_identity
+        assert snapshot == [{path_identity(old): {'inode': inode, 'offset': 0}}]
         assert not fully_consumed(snapshot, old, old.stat().st_ino, old.stat().st_size)
     result = prune(tmp_path, max_bytes=1, timeout=4)
     assert old.exists() and result['removed_files'] == 0

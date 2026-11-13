@@ -139,8 +139,12 @@ def recent_failures(roots, *, config=None):
                 eligibility = 'local_only'
             elif not isinstance(consent, dict):
                 eligibility = 'not_authorized_at_capture'
-            elif config is not None and consent.get('config_file') != str(f.policy_path(config)):
-                eligibility = 'other_profile'
+            elif config is not None:
+                from .filesystem import path_identity
+                recorded = consent.get('config_file')
+                eligibility = ('other_profile' if not isinstance(recorded, str)
+                               or path_identity(recorded) != path_identity(f.policy_path(config))
+                               else 'consent_' + f.consent_status(consent))
             else:
                 eligibility = 'consent_' + f.consent_status(consent)
             item['reporting_eligibility'] = eligibility

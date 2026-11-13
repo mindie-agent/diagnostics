@@ -46,9 +46,9 @@ def test_worker_retention_preserves_unread_old_evidence(tmp_path, monkeypatch):
     consumed = ingest(tmp_path, queue)
     assert consumed['scanned_bytes'] > 0 and consumed['enqueued'] == 0
     # Retention consumes local-only records without authorizing an Issue.
-    skipped = prune(tmp_path, max_bytes=1, queue=queue)
+    skipped = prune(tmp_path, max_bytes=1, queue=queue, timeout=1)
     assert skipped['reader_unknown'] and skipped['removed_files'] == 0
-    assert prune(tmp_path, max_bytes=1, queue=queue, timeout=4)['removed_files'] == 1
+    assert prune(tmp_path, max_bytes=1, queue=queue)['removed_files'] == 1
     assert not path.exists()
 
 
@@ -69,10 +69,10 @@ def test_prune_skips_locked_reader_when_remaining_budget_cannot_admit_sqlite(tmp
         db.commit()
         register_reader(tmp_path, db_path)
         # A rollback-journal exclusive lock would make the real SQLite reader
-        # wait 3s if prune admitted it into the default 1s outer budget.
+        # wait 3s if prune admitted it into this explicit 1s outer budget.
         db.execute('BEGIN EXCLUSIVE')
         started = time.monotonic()
-        result = prune(tmp_path, max_bytes=1)
+        result = prune(tmp_path, max_bytes=1, timeout=1)
         assert time.monotonic() - started < 1
         assert result['reader_unknown'] and result['limited']
         assert result['removed_files'] == 0 and result['unread_files'] == 1

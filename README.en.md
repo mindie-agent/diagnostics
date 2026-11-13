@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mindie-agent/diagnostics/releases"><img src="https://img.shields.io/badge/Release-v0.5.9-blue" alt="Release v0.5.9"></a>
+  <a href="https://github.com/mindie-agent/diagnostics/releases"><img src="https://img.shields.io/badge/Release-v0.5.10-blue" alt="Release v0.5.10"></a>
   <img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/Execution-100%25%20Model--Free-success" alt="100% Model-Free">
   <img src="https://img.shields.io/badge/Privacy-Strict%20Allowlist-blue" alt="Strict Allowlist Privacy">

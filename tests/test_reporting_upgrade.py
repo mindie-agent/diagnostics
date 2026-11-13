@@ -2,6 +2,7 @@
 from contextlib import contextmanager
 import errno
 import json
+import os
 import subprocess
 import sys
 import time
@@ -112,6 +113,28 @@ def test_preparation_cannot_revive_stopped_worker_or_cross_consent_revision(prep
     result = commands.upgrade_running(config)
     assert result['status'] == 'skipped' and calls == []
     assert json.loads((root / 'current.json').read_text())['source_hash'] == 'a' * 64
+
+
+def test_live_degraded_worker_can_upgrade_without_discarding_queue(prepared, monkeypatch):
+    from mindie_diagnostics.outbox import Outbox
+
+    config, root, state, calls = prepared
+    queue = Outbox(config.with_suffix('.state') / 'reporter.sqlite3')
+    queue.enqueue('pending-evidence', 'operation', {'retained': True})
+    state.update(healthy=False, running=True, status='degraded')
+    monkeypatch.setattr(runtime, '_prepare_locked',
+                        lambda *args, **kwargs: {'python': sys.executable, 'source_hash': 'b' * 64})
+
+    def installed(*args, **kwargs):
+        calls.append(kwargs)
+        state.update(healthy=True, running=True, status='idle', runtime_source='b' * 64)
+        return {'changed': True}
+
+    monkeypatch.setattr(service, 'ensure_reporter_service', installed)
+    result = commands.upgrade_running(config)
+    assert result['status'] == 'updated' and len(calls) == 1
+    assert json.loads((root / 'current.json').read_text())['source_hash'] == 'b' * 64
+    assert [row['state'] for row in queue.rows()] == ['pending']
 
 
 def test_invalid_worker_directory_is_a_failure_not_a_normal_update_skip(prepared, monkeypatch):
@@ -280,11 +303,24 @@ def test_collect_source_reads_real_distribution_tree_and_rejects_symlinks(tmp_pa
         runtime._collect_source()
 
 
-def test_real_generation_atomic_pointer_switch_and_retire_other_generations():
+@pytest.mark.parametrize("deep_profile", [False, True])
+def test_real_generation_atomic_pointer_switch_and_retire_other_generations(deep_profile):
+    import shutil
     import tempfile
 
-    with tempfile.TemporaryDirectory(prefix="md-rt-") as raw_tmp:
+    @contextmanager
+    def temporary_profile():
+        directory = tempfile.mkdtemp(prefix="md-rt-")
+        path = Path("\\\\?\\" + directory) if os.name == "nt" else Path(directory)
+        try:
+            yield path
+        finally:
+            shutil.rmtree(path)
+
+    with temporary_profile() as raw_tmp:
         short_tmp = Path(raw_tmp)
+        if deep_profile:
+            short_tmp = short_tmp / ("profile-directory-" * 5) / ("nested-installation-" * 5)
         config = short_tmp / "d.json"
         configure_reporting(True, config=config, repository="owner/repo", roots=[str(short_tmp / "logs")])
 
@@ -314,20 +350,27 @@ def test_real_generation_atomic_pointer_switch_and_retire_other_generations():
             assert first["published"] is True and first["changed"] is True
             current = runtime._read_current(root)
             assert current["source_hash"] == src_v1[3] and current["version"] == "0.3.0"
-            assert (root / "generations" / src_v1[3] / "source.json").is_file()
+            generations = runtime._generations(root)
+            assert (generations / src_v1[3] / "source.json").is_file()
+            assert runtime._generation_python(root, src_v1[3]) == first["python"]
+            if os.name == "nt":
+                assert len(first["python"]) < 260
+                assert Path(first["python"]).with_name("pythonw.exe").is_file()
 
             # Prepare v2 with publish=False: v2 generation is materialized & verified,
             # but current.json still points to v1 until explicitly published.
             second = runtime._prepare_locked(config, publish=False, source=src_v2)
             assert second["published"] is False and second["changed"] is True
             assert runtime._read_current(root)["source_hash"] == src_v1[3]
-            assert (root / "generations" / src_v2[3] / "source.json").is_file()
+            assert (generations / src_v2[3] / "source.json").is_file()
 
             # Atomically switch current.json pointer and retire superseded generations.
             runtime._publish(root, {"schema": 1, "source_hash": src_v2[3], "version": src_v2[0], "revision": src_v2[1]})
             assert runtime._read_current(root)["source_hash"] == src_v2[3]
             retired = runtime.retire_other_generations(root, src_v2[3])
             assert retired == [src_v1[3]]
-            assert not (root / "generations" / src_v1[3]).exists()
-            assert (root / "generations" / src_v2[3]).is_dir()
+            assert not (generations / src_v1[3]).exists()
+            assert (generations / src_v2[3]).is_dir()
+            reused = runtime._prepare_locked(config, publish=False, source=src_v2)
+            assert reused["python"] == second["python"] and not reused["changed"]
 

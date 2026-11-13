@@ -668,7 +668,10 @@ def _as_local_absolute(value):
     if not path.is_absolute():
         return None
     raw = str(path)
-    if raw.startswith("\\\\") or raw.startswith("//"):
+    extended_drive = (os.name == "nt" and raw.startswith("\\\\?\\")
+                      and len(raw) >= 7 and raw[4].isascii() and raw[4].isalpha()
+                      and raw[5:7] == ":\\")
+    if (raw.startswith("\\\\") or raw.startswith("//")) and not extended_drive:
         return None
     for part in path.parts[1:]:
         if part in ("", ".", ".."):

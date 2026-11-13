@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import tempfile
 
 NETWORK_ENV = (
@@ -26,6 +27,41 @@ NETWORK_ENV = (
 )
 ENV_KEYS = {*NETWORK_ENV, "GH_TOKEN", "GITHUB_TOKEN"}
 LIMIT = 32768
+_GIT_SLOT = re.compile(r"GIT_CONFIG_(?:COUNT|(?:KEY|VALUE)_[0-9]+)\Z")
+_GIT_TRANSPORT = re.compile(
+    r"http(?:\.[^\r\n]+)?\.(?:proxy|proxyauthmethod|sslbackend|sslcainfo|sslcapath|"
+    r"sslverify|sslversion|schannelcheckrevoke|schannelusesslcainfo)\Z", re.IGNORECASE)
+
+
+def git_transport_environment(environment):
+    """Project transport options only; credential helpers and headers stay out."""
+    if "GIT_CONFIG_COUNT" not in environment:
+        return {}
+    try:
+        count = int(environment["GIT_CONFIG_COUNT"])
+    except (TypeError, ValueError):
+        raise ValueError("invalid_service_git_configuration") from None
+    if not 0 <= count <= 256:
+        raise ValueError("invalid_service_git_configuration")
+    values, selected = {}, 0
+    for index in range(count):
+        try:
+            key = environment[f"GIT_CONFIG_KEY_{index}"]
+            value = environment[f"GIT_CONFIG_VALUE_{index}"]
+        except KeyError:
+            raise ValueError("invalid_service_git_configuration") from None
+        if _GIT_TRANSPORT.fullmatch(key):
+            values[f"GIT_CONFIG_KEY_{selected}"] = key
+            values[f"GIT_CONFIG_VALUE_{selected}"] = value
+            selected += 1
+    values["GIT_CONFIG_COUNT"] = str(selected)
+    return values
+
+
+def validate_git_environment(values):
+    supplied = {key: value for key, value in values.items() if _GIT_SLOT.fullmatch(key)}
+    if supplied != git_transport_environment(supplied):
+        raise ValueError("invalid_service_git_configuration")
 
 
 def prepare(directory, explicit=None):
@@ -34,6 +70,7 @@ def prepare(directory, explicit=None):
     if explicit is not None and Path(explicit).absolute() != path.absolute():
         return Path(explicit), False
     values = {key: os.environ[key] for key in NETWORK_ENV if key in os.environ}
+    values.update(git_transport_environment(os.environ))
     if any(any(ord(char) < 32 for char in value) for value in values.values()):
         raise ValueError("invalid_service_network_environment")
     content = "".join(f"{key}={json.dumps(value, ensure_ascii=False)}\n"
@@ -68,11 +105,20 @@ def read(path):
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         key, equal, value = line.partition("=")
-        if not equal or key not in ENV_KEYS:
+        if not equal or key not in ENV_KEYS and not _GIT_SLOT.fullmatch(key):
             raise ValueError("invalid_environment_file")
         if value.startswith('"'):
             value = json.loads(value)
         if not isinstance(value, str) or any(ord(char) < 32 for char in value):
             raise ValueError("invalid_environment_file")
         values[key] = value
+    validate_git_environment(values)
     return values
+
+
+def apply(values):
+    """Apply the selected service network, including explicitly absent settings."""
+    for key in list(os.environ):
+        if key in ENV_KEYS or _GIT_SLOT.fullmatch(key):
+            os.environ.pop(key, None)
+    os.environ.update(values)

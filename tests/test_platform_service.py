@@ -93,6 +93,22 @@ def scripts(runner):
     return [base64.b64decode(argv[-1]).decode("utf-16-le") for argv, _ in runner.calls if argv[0] == "powershell.exe"]
 
 
+def test_windows_task_uses_launchable_working_directory_for_deep_profile(tmp_path):
+    from xml.etree import ElementTree as ET
+
+    launcher = tmp_path / "short-runtime" / "pythonw.exe"
+    manifest = tmp_path / ("nested-profile-" * 18) / native.MANIFEST
+    config = {"launcher": str(launcher), "launch_args": ["-I", "-m", "mindie_diagnostics.platform_service",
+                                                     "run", "--config", str(manifest)]}
+    tree = ET.fromstring(native._windows_xml(config, manifest, "S-1-5-21-1000"))
+    namespace = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
+    action = tree.find("t:Actions/t:Exec", namespace)
+    assert action.find("t:WorkingDirectory", namespace).text == str(launcher.parent)
+    assert action.find("t:Command", namespace).text == str(launcher)
+    assert action.find("t:Arguments", namespace).text == subprocess.list2cmdline(config["launch_args"])
+    assert len(str(manifest)) > 260
+
+
 def test_console_pythonw_never_registers_or_restarts_a_worker(installation):
     values, runner = installation
     if sys.platform != "win32":

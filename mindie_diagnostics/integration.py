@@ -277,6 +277,7 @@ def _error(category):
 
 
 def _merge_roots(existing, supplied):
+    from .filesystem import path_identity
     if supplied is None:
         supplied_paths = []
     elif isinstance(supplied, (str, Path)) or not isinstance(supplied, (list, tuple)):
@@ -290,9 +291,10 @@ def _merge_roots(existing, supplied):
         if path is None:
             return None
         text = str(path)
-        if text in seen:
+        identity = path_identity(text)
+        if identity in seen:
             continue
-        seen.add(text)
+        seen.add(identity)
         merged.append(text)
         if len(merged) > 32:
             return None
@@ -490,7 +492,8 @@ def _worker_view(config):
             elif observed is True and type(expected) is int and expected > 0:
                 # A reused PID must not make a stopped worker look healthy.
                 alive = created == expected
-        if status in {"running", "idle"}:
+        running = status in {"running", "idle", "degraded"}
+        if running:
             if alive is False:
                 status = "stopped"
             elif age > 60:
@@ -500,6 +503,7 @@ def _worker_view(config):
             elif stalled:
                 status = "stalled"
         view = {"status": status, "pid": pid, "healthy": status in {"running", "idle"},
+                "running": running and alive is True and age <= 60 and not stalled,
                 "heartbeat_age_s": age, "progress_stalled": stalled}
         if stage:
             view["stage"] = stage
@@ -593,7 +597,8 @@ def _read_outbox(config, repository):
         return _queue_unavailable()
     deadline = time.monotonic() + _QUERY_DEADLINE
     try:
-        conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=3.0)
+        from .filesystem import sqlite_file_uri
+        conn = sqlite3.connect(sqlite_file_uri(path) + "?mode=ro", uri=True, timeout=3.0)
     except Exception as exc:
         return _queue_unavailable(type(exc).__name__)
     try:

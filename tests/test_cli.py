@@ -129,6 +129,27 @@ class CyclePublisher:
         return {'number': 1, 'html_url': f'https://github.com/{self.repository}/issues/1'}
 
 
+def test_default_worker_cycle_with_registered_reader_is_healthy(tmp_path):
+    from mindie_diagnostics.reader_registry import register_reader
+
+    root, state = tmp_path / 'logs', tmp_path / 'state'
+    recorder = configure('healthy-cycle', root=root)
+    queue = Outbox(state / 'queue.db')
+    register_reader(root, queue.path)
+    publisher = CyclePublisher('owner/repo')
+    try:
+        with Health(state, recorder) as health:
+            result = cli.run_cycle(SimpleNamespace(root=[str(root)]),
+                                   queue, publisher, recorder, health)
+            assert result['status'] == 'ok'
+            assert not result['retention'][0]['reader_unknown']
+            assert not result['retention'][0]['limited']
+            assert read_health(state)['healthy']
+            assert publisher.calls == []
+    finally:
+        recorder.close()
+
+
 def test_worker_stop_during_intake_admits_no_later_stage(tmp_path, monkeypatch, reporting_consent):
     import threading
     from mindie_diagnostics import maintenance

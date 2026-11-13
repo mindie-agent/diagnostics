@@ -218,7 +218,8 @@ def _windows_xml(config, manifest, sid):
     action = element(element(task, "Actions", Context="Author"), "Exec")
     element(action, "Command", config["launcher"])
     element(action, "Arguments", subprocess.list2cmdline(config["launch_args"]))
-    element(action, "WorkingDirectory", str(manifest.parent))
+    # Windows rejects a long working directory before launching the short venv.
+    element(action, "WorkingDirectory", str(Path(config["launcher"]).parent))
     # Register-ScheduledTask receives a .NET UTF-16 string. An UTF-8 XML
     # declaration conflicts with that transport even though the file is UTF-8.
     return ET.tostring(task, encoding="utf-8", xml_declaration=False)
@@ -522,7 +523,7 @@ def run_worker(config_path):
     env_file = _private_environment(config.get("environment_file"), subprocess.run)
     if env_file is not None:
         try:
-            os.environ.update(service_environment.read(env_file))
+            service_environment.apply(service_environment.read(env_file))
         except ValueError:
             raise common.ServiceError("invalid_environment_file") from None
     from .cli import main

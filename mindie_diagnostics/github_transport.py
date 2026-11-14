@@ -36,6 +36,8 @@ import tempfile
 import threading
 import time
 
+from .filesystem import which_native
+
 
 class TransportError(RuntimeError):
     def __init__(
@@ -64,7 +66,7 @@ def _run_gh(command, data, *, deadline, max_bytes, cancel=None):
         raise TransportError("github_cancelled", uncertain=False)
     if time.monotonic() >= deadline:
         raise TransportError("github_timeout", uncertain=False)
-    if not command or shutil.which(command[0]) is None:
+    if not command or which_native(command[0], which_fn=shutil.which) is None:
         raise TransportError("github_client_missing", uncertain=False, permanent=True)
     payload = b"" if data is None else bytes(data)
     if len(payload) > 65536:

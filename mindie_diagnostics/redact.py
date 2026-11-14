@@ -39,6 +39,8 @@ def load_document(path):
     """Standalone allow files use JSON; knowledge retains its YAML CLI adapter."""
     try:
         return json.loads(Path(path).read_text(encoding="utf-8"))
+    except TimeoutError:
+        raise
     except (OSError, ValueError) as exc:
         raise ToolError("cannot read JSON allow file") from exc
 

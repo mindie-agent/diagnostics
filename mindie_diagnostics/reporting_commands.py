@@ -40,6 +40,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import fallback as f
+from .filesystem import which_native
 from .integration import reporting_status, _worker_view
 
 
@@ -49,6 +50,8 @@ def _state(config):
         raise ValueError('unsafe_state_directory')
     try:
         f._private_mkdir(path, parents=True, exist_ok=True)
+    except TimeoutError:
+        raise
     except OSError as exc:
         raise ValueError('unsafe_state_directory') from exc
     if not path.is_dir():
@@ -193,7 +196,7 @@ def ensure(config=None, *, unit_dir=None):
     if unit_dir is None:
         unit_dir = f.service_directory(config)
     consent_revision = policy.get('revision')
-    gh = shutil.which('gh')
+    gh = which_native('gh', which_fn=shutil.which)
     if not gh:
         return {'status': 'configuration_unavailable', 'category': 'gh_unavailable'}
     from .reporting_runtime import _prepare_locked, runtime_transaction
@@ -269,6 +272,7 @@ def _bounded_runner(deadline):
         return subprocess.run(command, timeout=bounded_timeout, **kwargs)
 
     run.deadline = deadline
+    run._is_real_runner = True
     return run
 
 
@@ -321,7 +325,7 @@ def upgrade_running(config=None, *, unit_dir=None, deadline=None):
         if unit_dir is None:
             unit_dir = f.service_directory(config)
         consent_revision = policy['revision']
-        gh = shutil.which('gh')
+        gh = which_native('gh', which_fn=shutil.which)
         if not gh:
             return {'status': 'skipped', 'reason': 'gh_unavailable'}
         native = service_status(unit_dir=unit_dir, runner=runner)

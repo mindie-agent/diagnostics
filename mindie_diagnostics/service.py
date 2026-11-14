@@ -1,8 +1,9 @@
 """Linux systemd user service management and cross-platform service dispatch.
 
 [Role]
-Manages `mindie-diagnostics.service` under `~/.config/systemd/user` on Linux and
-delegates to `platform_service` on macOS (`darwin`) and Windows (`win32`).
+Manages `mindie-diagnostics.service` under `~/.config/systemd/user` on Linux when
+a `systemd --user` manager is available, and delegates to `platform_service` on
+macOS (`darwin`), Windows (`win32`), and non-systemd Linux / WSL2 environments.
 
 [Invariants]
 - Refuses to overwrite or unload unowned unit files or units with systemd
@@ -37,6 +38,8 @@ import hashlib
 import sys
 import tempfile
 import time
+
+from .filesystem import is_pe_executable, which_native
 
 UNIT = "mindie-diagnostics.service"
 MARKER = "# Owned by mindie-diagnostics user-service schema=1\n"
@@ -145,7 +148,14 @@ def _run(runner, command, *, check=True, action):
 
 
 def _systemctl(runner, *args, check=True):
-    return _run(runner, ["systemctl", "--user", *args], check=check, action="systemctl." + args[0])
+    action = "systemctl." + args[0]
+    if _is_real_runner(runner):
+        exe = which_native("systemctl", which_fn=shutil.which)
+        if not exe:
+            raise ServiceError("command_unavailable", action=action)
+    else:
+        exe = "systemctl"
+    return _run(runner, [exe, "--user", *args], check=check, action=action)
 
 
 def _loaded_properties(runner, path):
@@ -177,11 +187,14 @@ def _check_loaded_owner(runner, path, *, allow_missing=False, creating=False, re
 
 
 def _executable(value):
-    found = value if Path(value).is_absolute() else shutil.which(str(value))
+    raw = str(value)
+    found = raw if Path(raw).is_absolute() else which_native(raw, which_fn=shutil.which)
     if not found:
         raise ServiceError("executable_unavailable")
     path = _absolute(found)
     if not path.is_file() or not os.access(path, os.X_OK):
+        raise ServiceError("executable_unavailable")
+    if os.name != "nt" and sys.platform != "win32" and is_pe_executable(path):
         raise ServiceError("executable_unavailable")
     return path
 
@@ -211,7 +224,8 @@ def _environment_file(value):
     if path.is_symlink():
         raise ServiceError("unsafe_environment_file")
     info = path.stat()
-    if (not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600
+    if (not stat.S_ISREG(info.st_mode)
+            or stat.S_IMODE(info.st_mode) != 0o600
             or info.st_uid != os.geteuid()):
         raise ServiceError("unsafe_environment_file")
     return path
@@ -299,7 +313,7 @@ def _publish(path, text, runner):
         # Parse the exact staged file before replacing a working installation.
         # This does not contact a service manager or execute ExecStart. Some
         # minimal systemd installations omit this optional inspection binary.
-        analyzer = shutil.which("systemd-analyze")
+        analyzer = which_native("systemd-analyze", which_fn=shutil.which)
         if analyzer:
             checked = _run(runner, [analyzer, "verify", "--man=no", temporary], action="unit.verify")
             warnings = _unit_verification_warnings(checked.stderr, temporary)
@@ -312,6 +326,42 @@ def _publish(path, text, runner):
         if os.path.exists(temporary):
             os.unlink(temporary)
         staging.rmdir()
+
+
+def _is_real_runner(runner) -> bool:
+    return runner is None or runner is subprocess.run or bool(getattr(runner, "_is_real_runner", False))
+
+
+def _systemd_user_available(runner) -> bool:
+    systemctl_exe = which_native("systemctl", which_fn=shutil.which)
+    if systemctl_exe is None:
+        return False
+    run_fn = runner or subprocess.run
+    try:
+        reply = run_fn(
+            [str(systemctl_exe), "--user", "show-environment"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3, check=False,
+        )
+    except (FileNotFoundError, PermissionError, subprocess.TimeoutExpired):
+        return False
+    except TimeoutError:
+        raise
+    except OSError:
+        return False
+    return reply.returncode == 0
+
+
+def _linux_uses_local_service(unit_dir, runner, *, installing=False) -> bool:
+    from . import platform_service
+    local_manifest = platform_service._paths(unit_dir)[0]
+    if local_manifest.exists() or local_manifest.is_symlink():
+        return True
+    systemd_unit = _unit_path(unit_dir)
+    if systemd_unit.exists() or systemd_unit.is_symlink():
+        return False
+    if installing and _is_real_runner(runner):
+        return not _systemd_user_available(runner)
+    return False
 
 
 def install_service(roots, state, repository, *, python=None, gh=None, interval=60, since=None,
@@ -333,6 +383,12 @@ def install_service(roots, state, repository, *, python=None, gh=None, interval=
                               ensure=ensure, reporting_config=reporting_config,
                               expected_consent_revision=expected_consent_revision)
     _linux()
+    if _linux_uses_local_service(unit_dir, runner, installing=True):
+        from .platform_service import install_service as install_native
+        return install_native(roots, state, repository, python=python, gh=gh, interval=interval, since=since,
+                              environment_file=environment_file, unit_dir=unit_dir, runner=runner, start=start,
+                              ensure=ensure, reporting_config=reporting_config,
+                              expected_consent_revision=expected_consent_revision)
     runner = runner or subprocess.run
     path = _unit_path(unit_dir)
     reporting_config = _absolute(reporting_config)
@@ -414,6 +470,9 @@ def service_status(*, unit_dir=None, runner=None):
         from .platform_service import service_status as status_native
         return status_native(unit_dir=unit_dir, runner=runner)
     _linux()
+    if _linux_uses_local_service(unit_dir, runner):
+        from .platform_service import service_status as status_native
+        return status_native(unit_dir=unit_dir, runner=runner)
     path = _unit_path(unit_dir)
     existing = _read_owned(path)
     if existing is None:
@@ -431,6 +490,9 @@ def start_service(*, unit_dir=None, runner=None):
         from .platform_service import start_service as start_native
         return start_native(unit_dir=unit_dir, runner=runner)
     _linux()
+    if _linux_uses_local_service(unit_dir, runner):
+        from .platform_service import start_service as start_native
+        return start_native(unit_dir=unit_dir, runner=runner)
     path = _unit_path(unit_dir)
     runner = runner or subprocess.run
     with _locked(path):
@@ -449,6 +511,10 @@ def remove_service(*, unit_dir=None, runner=None, expected_reporting_config=None
         return remove_native(unit_dir=unit_dir, runner=runner,
                              expected_reporting_config=expected_reporting_config)
     _linux()
+    if _linux_uses_local_service(unit_dir, runner):
+        from .platform_service import remove_service as remove_native
+        return remove_native(unit_dir=unit_dir, runner=runner,
+                             expected_reporting_config=expected_reporting_config)
     path = _unit_path(unit_dir)
     runner = runner or subprocess.run
     with _locked(path):

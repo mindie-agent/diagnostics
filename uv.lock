@@ -1,5 +1,5 @@
 version = 1
-revision = 5
+revision = 3
 requires-python = ">=3.11"
 
 [[package]]
@@ -22,7 +22,7 @@ wheels = [
 
 [[package]]
 name = "mindie-diagnostics"
-version = "0.5.10"
+version = "0.5.12"
 source = { editable = "." }
 
 [package.optional-dependencies]

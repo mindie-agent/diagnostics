@@ -26,9 +26,25 @@
 
 from __future__ import annotations
 
-import errno, hashlib, json, math, os, platform as _platform, re, stat, subprocess, sys, threading, time, urllib.error, uuid
+import errno, hashlib, http.client, json, math, os, platform as _platform, re, socket, stat, subprocess, sys, threading, time, urllib.error, uuid
 from datetime import datetime, timezone
 from pathlib import Path
+try:
+    import ssl
+except ImportError:
+    ssl = None
+
+_HTTP_TRANSPORT_ERRORS = (
+    http.client.IncompleteRead,
+    http.client.RemoteDisconnected,
+    http.client.BadStatusLine,
+)
+_DNS_ERRORS = tuple(
+    dict.fromkeys(
+        cls for cls in (getattr(socket, "gaierror", OSError), getattr(socket, "herror", OSError))
+        if isinstance(cls, type) and issubclass(cls, OSError) and cls is not OSError
+    )
+)
 
 _POLICY_SCHEMA = "mindie.diagnostics.reporting.v1"
 _POLICY_PURPOSE = "tool_fault_reporting"
@@ -305,25 +321,10 @@ def _runtime_envelope() -> dict:
 
 
 def record_failure(
-    component,
-    operation,
-    *,
-    stage,
-    category,
-    exception=None,
-    host=None,
-    revision=None,
-    version=None,
-    elapsed_ms=None,
-    exit_code=None,
-    reportable=True,
-    root=None,
-    incident_id=None,
-    reason_code=None,
-    substage=None,
-    contract_name=None,
-    soc_generation=None,
-    harness=None,
+    component, operation, *, stage, category, exception=None, host=None, revision=None,
+    version=None, elapsed_ms=None, exit_code=None, reportable=True, root=None,
+    incident_id=None, reason_code=None, substage=None, contract_name=None,
+    soc_generation=None, harness=None,
 ) -> dict:
     """Record one local operation failure. Never raises or masks the caller."""
     try:
@@ -375,7 +376,15 @@ def update_failure_policy(exception):
             return "permission", False, "update_permission_required"
         if category == "cancelled":
             return "cancelled", False, "update_cancelled"
-        if isinstance(current, (TimeoutError, subprocess.TimeoutExpired, urllib.error.URLError, ConnectionError)):
+        if ssl is not None and isinstance(current, ssl.SSLCertVerificationError):
+            return "credentials", False, "update_credentials_required"
+        if ssl is not None and isinstance(current, ssl.SSLError):
+            return "connectivity", False, "update_transport_unavailable"
+        if isinstance(
+            current,
+            (TimeoutError, subprocess.TimeoutExpired, urllib.error.URLError, ConnectionError,
+             *_DNS_ERRORS, *_HTTP_TRANSPORT_ERRORS),
+        ):
             return "connectivity", False, "update_transport_unavailable"
         if isinstance(current, (PermissionError, FileNotFoundError)):
             return "prerequisite", False, "update_prerequisite_unavailable"
@@ -423,24 +432,9 @@ def _public_os_attributes(exception, attributes):
 
 
 def _build_event(
-    incident,
-    component,
-    operation,
-    *,
-    stage,
-    category,
-    exception,
-    host,
-    revision,
-    version,
-    elapsed_ms,
-    exit_code,
-    reportable,
-    reason_code=None,
-    substage=None,
-    contract_name=None,
-    soc_generation=None,
-    harness=None,
+    incident, component, operation, *, stage, category, exception, host, revision,
+    version, elapsed_ms, exit_code, reportable, reason_code=None, substage=None,
+    contract_name=None, soc_generation=None, harness=None,
 ):
     if not _label(component, 80) or not _label(operation, 120):
         return None

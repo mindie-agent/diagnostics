@@ -1,0 +1,12 @@
+# mindie-diagnostics 0.5.12: Transport Classification, Windows PowerShell 5.1 / CP936 & WSL2 Service Hardening
+
+[中文](diagnostics-0.5.12.md)
+
+Hardens cross-platform transport error policy, windowless PowerShell UTF-8 stream handling, and WSL2 executable/mount/service boundaries:
+
+- **Transport Failure Policy Alignment (`fallback.py`)**: Classifies `ssl.SSLCertVerificationError` as `("credentials", False, "update_credentials_required")` and mid-stream `ssl.SSLError`/`SSLEOFError`, `socket.gaierror`/`herror`, and `http.client.IncompleteRead`/`RemoteDisconnected`/`BadStatusLine` as `("connectivity", False, "update_transport_unavailable")` so transient TLS/network drops never auto-file false `internal` GitHub Issues, while keeping `InvalidURL`/`ImproperConnectionState`/`NotConnected` as `internal`.
+- **Windowless PowerShell 5.1 Direct UTF-8 Pipe Binding (`platform_service.py`)**: Binds `[Console]::SetOut` and `[Console]::SetError` directly over `[Console]::OpenStandardOutput()` / `[Console]::OpenStandardError()` with UTF-8 (`no BOM`), preventing headless `CREATE_NO_WINDOW` fallback to `CP936` on non-ASCII task paths.
+- **WSL2 `.exe`/PE/DrvFS Shadowing Defense & Fail-Closed Private Permissions (`filesystem.py`, `github_transport.py`, `service.py`, `reporting_runtime.py`)**: Executes the exact native binary path resolved by `which_native` using strict symlink resolution (`realpath(..., strict=True)`) that propagates `os.stat`/`os.lstat` `TimeoutError`; strictly enforces `0700`/`0600` permissions on background worker runtime directories and credential environment files across all POSIX and DrvFS mounts without trusting synthetic DrvFS mount UIDs.
+- **Non-`systemd` Linux / WSL2 Local Worker Identity, Drain Budget & Transaction Rollback (`platform_service.py`, `service.py`)**: Falls back to a managed local background worker when `systemctl --user` is unavailable, requiring verified `boot_id` + `uid` + start-time PID identity, reserving the full `5.5s` shutdown drain budget before signaling `SIGTERM` so `gh` transport child cleanup (`2.0s` grace) is never truncated, cleaning up unregistered children on registration failure, and restoring unit/manifest transactions before propagating `TimeoutError`.
+
+In-package `__version__` is aligned to `0.5.12`. Actual test and benchmark results are recorded in the packaged `benchmark-results.json`, `benchmark-results.md`, and CI runs.

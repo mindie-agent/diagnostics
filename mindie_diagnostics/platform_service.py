@@ -286,6 +286,10 @@ def _pid_path(manifest: Path) -> Path:
     return manifest.with_name("worker-process.json")
 
 
+_BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
+_WORKER_STOP_DRAIN = 5.0
+
+
 def _linux_worker_identity(pid: int) -> str | None:
     if type(pid) is not int or pid <= 1:
         return None
@@ -295,23 +299,26 @@ def _linux_worker_identity(pid: int) -> str | None:
             uid = proc_dir.stat().st_uid
             if uid != os.getuid():
                 return None
+            boot_id = Path(_BOOT_ID_PATH).read_text(encoding="utf-8").strip()
             raw = (proc_dir / "stat").read_bytes()
         except TimeoutError:
             raise
         except OSError:
             return None
         rparen = raw.rfind(b")")
-        if rparen < 0:
+        if not boot_id or rparen < 0:
             return None
         fields = raw[rparen + 2:].split()
         if len(fields) <= 19 or fields[0] == b"Z":
             return None
         try:
-            return f"proc:{uid}:{int(fields[19])}"
+            return f"proc:{boot_id}:{uid}:{int(fields[19])}"
         except ValueError:
             return None
+    ps_exe = common.which_native("ps", which_fn=common.shutil.which) or common.which_native("/bin/ps")
+    if not ps_exe:
+        return None
     try:
-        ps_exe = common.which_native("ps", which_fn=common.shutil.which) or "/bin/ps"
         reply = subprocess.run(
             [str(ps_exe), "-o", "uid=,state=,lstart=", "-p", str(pid)],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -402,7 +409,7 @@ def _linux_stop_worker(manifest: Path, config, *, deadline=None) -> None:
                 raise
             except OSError:
                 pass
-            stop = time.monotonic() + 3.0
+            stop = time.monotonic() + _WORKER_STOP_DRAIN
             if deadline is not None:
                 stop = min(stop, deadline)
             while _linux_worker_alive(pid, identity) and time.monotonic() < stop:
@@ -410,8 +417,6 @@ def _linux_stop_worker(manifest: Path, config, *, deadline=None) -> None:
             if _linux_worker_alive(pid, identity):
                 try:
                     os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
                 except TimeoutError:
                     raise
                 except OSError:
@@ -425,8 +430,7 @@ def _linux_stop_worker(manifest: Path, config, *, deadline=None) -> None:
 
 
 _SAFE_WORKER_ENV = frozenset({
-    "HOME", "USER", "LOGNAME", "PATH", "LANG", "LC_ALL", "LC_CTYPE",
-    "TZ", "TMPDIR", "GH_HOST", "GH_CONFIG_DIR",
+    "HOME", "USER", "LOGNAME", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "GH_HOST", "GH_CONFIG_DIR",
 })
 
 
@@ -435,7 +439,7 @@ def _cleanup_unregistered_child(proc) -> None:
         if proc.poll() is None:
             proc.terminate()
             try:
-                proc.wait(timeout=1.0)
+                proc.wait(timeout=_WORKER_STOP_DRAIN)
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait(timeout=0.5)
@@ -446,21 +450,12 @@ def _cleanup_unregistered_child(proc) -> None:
 
 
 def _linux_start_worker(manifest: Path, launcher: Path, launch_args: list[str], *, config_sha256: str) -> None:
-    worker_env = {
-        k: v for k, v in os.environ.items()
-        if k in _SAFE_WORKER_ENV or k.startswith(("XDG_", "MINDIE_"))
-    }
+    worker_env = {k: v for k, v in os.environ.items() if k in _SAFE_WORKER_ENV or k.startswith(("XDG_", "MINDIE_"))}
     try:
         proc = subprocess.Popen(
-            [str(launcher), *launch_args],
-            cwd="/",
-            env=worker_env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-            close_fds=True,
-            umask=0o077,
+            [str(launcher), *launch_args], cwd="/", env=worker_env,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True, close_fds=True, umask=0o077,
         )
     except TimeoutError:
         raise

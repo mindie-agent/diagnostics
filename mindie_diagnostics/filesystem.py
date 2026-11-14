@@ -138,15 +138,13 @@ def _match_drvfs_mount(value, *, require_fixed_mode: bool) -> bool:
     if not mounts:
         return False
     raw_text = os.fspath(value)
-    candidates = [os.path.abspath(raw_text)]
     try:
         real = os.path.realpath(raw_text)
-        if real not in candidates:
-            candidates.append(real)
     except TimeoutError:
         raise
     except OSError:
-        pass
+        real = os.path.abspath(raw_text)
+    candidates = [real] if require_fixed_mode else list(dict.fromkeys([os.path.abspath(raw_text), real]))
     for target in candidates:
         best_len = -1
         best_flag = False
@@ -167,8 +165,18 @@ def is_wsl_drvfs(value) -> bool:
 
 
 def is_wsl_drvfs_fixed_mode(value) -> bool:
-    """Return True only on single-owner WSL DrvFS mounts without `metadata` mode support."""
+    """Return True only when the resolved target lives on single-owner fixed-mode WSL DrvFS."""
     return _match_drvfs_mount(value, require_fixed_mode=True)
+
+
+def _is_exec_regular_file(path_str: str) -> bool:
+    try:
+        st = os.stat(path_str)
+        return stat.S_ISREG(st.st_mode) and os.access(path_str, os.X_OK)
+    except TimeoutError:
+        raise
+    except OSError:
+        return False
 
 
 def which_native(cmd, *, path=None, which_fn=None) -> str | None:
@@ -180,12 +188,12 @@ def which_native(cmd, *, path=None, which_fn=None) -> str | None:
     if os.name == "nt" or sys.platform == "win32":
         return lookup(cmd_str) if path is None else lookup(cmd_str, path=path)
     if "/" in cmd_str or (os.path.altsep and os.path.altsep in cmd_str):
-        if os.path.isfile(cmd_str) and os.access(cmd_str, os.X_OK) and not is_pe_executable(cmd_str):
+        if _is_exec_regular_file(cmd_str) and not is_pe_executable(cmd_str) and not is_wsl_drvfs(cmd_str):
             return cmd_str
         return None
     if lookup is not _STDLIB_WHICH:
         found = lookup(cmd_str) if path is None else lookup(cmd_str, path=path)
-        if not found or (os.path.isfile(found) and is_pe_executable(found)):
+        if not found or (_is_exec_regular_file(found) and (is_pe_executable(found) or is_wsl_drvfs(found))):
             return None
         return found
     if cmd_str.lower().endswith(_WINDOWS_SUFFIXES):
@@ -193,7 +201,7 @@ def which_native(cmd, *, path=None, which_fn=None) -> str | None:
     raw_path = os.environ.get("PATH", "") if path is None else path
     for entry in raw_path.split(os.pathsep):
         candidate = os.path.join(entry or ".", cmd_str)
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+        if _is_exec_regular_file(candidate):
             if is_pe_executable(candidate) or is_wsl_drvfs(candidate):
                 continue
             return candidate

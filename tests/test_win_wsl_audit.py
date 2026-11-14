@@ -435,3 +435,60 @@ def test_windows_detached_headless_powershell_51_preserves_utf8_non_ascii():
     )
     assert proc.returncode == 0, proc.stderr
     assert "UTF8_OK" in proc.stdout
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX native lookup and DrvFS symlink resolution")
+def test_round2_systemctl_rejection_and_symlink_drvfs_and_stat_timeout(tmp_path, monkeypatch):
+    # 1. Rejected PE/DrvFS systemctl shim must raise command_unavailable rather than invoking bare 'systemctl'
+    shim_dir = tmp_path / "drvfs_bin"
+    shim_dir.mkdir()
+    pe_systemctl = shim_dir / "systemctl"
+    pe_header = bytearray(128)
+    pe_header[0:2] = b"MZ"
+    pe_header[0x3C:0x40] = (64).to_bytes(4, "little")
+    pe_header[64:68] = b"PE\x00\x00"
+    pe_systemctl.write_bytes(bytes(pe_header))
+    pe_systemctl.chmod(0o755)
+    monkeypatch.setenv("PATH", str(shim_dir))
+    invoked = []
+
+    def real_like_runner(argv, **kwargs):
+        invoked.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    real_like_runner._is_real_runner = True
+    with pytest.raises(service.ServiceError) as exc_info:
+        service._systemctl(real_like_runner, "show", "mindie-diagnostics.service", check=False)
+    assert exc_info.value.category == "command_unavailable"
+    assert invoked == []
+
+    # 2. Ancestor symlink under fixed-mode DrvFS pointing to native ext4 must NOT exempt permissions
+    uid = os.geteuid()
+    drvfs_root = tmp_path / "mnt_c"
+    native_root = tmp_path / "ext4_secret"
+    drvfs_root.mkdir()
+    native_root.mkdir()
+    secret_file = native_root / "credentials.env"
+    secret_file.write_text("TOKEN=1\n", encoding="utf-8")
+    link_dir = drvfs_root / "link_to_ext4"
+    link_dir.symlink_to(native_root)
+
+    fake_mountinfo = tmp_path / "mountinfo"
+    fake_mountinfo.write_text(
+        f"20 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw\n"
+        f"90 20 0:42 / {drvfs_root} rw,noatime - 9p C:\\134 rw,dirsync,aname=drvfs;path=C:\\134;uid={uid};gid={uid};symlinkroot=/mnt/\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(filesystem, "sys", type("S", (), {"platform": "linux"})())
+    monkeypatch.setattr(filesystem, "_MOUNTINFO_PATH", str(fake_mountinfo))
+    assert filesystem.is_wsl_drvfs_fixed_mode(drvfs_root / "plain.txt") is True
+    assert filesystem.is_wsl_drvfs_fixed_mode(link_dir / "credentials.env") is False
+
+    # 3. TimeoutError during os.stat inside which_native must propagate
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(filesystem.os, "stat", lambda p: (_ for _ in ()).throw(TimeoutError("stat_deadline")))
+        with pytest.raises(TimeoutError, match="stat_deadline"):
+            filesystem.which_native("gh", path=str(tmp_path))
+
+    # 4. Worker drain budget exceeds github_transport 2.0s SIGTERM grace + 3.0s margin
+    assert platform_service._WORKER_STOP_DRAIN >= 5.0

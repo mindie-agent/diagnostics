@@ -148,8 +148,14 @@ def _run(runner, command, *, check=True, action):
 
 
 def _systemctl(runner, *args, check=True):
-    exe = (which_native("systemctl", which_fn=shutil.which) or "systemctl") if _is_real_runner(runner) else "systemctl"
-    return _run(runner, [exe, "--user", *args], check=check, action="systemctl." + args[0])
+    action = "systemctl." + args[0]
+    if _is_real_runner(runner):
+        exe = which_native("systemctl", which_fn=shutil.which)
+        if not exe:
+            raise ServiceError("command_unavailable", action=action)
+    else:
+        exe = "systemctl"
+    return _run(runner, [exe, "--user", *args], check=check, action=action)
 
 
 def _loaded_properties(runner, path):

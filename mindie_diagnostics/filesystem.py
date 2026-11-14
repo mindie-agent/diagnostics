@@ -100,8 +100,32 @@ def _is_drvfs_entry(fstype: str, source: str, super_opts: str) -> bool:
     return False
 
 
-def is_wsl_drvfs(value) -> bool:
-    """Return True when `value` (or its symlink target) lives on a WSL DrvFS mount."""
+def _parse_drvfs_mounts(raw_mountinfo: str) -> list[tuple[str, bool, bool]]:
+    """Return `(mount_point, is_drvfs, fixed_mode_for_euid)` entries from mountinfo."""
+    euid = os.geteuid() if hasattr(os, "geteuid") else -1
+    mounts: list[tuple[str, bool, bool]] = []
+    for line in raw_mountinfo.splitlines():
+        lhs, sep, rhs = line.partition(" - ")
+        if not sep:
+            continue
+        lhs_parts = lhs.split()
+        rhs_parts = rhs.split()
+        if len(lhs_parts) < 6 or len(rhs_parts) < 3:
+            continue
+        mount_point = _unescape_mount_path(lhs_parts[4])
+        on_drvfs = _is_drvfs_entry(rhs_parts[0], rhs_parts[1], rhs_parts[2])
+        fixed_mode = False
+        if on_drvfs:
+            tokens = [tok.strip() for tok in re.split(r"[,;]", f"{lhs_parts[5]},{rhs_parts[2]}") if tok.strip()]
+            has_metadata = "metadata" in tokens
+            uid_tokens = [tok.split("=", 1)[1] for tok in tokens if tok.startswith("uid=")]
+            uid_matches = bool(uid_tokens) and all(tok.isdigit() and int(tok) == euid for tok in uid_tokens)
+            fixed_mode = (not has_metadata) and uid_matches
+        mounts.append((mount_point, on_drvfs, fixed_mode))
+    return mounts
+
+
+def _match_drvfs_mount(value, *, require_fixed_mode: bool) -> bool:
     if not sys.platform.startswith("linux"):
         return False
     try:
@@ -110,17 +134,7 @@ def is_wsl_drvfs(value) -> bool:
         raise
     except OSError:
         return False
-    mounts: list[tuple[str, bool]] = []
-    for line in raw_mountinfo.splitlines():
-        lhs, sep, rhs = line.partition(" - ")
-        if not sep:
-            continue
-        lhs_parts = lhs.split()
-        rhs_parts = rhs.split()
-        if len(lhs_parts) < 5 or len(rhs_parts) < 3:
-            continue
-        mount_point = _unescape_mount_path(lhs_parts[4])
-        mounts.append((mount_point, _is_drvfs_entry(rhs_parts[0], rhs_parts[1], rhs_parts[2])))
+    mounts = _parse_drvfs_mounts(raw_mountinfo)
     if not mounts:
         return False
     raw_text = os.fspath(value)
@@ -135,16 +149,26 @@ def is_wsl_drvfs(value) -> bool:
         pass
     for target in candidates:
         best_len = -1
-        best_drvfs = False
-        for mount_point, on_drvfs in mounts:
+        best_flag = False
+        for mount_point, on_drvfs, fixed_mode in mounts:
             prefix = "/" if mount_point == "/" else mount_point.rstrip("/")
             if target == prefix or (prefix == "/" and target.startswith("/")) or target.startswith(prefix + "/"):
                 if len(prefix) > best_len:
                     best_len = len(prefix)
-                    best_drvfs = on_drvfs
-        if best_drvfs:
+                    best_flag = fixed_mode if require_fixed_mode else on_drvfs
+        if best_flag:
             return True
     return False
+
+
+def is_wsl_drvfs(value) -> bool:
+    """Return True when `value` (or its symlink target) lives on any WSL DrvFS mount."""
+    return _match_drvfs_mount(value, require_fixed_mode=False)
+
+
+def is_wsl_drvfs_fixed_mode(value) -> bool:
+    """Return True only on single-owner WSL DrvFS mounts without `metadata` mode support."""
+    return _match_drvfs_mount(value, require_fixed_mode=True)
 
 
 def which_native(cmd, *, path=None, which_fn=None) -> str | None:

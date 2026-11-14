@@ -39,7 +39,7 @@ import sys
 import tempfile
 import time
 
-from .filesystem import is_pe_executable, is_wsl_drvfs, which_native
+from .filesystem import is_pe_executable, is_wsl_drvfs_fixed_mode, which_native
 
 UNIT = "mindie-diagnostics.service"
 MARKER = "# Owned by mindie-diagnostics user-service schema=1\n"
@@ -148,7 +148,8 @@ def _run(runner, command, *, check=True, action):
 
 
 def _systemctl(runner, *args, check=True):
-    return _run(runner, ["systemctl", "--user", *args], check=check, action="systemctl." + args[0])
+    exe = (which_native("systemctl", which_fn=shutil.which) or "systemctl") if _is_real_runner(runner) else "systemctl"
+    return _run(runner, [exe, "--user", *args], check=check, action="systemctl." + args[0])
 
 
 def _loaded_properties(runner, path):
@@ -218,7 +219,7 @@ def _environment_file(value):
         raise ServiceError("unsafe_environment_file")
     info = path.stat()
     if (not stat.S_ISREG(info.st_mode)
-            or (stat.S_IMODE(info.st_mode) != 0o600 and not is_wsl_drvfs(path))
+            or (stat.S_IMODE(info.st_mode) != 0o600 and not is_wsl_drvfs_fixed_mode(path))
             or info.st_uid != os.geteuid()):
         raise ServiceError("unsafe_environment_file")
     return path
@@ -326,12 +327,13 @@ def _is_real_runner(runner) -> bool:
 
 
 def _systemd_user_available(runner) -> bool:
-    if which_native("systemctl", which_fn=shutil.which) is None:
+    systemctl_exe = which_native("systemctl", which_fn=shutil.which)
+    if systemctl_exe is None:
         return False
     run_fn = runner or subprocess.run
     try:
         reply = run_fn(
-            ["systemctl", "--user", "show-environment"],
+            [str(systemctl_exe), "--user", "show-environment"],
             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3, check=False,
         )
     except (FileNotFoundError, PermissionError, subprocess.TimeoutExpired):

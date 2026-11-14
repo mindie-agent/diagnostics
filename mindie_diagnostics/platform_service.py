@@ -174,11 +174,15 @@ def _ps_quote(value):
 
 
 def _ps(runner, script, *, action):
-    prefix = ("$ErrorActionPreference='Stop';$u=[Text.UTF8Encoding]::new($false);$OutputEncoding=$u;"
-              "try{[Console]::InputEncoding=$u}catch [System.IO.IOException]{};"
-              "try{[Console]::OutputEncoding=$u}catch [System.IO.IOException]{};"
-              "$ProgressPreference='SilentlyContinue';"
-              "$env:PSModulePath=(Join-Path $PSHOME 'Modules')+[IO.Path]::PathSeparator+$env:PSModulePath;")
+    prefix = (
+        "$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue';"
+        "$u=[Text.UTF8Encoding]::new($false);$OutputEncoding=$u;"
+        "try{[Console]::InputEncoding=$u}catch [System.IO.IOException]{};"
+        "try{[Console]::OutputEncoding=$u}catch [System.IO.IOException]{};"
+        "$o=[IO.StreamWriter]::new([Console]::OpenStandardOutput(),$u);$o.AutoFlush=$true;[Console]::SetOut($o);"
+        "$e=[IO.StreamWriter]::new([Console]::OpenStandardError(),$u);$e.AutoFlush=$true;[Console]::SetError($e);"
+        "$env:PSModulePath=(Join-Path $PSHOME 'Modules')+[IO.Path]::PathSeparator+$env:PSModulePath;"
+    )
     encoded = base64.b64encode((prefix + script).encode("utf-16-le")).decode("ascii")
     return _run(runner, ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden",
                          "-EncodedCommand", encoded], action=action)
@@ -282,36 +286,57 @@ def _pid_path(manifest: Path) -> Path:
     return manifest.with_name("worker-process.json")
 
 
-def _linux_proc_starttime(pid: int) -> int | None:
-    if not Path("/proc/self/stat").exists():
+def _linux_worker_identity(pid: int) -> str | None:
+    if type(pid) is not int or pid <= 1:
         return None
+    if Path("/proc/self/stat").exists():
+        try:
+            proc_dir = Path(f"/proc/{pid}")
+            uid = proc_dir.stat().st_uid
+            if uid != os.getuid():
+                return None
+            raw = (proc_dir / "stat").read_bytes()
+        except TimeoutError:
+            raise
+        except OSError:
+            return None
+        rparen = raw.rfind(b")")
+        if rparen < 0:
+            return None
+        fields = raw[rparen + 2:].split()
+        if len(fields) <= 19 or fields[0] == b"Z":
+            return None
+        try:
+            return f"proc:{uid}:{int(fields[19])}"
+        except ValueError:
+            return None
     try:
-        proc_dir = Path(f"/proc/{pid}")
-        if proc_dir.stat().st_uid != os.getuid():
-            return -1
-        raw = (proc_dir / "stat").read_bytes()
-    except FileNotFoundError:
-        return -1
+        ps_exe = common.which_native("ps", which_fn=common.shutil.which) or "/bin/ps"
+        reply = subprocess.run(
+            [str(ps_exe), "-o", "uid=,state=,lstart=", "-p", str(pid)],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            env={**os.environ, "LC_ALL": "C"}, timeout=3, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return None
     except TimeoutError:
         raise
     except OSError:
         return None
-    rparen = raw.rfind(b")")
-    if rparen < 0:
+    parts = reply.stdout.strip().split(None, 2)
+    if reply.returncode != 0 or len(parts) < 3 or parts[1].startswith("Z"):
         return None
-    fields = raw[rparen + 2:].split()
-    if len(fields) <= 19:
-        return None
-    if fields[0] == b"Z":
-        return -1
     try:
-        return int(fields[19])
+        uid = int(parts[0])
     except ValueError:
         return None
+    return f"ps:{uid}:{parts[2]}" if uid == os.getuid() else None
 
 
-def _linux_worker_alive(pid, expected_starttime) -> bool:
+def _linux_worker_alive(pid, expected_identity) -> bool:
     if type(pid) is not int or pid <= 1 or pid == os.getpid():
+        return False
+    if type(expected_identity) is not str or not expected_identity:
         return False
     try:
         wpid, _ = os.waitpid(pid, os.WNOHANG)
@@ -323,10 +348,8 @@ def _linux_worker_alive(pid, expected_starttime) -> bool:
         raise
     except OSError:
         pass
-    observed = _linux_proc_starttime(pid)
-    if observed == -1:
-        return False
-    if Path("/proc/self/stat").exists() and expected_starttime is not None and observed != expected_starttime:
+    observed = _linux_worker_identity(pid)
+    if observed is None or observed != expected_identity:
         return False
     try:
         os.kill(pid, 0)
@@ -350,18 +373,18 @@ def _linux_local_status(manifest: Path, config) -> dict:
     try:
         doc = json.loads(pid_file.read_text(encoding="utf-8"))
         pid = doc["pid"]
-        starttime = doc.get("starttime")
+        identity = doc.get("identity")
         config_sha = doc.get("config_sha256")
         if doc.get("manifest") != str(manifest) or type(pid) is not int or pid <= 1:
             raise ValueError("owner")
-        if starttime is not None and type(starttime) is not int:
-            raise ValueError("starttime")
+        if type(identity) is not str or not identity:
+            raise ValueError("identity")
         if config_sha is not None and type(config_sha) is not str:
             raise ValueError("config_sha256")
     except (ValueError, KeyError, TypeError) as exc:
         raise common.ServiceError("unowned_loaded_unit") from exc
-    alive = _linux_worker_alive(pid, starttime)
-    return {"status": "active" if alive else "idle", "pid": pid, "starttime": starttime,
+    alive = _linux_worker_alive(pid, identity)
+    return {"status": "active" if alive else "idle", "pid": pid, "identity": identity,
             "config_sha256": config_sha, "returncode": 0 if alive else 1}
 
 
@@ -369,8 +392,8 @@ def _linux_stop_worker(manifest: Path, config, *, deadline=None) -> None:
     status = _linux_local_status(manifest, config)
     if status["returncode"] == 0:
         pid = status["pid"]
-        starttime = status.get("starttime")
-        if _linux_worker_alive(pid, starttime):
+        identity = status["identity"]
+        if _linux_worker_alive(pid, identity):
             try:
                 os.kill(pid, signal.SIGTERM)
             except ProcessLookupError:
@@ -382,9 +405,9 @@ def _linux_stop_worker(manifest: Path, config, *, deadline=None) -> None:
             stop = time.monotonic() + 3.0
             if deadline is not None:
                 stop = min(stop, deadline)
-            while _linux_worker_alive(pid, starttime) and time.monotonic() < stop:
+            while _linux_worker_alive(pid, identity) and time.monotonic() < stop:
                 time.sleep(0.025)
-            if _linux_worker_alive(pid, starttime):
+            if _linux_worker_alive(pid, identity):
                 try:
                     os.kill(pid, signal.SIGKILL)
                 except ProcessLookupError:
@@ -394,9 +417,9 @@ def _linux_stop_worker(manifest: Path, config, *, deadline=None) -> None:
                 except OSError:
                     pass
                 kill_stop = time.monotonic() + 0.5
-                while _linux_worker_alive(pid, starttime) and time.monotonic() < kill_stop:
+                while _linux_worker_alive(pid, identity) and time.monotonic() < kill_stop:
                     time.sleep(0.02)
-                if _linux_worker_alive(pid, starttime):
+                if _linux_worker_alive(pid, identity):
                     raise common.ServiceError("service_removal_unconfirmed", action="local.stop", returncode=1)
     _pid_path(manifest).unlink(missing_ok=True)
 
@@ -405,6 +428,21 @@ _SAFE_WORKER_ENV = frozenset({
     "HOME", "USER", "LOGNAME", "PATH", "LANG", "LC_ALL", "LC_CTYPE",
     "TZ", "TMPDIR", "GH_HOST", "GH_CONFIG_DIR",
 })
+
+
+def _cleanup_unregistered_child(proc) -> None:
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=0.5)
+    except TimeoutError:
+        raise
+    except OSError:
+        pass
 
 
 def _linux_start_worker(manifest: Path, launcher: Path, launch_args: list[str], *, config_sha256: str) -> None:
@@ -428,14 +466,42 @@ def _linux_start_worker(manifest: Path, launcher: Path, launch_args: list[str], 
         raise
     except OSError as exc:
         raise common.ServiceError("command_failed", action="local.start", returncode=1) from exc
-    observed = _linux_proc_starttime(proc.pid)
-    payload = json.dumps(
-        {"manifest": str(manifest), "config_sha256": config_sha256, "pid": proc.pid,
-         "starttime": None if observed == -1 else observed},
-        ensure_ascii=True,
-        separators=(",", ":"),
-    ).encode("utf-8") + b"\n"
-    _write(_pid_path(manifest), payload)
+    try:
+        identity = _linux_worker_identity(proc.pid)
+        if not identity:
+            raise common.ServiceError("command_failed", action="local.start", returncode=1)
+        payload = json.dumps(
+            {"manifest": str(manifest), "config_sha256": config_sha256, "pid": proc.pid, "identity": identity},
+            ensure_ascii=True, separators=(",", ":"),
+        ).encode("utf-8") + b"\n"
+        _write(_pid_path(manifest), payload)
+    except BaseException:
+        _cleanup_unregistered_child(proc)
+        _pid_path(manifest).unlink(missing_ok=True)
+        raise
+
+
+def _publish_unit_and_manifest(unit: Path, payload: bytes, manifest: Path, manifest_bytes: bytes) -> None:
+    prior_unit = unit.read_bytes() if unit.is_file() and not unit.is_symlink() else None
+    prior_manifest = manifest.read_bytes() if manifest.is_file() and not manifest.is_symlink() else None
+    try:
+        _write(unit, payload)
+        _write(manifest, manifest_bytes)
+    except (TimeoutError, OSError, common.ServiceError):
+        try:
+            if prior_unit is None:
+                unit.unlink(missing_ok=True)
+            else:
+                _write(unit, prior_unit)
+            if prior_manifest is None:
+                manifest.unlink(missing_ok=True)
+            else:
+                _write(manifest, prior_manifest)
+        except TimeoutError:
+            raise
+        except (OSError, common.ServiceError) as exc:
+            raise common.ServiceError("unit_restore_failed", action="unit.restore") from exc
+        raise
 
 
 def _verify_unit(unit, config):
@@ -582,29 +648,8 @@ def install_service(roots, state, repository, *, python=None, gh=None, interval=
                 _launchctl(runner, "bootout", _domain(label))
                 _await_bootout(runner, label)
             if changed:
-                prior_unit = unit.read_bytes() if unit.is_file() and not unit.is_symlink() else None
-                prior_manifest = manifest.read_bytes() if manifest.is_file() and not manifest.is_symlink() else None
                 common._check_reporting_consent(reporting_config, expected_consent_revision)
-                try:
-                    _write(unit, payload)
-                    _write(manifest, manifest_bytes)
-                except TimeoutError:
-                    raise
-                except (OSError, common.ServiceError):
-                    try:
-                        if prior_unit is None:
-                            unit.unlink(missing_ok=True)
-                        else:
-                            _write(unit, prior_unit)
-                        if prior_manifest is None:
-                            manifest.unlink(missing_ok=True)
-                        else:
-                            _write(manifest, prior_manifest)
-                    except TimeoutError:
-                        raise
-                    except (OSError, common.ServiceError) as exc:
-                        raise common.ServiceError('unit_restore_failed', action='unit.restore') from exc
-                    raise
+                _publish_unit_and_manifest(unit, payload, manifest, manifest_bytes)
             if start:
                 common._check_reporting_consent(reporting_config, expected_consent_revision)
                 if changed or loaded["returncode"]:
@@ -614,29 +659,8 @@ def install_service(roots, state, repository, *, python=None, gh=None, interval=
         else:
             manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
             if changed:
-                prior_unit = unit.read_bytes() if unit.is_file() and not unit.is_symlink() else None
-                prior_manifest = manifest.read_bytes() if manifest.is_file() and not manifest.is_symlink() else None
                 common._check_reporting_consent(reporting_config, expected_consent_revision)
-                try:
-                    _write(unit, payload)
-                    _write(manifest, manifest_bytes)
-                except TimeoutError:
-                    raise
-                except (OSError, common.ServiceError):
-                    try:
-                        if prior_unit is None:
-                            unit.unlink(missing_ok=True)
-                        else:
-                            _write(unit, prior_unit)
-                        if prior_manifest is None:
-                            manifest.unlink(missing_ok=True)
-                        else:
-                            _write(manifest, prior_manifest)
-                    except TimeoutError:
-                        raise
-                    except (OSError, common.ServiceError) as exc:
-                        raise common.ServiceError("unit_restore_failed", action="unit.restore") from exc
-                    raise
+                _publish_unit_and_manifest(unit, payload, manifest, manifest_bytes)
             if start:
                 stale_worker = loaded["returncode"] == 0 and (changed or loaded.get("config_sha256") != manifest_sha)
                 if stale_worker:

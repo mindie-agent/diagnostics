@@ -140,18 +140,23 @@ def test_wsl_which_native_and_gh_transport_skip_pe_and_drvfs_shims(tmp_path, mon
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX / WSL2 DrvFS mode bit checks")
-def test_wsl_drvfs_tolerates_unmodifiable_mode_bits_while_native_fs_fails_closed(tmp_path, monkeypatch):
+def test_wsl_drvfs_tolerates_unmodifiable_mode_bits_while_metadata_and_native_fail_closed(tmp_path, monkeypatch):
     monkeypatch.setattr(filesystem.sys, "platform", "linux")
+    euid = os.geteuid()
     drvfs_root = tmp_path / "mnt_c" / "workspace"
+    drvfs_meta_root = tmp_path / "mnt_d" / "workspace"
     native_root = tmp_path / "ext4_home"
     drvfs_root.mkdir(parents=True)
+    drvfs_meta_root.mkdir(parents=True)
     native_root.mkdir(parents=True)
 
     mountinfo = tmp_path / "mountinfo"
     escaped_drvfs = str((tmp_path / "mnt_c").resolve()).replace(" ", "\\040")
+    escaped_meta = str((tmp_path / "mnt_d").resolve()).replace(" ", "\\040")
     mountinfo.write_text(
         f"36 28 0:31 / / rw,relatime - ext4 /dev/sdb rw\n"
-        f"92 36 0:54 / {escaped_drvfs} rw,noatime - drvfs C: rw,uid=1000,gid=1000\n",
+        f"92 36 0:54 / {escaped_drvfs} rw,noatime - 9p C:\\134 rw,aname=drvfs;path=C:\\;uid={euid};gid={euid}\n"
+        f"93 36 0:55 / {escaped_meta} rw,noatime - 9p D:\\134 rw,aname=drvfs;path=D:\\;uid={euid};gid={euid};metadata\n",
         encoding="utf-8",
     )
     monkeypatch.setattr(filesystem, "_MOUNTINFO_PATH", str(mountinfo))
@@ -165,6 +170,19 @@ def test_wsl_drvfs_tolerates_unmodifiable_mode_bits_while_native_fs_fails_closed
     drvfs_env.write_text('HTTPS_PROXY="http://proxy.example.com:8080"\n', encoding="utf-8")
     drvfs_env.chmod(0o777)
     assert service._environment_file(drvfs_env) == drvfs_env.absolute()
+
+    # DrvFS mounts with `metadata` enabled enforce Linux permissions -> 0777 / 0666 MUST fail closed!
+    meta_dir = drvfs_meta_root / "runtime_dir"
+    meta_dir.mkdir()
+    meta_dir.chmod(0o777)
+    with pytest.raises(RuntimeError, match="runtime_untrusted"):
+        reporting_runtime._require_dir(meta_dir, fallback._owned)
+
+    meta_env = drvfs_meta_root / "mindie-network.env"
+    meta_env.write_text('HTTPS_PROXY="http://proxy.example.com:8080"\n', encoding="utf-8")
+    meta_env.chmod(0o666)
+    with pytest.raises(service.ServiceError, match="unsafe_environment_file"):
+        service._environment_file(meta_env)
 
     # Symlinks on DrvFS must still be rejected
     drvfs_link = drvfs_root / "linked.env"
@@ -186,13 +204,43 @@ def test_wsl_drvfs_tolerates_unmodifiable_mode_bits_while_native_fs_fails_closed
         service._environment_file(native_env)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX native resolution execution test")
+def test_run_gh_executes_resolved_native_path_not_shadowing_drvfs_shim(tmp_path, monkeypatch):
+    monkeypatch.setattr(filesystem.sys, "platform", "linux")
+    drvfs_bin = tmp_path / "mnt_c" / "gh_cli"
+    native_bin = tmp_path / "usr_bin"
+    drvfs_bin.mkdir(parents=True)
+    native_bin.mkdir(parents=True)
+
+    mountinfo = tmp_path / "mountinfo"
+    escaped = str((tmp_path / "mnt_c").resolve()).replace(" ", "\\040")
+    mountinfo.write_text(
+        f"36 28 0:31 / / rw,relatime - ext4 /dev/sdb rw\n"
+        f"92 36 0:54 / {escaped} rw,noatime - drvfs C: rw,uid={os.geteuid()},gid={os.geteuid()}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(filesystem, "_MOUNTINFO_PATH", str(mountinfo))
+
+    shim_gh = drvfs_bin / "gh"
+    shim_gh.write_text("#!/bin/sh\necho SHIM_EXECUTED\nexit 99\n", encoding="utf-8")
+    shim_gh.chmod(0o755)
+
+    real_gh = native_bin / "gh"
+    real_gh.write_text("#!/bin/sh\necho NATIVE_GH_OK\nexit 0\n", encoding="utf-8")
+    real_gh.chmod(0o755)
+
+    monkeypatch.setenv("PATH", f"{drvfs_bin}{os.pathsep}{native_bin}{os.pathsep}/bin:/usr/bin")
+    code, raw, _ = _run_gh(["gh", "version"], None, deadline=time.monotonic() + 5.0, max_bytes=4096)
+    assert code == 0
+    assert b"NATIVE_GH_OK" in raw
+    assert b"SHIM_EXECUTED" not in raw
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX detached process supervision")
 def test_non_systemd_linux_local_worker_lifecycle_and_pid_reuse_guard(tmp_path, monkeypatch):
     monkeypatch.setattr(service.sys, "platform", "linux")
     monkeypatch.setattr(platform_service.sys, "platform", "linux")
 
-    # Stub runner simulating WSL2 without systemd user bus (`systemctl --user` fails)
-    # while running a sleeper Python child for `_linux_start_worker`.
     venv_dir = tmp_path / "gen-venv"
     bin_dir = venv_dir / "bin"
     bin_dir.mkdir(parents=True)
@@ -207,7 +255,7 @@ def test_non_systemd_linux_local_worker_lifecycle_and_pid_reuse_guard(tmp_path, 
     fake_gh.chmod(0o755)
 
     def non_systemd_runner(argv, **kwargs):
-        if argv[0] == "systemctl":
+        if Path(argv[0]).name == "systemctl":
             return subprocess.CompletedProcess(argv, 1, "", "Failed to connect to bus: No medium found")
         if argv[0] == str(fake_py) and argv[1:3] == ["-I", "-c"]:
             facts = {
@@ -271,15 +319,15 @@ def test_non_systemd_linux_local_worker_lifecycle_and_pid_reuse_guard(tmp_path, 
         with pytest.raises(ProcessLookupError):
             os.kill(pid_1, 0)
 
-        # PID-reuse safety: if `/proc/self/stat` is present on Linux, mismatched starttime
-        # treats the recorded PID as dead without signaling the unrelated process.
-        if Path("/proc/self/stat").exists():
-            bystander = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
-            try:
-                assert platform_service._linux_worker_alive(bystander.pid, 1) is False
-            finally:
-                bystander.terminate()
-                bystander.wait(timeout=5)
+        # PID-reuse & missing-identity safety: mismatched or missing identity never signals bystander
+        bystander = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            assert platform_service._linux_worker_alive(bystander.pid, "proc:0:1") is False
+            assert platform_service._linux_worker_alive(bystander.pid, None) is False
+            assert platform_service._linux_worker_alive(bystander.pid, "") is False
+        finally:
+            bystander.terminate()
+            bystander.wait(timeout=5)
 
         marker = state / "keep.sqlite3"
         marker.write_bytes(b"preserve-outbox")
@@ -290,7 +338,6 @@ def test_non_systemd_linux_local_worker_lifecycle_and_pid_reuse_guard(tmp_path, 
         with pytest.raises(ProcessLookupError):
             os.kill(pid_2, 0)
     finally:
-        # Ensure no background sleeper leaks if an assertion ever fails mid-test
         manifest = platform_service._paths(unit_dir)[0]
         pid_file = manifest.with_name("worker-process.json")
         if pid_file.is_file():
@@ -300,7 +347,53 @@ def test_non_systemd_linux_local_worker_lifecycle_and_pid_reuse_guard(tmp_path, 
                 pass
 
 
-def test_powershell_encoded_prefix_guards_missing_console_handles():
+@pytest.mark.skipif(os.name == "nt", reason="POSIX registration cleanup and rollback checks")
+def test_worker_registration_cleanup_and_timeout_transaction_rollback(tmp_path, monkeypatch):
+    manifest = tmp_path / "service.json"
+    unit = tmp_path / "mindie-diagnostics.service"
+    unit.write_bytes(b"old-unit")
+    manifest.write_bytes(b"old-manifest")
+
+    real_write = platform_service._write
+    calls = {"n": 0}
+
+    def timeout_on_manifest(path, data):
+        calls["n"] += 1
+        if path == manifest and calls["n"] == 2:
+            raise TimeoutError("manifest_write_timeout")
+        return real_write(path, data)
+
+    monkeypatch.setattr(platform_service, "_write", timeout_on_manifest)
+    with pytest.raises(TimeoutError, match="manifest_write_timeout"):
+        platform_service._publish_unit_and_manifest(unit, b"new-unit", manifest, b"new-manifest")
+    assert unit.read_bytes() == b"old-unit"
+    assert manifest.read_bytes() == b"old-manifest"
+
+    # Inject PID-file write failure -> spawned child MUST be terminated and reaped!
+    spawned = []
+    real_popen = subprocess.Popen
+
+    def tracking_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        if args and list(args[0])[:1] == [str(sleeper)]:
+            spawned.append(proc)
+        return proc
+
+    def fail_pid_write(path, data):
+        raise TimeoutError("pid_write_timeout")
+
+    monkeypatch.setattr(platform_service.subprocess, "Popen", tracking_popen)
+    monkeypatch.setattr(platform_service, "_write", fail_pid_write)
+    sleeper = tmp_path / "sleeper"
+    sleeper.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(30)\n", encoding="utf-8")
+    sleeper.chmod(0o755)
+    with pytest.raises(TimeoutError, match="pid_write_timeout"):
+        platform_service._linux_start_worker(manifest, sleeper, [], config_sha256="a" * 64)
+    assert len(spawned) == 1
+    assert spawned[0].poll() is not None
+
+
+def test_powershell_encoded_prefix_binds_utf8_standard_streams():
     captured = []
 
     def fake_runner(argv, **kwargs):
@@ -311,16 +404,21 @@ def test_powershell_encoded_prefix_guards_missing_console_handles():
     argv, _ = captured[0]
     decoded = base64.b64decode(argv[-1]).decode("utf-16-le")
     assert "$u=[Text.UTF8Encoding]::new($false);$OutputEncoding=$u;" in decoded
-    assert "try{[Console]::InputEncoding=$u}catch [System.IO.IOException]{};" in decoded
-    assert "try{[Console]::OutputEncoding=$u}catch [System.IO.IOException]{};" in decoded
+    assert "[Console]::OpenStandardOutput()" in decoded
+    assert "[Console]::SetOut(" in decoded
+    assert "[Console]::OpenStandardError()" in decoded
+    assert "[Console]::SetError(" in decoded
 
 
-@pytest.mark.skipif(os.name != "nt", reason="Real Windows headless PowerShell 5.1 check")
-def test_windows_detached_headless_powershell_51_does_not_throw_ioexception():
+@pytest.mark.skipif(os.name != "nt", reason="Real Windows headless PowerShell 5.1 UTF-8 check")
+def test_windows_detached_headless_powershell_51_preserves_utf8_non_ascii():
     code = (
-        "import subprocess; from mindie_diagnostics import platform_service as p; "
-        "r = p._ps(subprocess.run, '[Security.Principal.WindowsIdentity]::GetCurrent().User.Value', action='sid'); "
-        "print(r.stdout.strip())"
+        "import json, subprocess; from mindie_diagnostics import platform_service as p; "
+        "r = p._ps(subprocess.run, '@{sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;"
+        "label=\"\\u4e2d\\u6587\\u8def\\u5f84\\u2014\\u03bcs\"}|ConvertTo-Json -Compress', action='sid'); "
+        "d = json.loads(r.stdout); "
+        "assert d['sid'].startswith('S-1-') and d['label'] == '\\u4e2d\\u6587\\u8def\\u5f84\\u2014\\u03bcs', d; "
+        "print('UTF8_OK')"
     )
     flags = getattr(subprocess, "DETACHED_PROCESS", 0x00000008) | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
     proc = subprocess.run(
@@ -329,9 +427,11 @@ def test_windows_detached_headless_powershell_51_does_not_throw_ioexception():
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=20,
         creationflags=flags,
         check=False,
     )
     assert proc.returncode == 0, proc.stderr
-    assert proc.stdout.strip().startswith("S-1-")
+    assert "UTF8_OK" in proc.stdout

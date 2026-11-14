@@ -39,7 +39,7 @@ import sys
 import tempfile
 import time
 
-from .filesystem import is_pe_executable, is_wsl_drvfs_fixed_mode, which_native
+from .filesystem import is_pe_executable, which_native
 
 UNIT = "mindie-diagnostics.service"
 MARKER = "# Owned by mindie-diagnostics user-service schema=1\n"
@@ -225,7 +225,7 @@ def _environment_file(value):
         raise ServiceError("unsafe_environment_file")
     info = path.stat()
     if (not stat.S_ISREG(info.st_mode)
-            or (stat.S_IMODE(info.st_mode) != 0o600 and not is_wsl_drvfs_fixed_mode(path))
+            or stat.S_IMODE(info.st_mode) != 0o600
             or info.st_uid != os.geteuid()):
         raise ServiceError("unsafe_environment_file")
     return path

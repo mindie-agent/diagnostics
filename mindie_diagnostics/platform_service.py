@@ -12,14 +12,15 @@ Linux / WSL2 (`~/.config/mindie-agent/diagnostics-service`) using a JSON manifes
   or service start/stop mutation.
 - On macOS, `_await_bootout` confirms label removal (`launchctl print` exit 113)
   before running `launchctl bootstrap`.
-- On Linux local supervision, worker PIDs are verified against `/proc/<pid>/stat`
-  `starttime` so recycled PIDs are never signaled or mistaken for active workers.
+- On Linux local supervision, worker PIDs are verified against `boot_id`, UID,
+  and `/proc/<pid>/stat` `starttime` so recycled PIDs are never signaled.
 
 [Timeouts & Locks]
 - `_locked` acquires an exclusive `flock`/`msvcrt` lock on `.lock` with a 10s
   default ceiling capped by `runner.deadline`.
-- `_await_bootout` and `_linux_stop_worker` bound stop waits to 3.0s capped by
-  `runner.deadline`.
+- `_await_bootout` bounds macOS unload waits to 3.0s; `_linux_stop_worker`
+  requires `_WORKER_STOP_DRAIN + 0.5s` (`5.5s`) before signaling `SIGTERM` so
+  in-flight `gh` transport child cleanup (`2.0s` grace) is never truncated.
 
 [Side-Effect Policy]
 - If writing the updated unit or manifest fails after stopping the previous
@@ -398,9 +399,10 @@ def _linux_local_status(manifest: Path, config) -> dict:
 def _linux_stop_worker(manifest: Path, config, *, deadline=None) -> None:
     status = _linux_local_status(manifest, config)
     if status["returncode"] == 0:
-        pid = status["pid"]
-        identity = status["identity"]
+        pid, identity = status["pid"], status["identity"]
         if _linux_worker_alive(pid, identity):
+            if deadline is not None and deadline - time.monotonic() < _WORKER_STOP_DRAIN + 0.5:
+                raise common.ServiceError("command_timeout", action="local.stop")
             try:
                 os.kill(pid, signal.SIGTERM)
             except ProcessLookupError:
@@ -410,8 +412,6 @@ def _linux_stop_worker(manifest: Path, config, *, deadline=None) -> None:
             except OSError:
                 pass
             stop = time.monotonic() + _WORKER_STOP_DRAIN
-            if deadline is not None:
-                stop = min(stop, deadline)
             while _linux_worker_alive(pid, identity) and time.monotonic() < stop:
                 time.sleep(0.025)
             if _linux_worker_alive(pid, identity):
@@ -653,17 +653,16 @@ def install_service(roots, state, repository, *, python=None, gh=None, interval=
                 _launchctl(runner, "kickstart", _domain(label))
         else:
             manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
+            stale_worker = start and loaded["returncode"] == 0 and (changed or loaded.get("config_sha256") != manifest_sha)
+            if stale_worker:
+                common._check_reporting_consent(reporting_config, expected_consent_revision)
+                _linux_stop_worker(manifest, existing or config, deadline=getattr(runner, "deadline", None))
             if changed:
                 common._check_reporting_consent(reporting_config, expected_consent_revision)
                 _publish_unit_and_manifest(unit, payload, manifest, manifest_bytes)
-            if start:
-                stale_worker = loaded["returncode"] == 0 and (changed or loaded.get("config_sha256") != manifest_sha)
-                if stale_worker:
-                    common._check_reporting_consent(reporting_config, expected_consent_revision)
-                    _linux_stop_worker(manifest, existing or config, deadline=getattr(runner, "deadline", None))
-                if stale_worker or loaded["returncode"] != 0:
-                    common._check_reporting_consent(reporting_config, expected_consent_revision)
-                    _linux_start_worker(manifest, launcher, config["launch_args"], config_sha256=manifest_sha)
+            if start and (stale_worker or loaded["returncode"] != 0):
+                common._check_reporting_consent(reporting_config, expected_consent_revision)
+                _linux_start_worker(manifest, launcher, config["launch_args"], config_sha256=manifest_sha)
         return {"status": "installed", "unit": str(unit), "manifest": str(manifest), "task_name": label,
                 "since": fixed_since, "changed": changed, "start_requested": start, "python": str(interpreter),
                 "package_version": version, "state": str(state), "platform": sys.platform}

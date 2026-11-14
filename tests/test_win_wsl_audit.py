@@ -140,7 +140,7 @@ def test_wsl_which_native_and_gh_transport_skip_pe_and_drvfs_shims(tmp_path, mon
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX / WSL2 DrvFS mode bit checks")
-def test_wsl_drvfs_tolerates_unmodifiable_mode_bits_while_metadata_and_native_fail_closed(tmp_path, monkeypatch):
+def test_wsl_drvfs_and_native_fail_closed_for_worker_runtime_and_credentials(tmp_path, monkeypatch):
     monkeypatch.setattr(filesystem.sys, "platform", "linux")
     euid = os.geteuid()
     drvfs_root = tmp_path / "mnt_c" / "workspace"
@@ -161,28 +161,35 @@ def test_wsl_drvfs_tolerates_unmodifiable_mode_bits_while_metadata_and_native_fa
     )
     monkeypatch.setattr(filesystem, "_MOUNTINFO_PATH", str(mountinfo))
 
+    # Unmetadata'd DrvFS synthetic mount UID does NOT establish private access -> 0777/0666 MUST fail closed!
     drvfs_dir = drvfs_root / "runtime_dir"
     drvfs_dir.mkdir()
     drvfs_dir.chmod(0o777)
-    reporting_runtime._require_dir(drvfs_dir, fallback._owned)
+    with pytest.raises(RuntimeError, match="runtime_untrusted"):
+        reporting_runtime._require_dir(drvfs_dir, fallback._owned)
 
     drvfs_env = drvfs_root / "mindie-network.env"
     drvfs_env.write_text('HTTPS_PROXY="http://proxy.example.com:8080"\n', encoding="utf-8")
     drvfs_env.chmod(0o777)
-    assert service._environment_file(drvfs_env) == drvfs_env.absolute()
+    with pytest.raises(service.ServiceError, match="unsafe_environment_file"):
+        service._environment_file(drvfs_env)
 
-    # DrvFS mounts with `metadata` enabled enforce Linux permissions -> 0777 / 0666 MUST fail closed!
+    # DrvFS mounts with `metadata` enabled succeed ONLY when truly 0700/0600, and fail closed on 0777/0666
     meta_dir = drvfs_meta_root / "runtime_dir"
     meta_dir.mkdir()
     meta_dir.chmod(0o777)
     with pytest.raises(RuntimeError, match="runtime_untrusted"):
         reporting_runtime._require_dir(meta_dir, fallback._owned)
+    meta_dir.chmod(0o700)
+    reporting_runtime._require_dir(meta_dir, fallback._owned)
 
     meta_env = drvfs_meta_root / "mindie-network.env"
     meta_env.write_text('HTTPS_PROXY="http://proxy.example.com:8080"\n', encoding="utf-8")
     meta_env.chmod(0o666)
     with pytest.raises(service.ServiceError, match="unsafe_environment_file"):
         service._environment_file(meta_env)
+    meta_env.chmod(0o600)
+    assert service._environment_file(meta_env) == meta_env.absolute()
 
     # Symlinks on DrvFS must still be rejected
     drvfs_link = drvfs_root / "linked.env"
@@ -449,30 +456,24 @@ def test_round2_systemctl_rejection_and_symlink_drvfs_and_stat_timeout(tmp_path,
     pe_header[64:68] = b"PE\x00\x00"
     pe_systemctl.write_bytes(bytes(pe_header))
     pe_systemctl.chmod(0o755)
-    monkeypatch.setenv("PATH", str(shim_dir))
-    invoked = []
+    with pytest.MonkeyPatch.context() as mp_path:
+        mp_path.setenv("PATH", str(shim_dir))
+        invoked = []
 
-    def real_like_runner(argv, **kwargs):
-        invoked.append(argv)
-        return subprocess.CompletedProcess(argv, 0, "", "")
+        def real_like_runner(argv, **kwargs):
+            invoked.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "", "")
 
-    real_like_runner._is_real_runner = True
-    with pytest.raises(service.ServiceError) as exc_info:
-        service._systemctl(real_like_runner, "show", "mindie-diagnostics.service", check=False)
-    assert exc_info.value.category == "command_unavailable"
-    assert invoked == []
+        real_like_runner._is_real_runner = True
+        with pytest.raises(service.ServiceError) as exc_info:
+            service._systemctl(real_like_runner, "show", "mindie-diagnostics.service", check=False)
+        assert exc_info.value.category == "command_unavailable"
+        assert invoked == []
 
-    # 2. Ancestor symlink under fixed-mode DrvFS pointing to native ext4 must NOT exempt permissions
+    # 2. Strict realpath resolution in is_wsl_drvfs propagates os.lstat TimeoutError
     uid = os.geteuid()
     drvfs_root = tmp_path / "mnt_c"
-    native_root = tmp_path / "ext4_secret"
     drvfs_root.mkdir()
-    native_root.mkdir()
-    secret_file = native_root / "credentials.env"
-    secret_file.write_text("TOKEN=1\n", encoding="utf-8")
-    link_dir = drvfs_root / "link_to_ext4"
-    link_dir.symlink_to(native_root)
-
     fake_mountinfo = tmp_path / "mountinfo"
     fake_mountinfo.write_text(
         f"20 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw\n"
@@ -481,8 +482,11 @@ def test_round2_systemctl_rejection_and_symlink_drvfs_and_stat_timeout(tmp_path,
     )
     monkeypatch.setattr(filesystem, "sys", type("S", (), {"platform": "linux"})())
     monkeypatch.setattr(filesystem, "_MOUNTINFO_PATH", str(fake_mountinfo))
-    assert filesystem.is_wsl_drvfs_fixed_mode(drvfs_root / "plain.txt") is True
-    assert filesystem.is_wsl_drvfs_fixed_mode(link_dir / "credentials.env") is False
+    assert filesystem.is_wsl_drvfs(drvfs_root / "gh") is True
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(filesystem.os, "lstat", lambda p, *a, **kw: (_ for _ in ()).throw(TimeoutError("lstat_deadline")))
+        with pytest.raises(TimeoutError, match="lstat_deadline"):
+            filesystem.is_wsl_drvfs(drvfs_root / "link" / "gh")
 
     # 3. TimeoutError during os.stat inside which_native must propagate
     with pytest.MonkeyPatch.context() as mp:
@@ -490,5 +494,25 @@ def test_round2_systemctl_rejection_and_symlink_drvfs_and_stat_timeout(tmp_path,
         with pytest.raises(TimeoutError, match="stat_deadline"):
             filesystem.which_native("gh", path=str(tmp_path))
 
-    # 4. Worker drain budget exceeds github_transport 2.0s SIGTERM grace + 3.0s margin
+    # 4. Insufficient remaining deadline fails closed BEFORE signaling worker or unlinking worker-process.json
     assert platform_service._WORKER_STOP_DRAIN >= 5.0
+    manifest = tmp_path / "mindie-diagnostics-service.json"
+    manifest.write_text("{}", encoding="utf-8")
+    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        identity = platform_service._linux_worker_identity(sleeper.pid)
+        expected_prefix = "proc:" if sys.platform.startswith("linux") else "ps:"
+        assert identity and identity.startswith(expected_prefix)
+        pid_file = platform_service._pid_path(manifest)
+        pid_file.write_text(
+            json.dumps({"manifest": str(manifest), "pid": sleeper.pid, "identity": identity, "config_sha256": "a" * 64}),
+            encoding="utf-8",
+        )
+        with pytest.raises(service.ServiceError) as stop_exc:
+            platform_service._linux_stop_worker(manifest, {"ok": True}, deadline=time.monotonic() + 0.25)
+        assert stop_exc.value.category == "command_timeout"
+        assert sleeper.poll() is None
+        assert pid_file.is_file()
+    finally:
+        sleeper.terminate()
+        sleeper.wait(timeout=5)

@@ -100,10 +100,9 @@ def _is_drvfs_entry(fstype: str, source: str, super_opts: str) -> bool:
     return False
 
 
-def _parse_drvfs_mounts(raw_mountinfo: str) -> list[tuple[str, bool, bool]]:
-    """Return `(mount_point, is_drvfs, fixed_mode_for_euid)` entries from mountinfo."""
-    euid = os.geteuid() if hasattr(os, "geteuid") else -1
-    mounts: list[tuple[str, bool, bool]] = []
+def _parse_drvfs_mounts(raw_mountinfo: str) -> list[tuple[str, bool]]:
+    """Return `(mount_point, is_drvfs)` entries from `/proc/self/mountinfo`."""
+    mounts: list[tuple[str, bool]] = []
     for line in raw_mountinfo.splitlines():
         lhs, sep, rhs = line.partition(" - ")
         if not sep:
@@ -114,18 +113,32 @@ def _parse_drvfs_mounts(raw_mountinfo: str) -> list[tuple[str, bool, bool]]:
             continue
         mount_point = _unescape_mount_path(lhs_parts[4])
         on_drvfs = _is_drvfs_entry(rhs_parts[0], rhs_parts[1], rhs_parts[2])
-        fixed_mode = False
-        if on_drvfs:
-            tokens = [tok.strip() for tok in re.split(r"[,;]", f"{lhs_parts[5]},{rhs_parts[2]}") if tok.strip()]
-            has_metadata = "metadata" in tokens
-            uid_tokens = [tok.split("=", 1)[1] for tok in tokens if tok.startswith("uid=")]
-            uid_matches = bool(uid_tokens) and all(tok.isdigit() and int(tok) == euid for tok in uid_tokens)
-            fixed_mode = (not has_metadata) and uid_matches
-        mounts.append((mount_point, on_drvfs, fixed_mode))
+        mounts.append((mount_point, on_drvfs))
     return mounts
 
 
-def _match_drvfs_mount(value, *, require_fixed_mode: bool) -> bool:
+def _strict_realpath(raw_text: str) -> str | None:
+    """Resolve symlinks via `strict=True` so `os.lstat` `TimeoutError` propagates."""
+    probe = os.path.abspath(raw_text)
+    suffix: list[str] = []
+    while True:
+        try:
+            resolved = os.path.realpath(probe, strict=True)
+            return os.path.join(resolved, *reversed(suffix)) if suffix else resolved
+        except TimeoutError:
+            raise
+        except (FileNotFoundError, NotADirectoryError):
+            parent, name = os.path.split(probe)
+            if not name or parent == probe:
+                return None
+            suffix.append(name)
+            probe = parent
+        except OSError:
+            return None
+
+
+def is_wsl_drvfs(value) -> bool:
+    """Return True when `value` (or its symlink target) lives on any WSL DrvFS mount."""
     if not sys.platform.startswith("linux"):
         return False
     try:
@@ -138,35 +151,21 @@ def _match_drvfs_mount(value, *, require_fixed_mode: bool) -> bool:
     if not mounts:
         return False
     raw_text = os.fspath(value)
-    try:
-        real = os.path.realpath(raw_text)
-    except TimeoutError:
-        raise
-    except OSError:
-        real = os.path.abspath(raw_text)
-    candidates = [real] if require_fixed_mode else list(dict.fromkeys([os.path.abspath(raw_text), real]))
+    abs_target = os.path.abspath(raw_text)
+    real_target = _strict_realpath(raw_text)
+    candidates = [abs_target] if not real_target or real_target == abs_target else [abs_target, real_target]
     for target in candidates:
         best_len = -1
         best_flag = False
-        for mount_point, on_drvfs, fixed_mode in mounts:
+        for mount_point, on_drvfs in mounts:
             prefix = "/" if mount_point == "/" else mount_point.rstrip("/")
             if target == prefix or (prefix == "/" and target.startswith("/")) or target.startswith(prefix + "/"):
                 if len(prefix) > best_len:
                     best_len = len(prefix)
-                    best_flag = fixed_mode if require_fixed_mode else on_drvfs
+                    best_flag = on_drvfs
         if best_flag:
             return True
     return False
-
-
-def is_wsl_drvfs(value) -> bool:
-    """Return True when `value` (or its symlink target) lives on any WSL DrvFS mount."""
-    return _match_drvfs_mount(value, require_fixed_mode=False)
-
-
-def is_wsl_drvfs_fixed_mode(value) -> bool:
-    """Return True only when the resolved target lives on single-owner fixed-mode WSL DrvFS."""
-    return _match_drvfs_mount(value, require_fixed_mode=True)
 
 
 def _is_exec_regular_file(path_str: str) -> bool:

@@ -37,7 +37,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from .fallback import _private_mkdir
-from .filesystem import is_wsl_drvfs_fixed_mode, path_identity
+from .filesystem import path_identity
 
 _PKG = "mindie_diagnostics"
 _DIST = "mindie-diagnostics"
@@ -205,7 +205,7 @@ def _require_dir(path, owned):
     st = path.stat()
     if not owned(st):
         _fail("runtime_untrusted")
-    if os.name != "nt" and stat.S_IMODE(st.st_mode) != _DIR and not is_wsl_drvfs_fixed_mode(path):
+    if os.name != "nt" and stat.S_IMODE(st.st_mode) != _DIR:
         _fail("runtime_untrusted")
 
 

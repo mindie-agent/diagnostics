@@ -10,7 +10,7 @@ paths, commands, environment variables, and unapproved attributes.
 - Allowlist-only projection (`_NUMERIC`, `_BOOLEAN`, `_LABELS`, `_HASHES`);
   any record failing `scan_text` redaction verification is dropped (`None`).
 - `export_issue_event` strips local correlation keys (`operation_id`, `trace_id`,
-  `monotonic_ns`, `process_instance_id`) before external publication.
+  `monotonic_ns`, `process_instance_id`, `invocation_token`) before external publication.
 - Output size is strictly bounded by `max_bytes` (default `1 MiB`); older events
   are clipped from the front rather than emitting partial JSON.
 
@@ -50,15 +50,19 @@ _LABEL = re.compile(r"[A-Za-z][A-Za-z0-9_.:-]{0,119}\Z")
 _LOG = re.compile(r"[0-9]+-[0-9a-f]{32}\.jsonl(?:\.[1-3])?\Z")
 _COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}\Z")
 _NUMERIC = frozenset({"duration_ms", "elapsed_ms", "input_bytes", "output_bytes", "bytes", "count",
-                      "attempt", "exit_code", "errno", "file_count", "dropped_count", "timeout_seconds", "omitted_bytes"})
+                      "attempt", "exit_code", "errno", "file_count", "dropped_count", "timeout_seconds",
+                      "omitted_bytes", "http_status"})
 _BOOLEAN = frozenset({"retryable", "quiet", "resources_released", "cache_hit", "ready", "timed_out",
-                      "attributes_omitted"})
-_LABELS = frozenset({"category", "submission_state", "error_type", "error_code", "tool", "stage", "status", "reason", "path"})
+                      "attributes_omitted", "stack_truncated", "stack_incomplete"})
+_LABELS = frozenset({"category", "submission_state", "error_type", "error_code", "tool", "stage", "status",
+                     "reason", "path", "platform", "arch", "py_version", "diagnostics_version", "substage",
+                     "reason_code", "contract_name", "soc_generation", "harness"})
 _HASHES = frozenset({"source_sha256", "content_sha256"})
 _TOP = frozenset({"schema", "timestamp", "monotonic_ns", "pid", "component", "severity", "event",
                   "operation_id", "trace_id", "parent_operation_id", "operation", "status",
                   "duration_ms", "attributes", "phase_id", "phase", "parent_phase_id", "process_ref",
-                  "process_instance_id", "package_version", "package_revision", "clock_domain_unknown"})
+                  "process_instance_id", "package_version", "package_revision", "clock_domain_unknown",
+                  "invocation_token"})
 
 
 def _canonical(payload):
@@ -166,21 +170,49 @@ def _project(record, *, correlation=True):
             safe[key] = [name for name in value[:8] if _label(name) is not None]
         elif key == "stack_frames" and isinstance(value, list):
             frames = []
-            for frame in value[:24]:
+            truncated = len(value) > 256
+            for frame in value[-256:]:
                 if not isinstance(frame, dict):
                     continue
                 module, function, line = frame.get("module"), frame.get("function"), frame.get("line")
                 if not isinstance(module, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]{0,159}", module):
                     continue
                 package = module.split(".")[0]
-                if not (package.startswith("mindie_") or package == "remote_dev" or package in sys.stdlib_module_names):
+                if not (package.startswith("mindie_") or package in {"remote_dev", "npu_top"} or package in sys.stdlib_module_names):
                     continue
-                if not isinstance(function, str) or not re.fullmatch(r"(?:[A-Za-z_][A-Za-z0-9_]{0,99}|<module>|<lambda>)", function):
+                if not isinstance(function, str) or not re.fullmatch(
+                    r"(?:[A-Za-z_][A-Za-z0-9_]{0,99}|<module>|<lambda>|<listcomp>|<dictcomp>|<setcomp>|<genexpr>)",
+                    function,
+                ):
                     continue
                 if type(line) is not int or not 0 < line < 10**7 or scan_text(module + " " + function):
                     continue
-                frames.append({"package": package, "module": module, "function": function, "line": line})
+                entry = {"package": package, "module": module, "function": function, "line": line}
+                if frame.get("init") is True:
+                    entry["init"] = True
+                frames.append(entry)
+            if len(frames) > 24:
+                truncated = True
+                frames = frames[-24:]
             safe[key] = frames
+            if truncated:
+                safe["stack_truncated"] = True
+        elif key == "phases" and isinstance(value, list):
+            phases = []
+            for item in value[:16]:
+                if not isinstance(item, dict):
+                    continue
+                phase = _label(item.get("phase"))
+                status = item.get("status")
+                if phase is None or status not in {"pending", "running", "success", "error", "cancelled", "skipped"}:
+                    continue
+                entry = {"phase": phase, "status": status}
+                dur = item.get("duration_ms")
+                if _number(dur) and dur >= 0:
+                    entry["duration_ms"] = dur
+                phases.append(entry)
+            if phases:
+                safe[key] = phases
         else:
             omitted += 1
     result["attributes"] = safe
@@ -233,12 +265,15 @@ def _write_output(path, raw):
             os.unlink(stage)
 
 
-def collect_bundle(root, *, operation_id=None, output=None, max_bytes=MAX_BYTES, records=(), include_logs=True):
+def collect_bundle(root=None, *, operation_id=None, output=None, max_bytes=MAX_BYTES, records=(), include_logs=True):
     """Read existing event segments only. No live probes, install or repair."""
     if type(max_bytes) is not int or not 2048 <= max_bytes <= 32 * MAX_BYTES:
         raise ValueError("max_bytes must be between 2048 and 33554432")
     if operation_id is not None and (not isinstance(operation_id, str) or not _ID.fullmatch(operation_id)):
         raise ValueError("invalid diagnostic operation identifier")
+    if root is None:
+        from .fallback import default_root
+        root = default_root()
     root = Path(root).expanduser().absolute()
     if any(parent.is_symlink() for parent in (root, *root.parents)):
         raise ValueError("bundle root must not traverse symlinks")

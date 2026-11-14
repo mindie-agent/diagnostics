@@ -26,19 +26,7 @@
 
 from __future__ import annotations
 
-import errno
-import hashlib
-import json
-import math
-import os
-import re
-import stat
-import sys
-import threading
-import time
-import uuid
-import subprocess
-import urllib.error
+import errno, hashlib, json, math, os, platform as _platform, re, stat, subprocess, sys, threading, time, urllib.error, uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -48,12 +36,12 @@ _MAX_POLICY_BYTES = 16384
 _MAX_EVENT_BYTES = 16384
 _MAX_FILE_BYTES = 1024 * 1024
 _LABEL_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.:-]{0,119}\Z")
+_REASON_CODE_RE = re.compile(r"[a-z][a-z0-9_]{0,63}\Z")
+_SOC_GENERATIONS = frozenset({"a2", "a3", "a5"})
 _INCIDENT_RE = re.compile(r"[0-9a-f]{32}\Z")
 _REVISION_RE = re.compile(r"[0-9a-f]{7,64}\Z")
 _VERSION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:+-]{0,79}\Z")
-_REPO_RE = re.compile(
-    r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z"
-)
+_REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z")
 _ERROR_TYPE_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,119}\Z")
 _NEVER_REPORTABLE = frozenset({
     "caller",
@@ -194,7 +182,7 @@ def read_policy(config=None):
             elif authority["choice_revision"] != policy.get("consent_revision"):
                 policy["decision"] = "disabled"
         return policy
-    except PolicyUnavailable:
+    except (PolicyUnavailable, TimeoutError):
         raise
     except (OSError, ValueError, TypeError) as exc:
         raise PolicyUnavailable() from exc
@@ -303,6 +291,19 @@ def scope_key(public_fingerprint, reference) -> str:
         return ""
 
 
+def _runtime_envelope() -> dict:
+    plat = ("win32" if sys.platform == "win32" else "darwin" if sys.platform == "darwin"
+            else "linux" if sys.platform.startswith("linux") else None)
+    raw_arch = (_platform.machine() or "").lower()
+    arch = "x86_64" if raw_arch in {"x86_64", "amd64"} else "arm64" if raw_arch in {"aarch64", "arm64"} else None
+    env = {"py_version": f"py{sys.version_info.major}.{sys.version_info.minor}"}
+    if plat:
+        env["platform"] = plat
+    if arch:
+        env["arch"] = arch
+    return env
+
+
 def record_failure(
     component,
     operation,
@@ -318,58 +319,33 @@ def record_failure(
     reportable=True,
     root=None,
     incident_id=None,
+    reason_code=None,
+    substage=None,
+    contract_name=None,
+    soc_generation=None,
+    harness=None,
 ) -> dict:
     """Record one local operation failure. Never raises or masks the caller."""
     try:
         if _valid_incident(incident_id):
-            return {
-                "recorded": True,
-                "incident_id": incident_id,
-                "logging_failed": False,
-            }
+            return {"recorded": True, "incident_id": incident_id, "logging_failed": False}
         fresh = uuid.uuid4().hex
         event = _build_event(
-            fresh,
-            component,
-            operation,
-            stage=stage,
-            category=category,
-            exception=exception,
-            host=host,
-            revision=revision,
-            version=version,
-            elapsed_ms=elapsed_ms,
-            exit_code=exit_code,
-            reportable=reportable,
+            fresh, component, operation, stage=stage, category=category, exception=exception,
+            host=host, revision=revision, version=version, elapsed_ms=elapsed_ms,
+            exit_code=exit_code, reportable=reportable, reason_code=reason_code,
+            substage=substage, contract_name=contract_name, soc_generation=soc_generation,
+            harness=harness,
         )
         if event is None:
-            return {
-                "recorded": False,
-                "incident_id": None,
-                "logging_failed": False,
-                "error": "invalid_arguments",
-            }
+            return {"recorded": False, "incident_id": None, "logging_failed": False, "error": "invalid_arguments"}
         if _append_event(root, component, event):
-            return {
-                "recorded": True,
-                "incident_id": fresh,
-                "logging_failed": False,
-            }
+            return {"recorded": True, "incident_id": fresh, "logging_failed": False}
         _warn_once()
-        return {
-            "recorded": False,
-            "incident_id": None,
-            "logging_failed": True,
-            "error": "logging_failed",
-        }
+        return {"recorded": False, "incident_id": None, "logging_failed": True, "error": "logging_failed"}
     except Exception:
         _warn_once()
-        return {
-            "recorded": False,
-            "incident_id": None,
-            "logging_failed": True,
-            "error": "logging_failed",
-        }
+        return {"recorded": False, "incident_id": None, "logging_failed": True, "error": "logging_failed"}
 
 
 def update_failure_policy(exception):
@@ -377,10 +353,16 @@ def update_failure_policy(exception):
 
     A broken helper or artifact is a product fault. Transport, credentials,
     cancellation and local prerequisites stay visible locally. Wrappers may
-    preserve a typed transport cause without copying its private message.
+    preserve a typed transport cause or context without copying its private message.
     """
-    current = exception
-    for _ in range(8):
+    seen: set[int] = set()
+    pending = [exception]
+    saw_import_error = False
+    while pending and len(seen) < 32:
+        current = pending.pop(0)
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
         code = getattr(current, "code", None)
         category = getattr(current, "category", None)
         if code in {"release_transport_unavailable", "release_http_error"}:
@@ -400,12 +382,32 @@ def update_failure_policy(exception):
         if isinstance(current, OSError) and current.errno in {errno.ENOSPC, errno.EROFS, errno.EMFILE, errno.ENFILE}:
             return "prerequisite", False, "update_prerequisite_unavailable"
         if isinstance(current, ImportError):
-            return "internal", True, "runtime_dependency_missing"
+            saw_import_error = True
         cause = getattr(current, "__cause__", None)
-        if cause is None:
-            break
-        current = cause
+        if cause is not None:
+            pending.append(cause)
+        if not getattr(current, "__suppress_context__", False):
+            ctx = getattr(current, "__context__", None)
+            if ctx is not None:
+                pending.append(ctx)
+    if pending:
+        return "prerequisite", False, "update_prerequisite_unavailable"
+    if saw_import_error:
+        return "internal", True, "runtime_dependency_missing"
     return "internal", True, "update_internal_failure"
+
+
+def _extract_chain_reason_code(exception) -> str | None:
+    current = exception
+    for _ in range(8):
+        if current is None:
+            break
+        for attr in ("reason_code", "code"):
+            val = getattr(current, attr, None)
+            if isinstance(val, str) and _REASON_CODE_RE.fullmatch(val):
+                return val
+        current = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+    return None
 
 
 def _public_os_attributes(exception, attributes):
@@ -434,6 +436,11 @@ def _build_event(
     elapsed_ms,
     exit_code,
     reportable,
+    reason_code=None,
+    substage=None,
+    contract_name=None,
+    soc_generation=None,
+    harness=None,
 ):
     if not _label(component, 80) or not _label(operation, 120):
         return None
@@ -445,9 +452,24 @@ def _build_event(
     if category == "update":
         category, eligible, error_code = update_failure_policy(exception)
         reportable = reportable and eligible
-    attributes = {"stage": stage, "category": category}
+    attributes = {**_runtime_envelope(), "stage": stage, "category": category}
     if error_code is not None:
         attributes["error_code"] = error_code
+    if reason_code is None and exception is not None:
+        reason_code = _extract_chain_reason_code(exception)
+    if reason_code is not None:
+        if not isinstance(reason_code, str) or _REASON_CODE_RE.fullmatch(reason_code) is None:
+            return None
+        attributes["reason_code"] = reason_code
+    for key, val in (("substage", substage), ("contract_name", contract_name), ("harness", harness)):
+        if val is not None:
+            if not _label(val, 120):
+                return None
+            attributes[key] = val
+    if soc_generation is not None:
+        if soc_generation not in _SOC_GENERATIONS:
+            return None
+        attributes["soc_generation"] = soc_generation
     if exception is not None:
         error_type = type(exception).__name__
         if not isinstance(error_type, str) or _ERROR_TYPE_RE.fullmatch(error_type) is None:
@@ -458,6 +480,21 @@ def _build_event(
         if not _label(host, 120):
             return None
         attributes["host"] = host
+        mapped_harness = {
+            "codex": "codex",
+            "claude-code": "claude_code",
+            "claude_code": "claude_code",
+            "kimi": "kimi",
+            "dsh": "dsh",
+            "antigravity": "antigravity",
+            "agy": "antigravity",
+            "workbuddy": "workbuddy",
+            "wb": "workbuddy",
+            "opencode": "opencode",
+            "oc": "opencode",
+        }.get(host)
+        if mapped_harness and "harness" not in attributes:
+            attributes["harness"] = mapped_harness
     if exit_code is not None:
         code = _int32(exit_code)
         if code is None:
@@ -498,6 +535,9 @@ def _build_event(
     event["attributes"] = attributes
     event["reportable"] = effective
     event["reporting"] = consent
+    inv_tok = os.environ.get("MINDIE_DIAGNOSTICS_INVOCATION_TOKEN")
+    if effective and isinstance(inv_tok, str) and _INCIDENT_RE.fullmatch(inv_tok):
+        event["invocation_token"] = inv_tok
     if package_revision is not None:
         event["package_revision"] = package_revision
     if package_version is not None:

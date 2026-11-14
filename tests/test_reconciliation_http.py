@@ -79,12 +79,20 @@ def github_http(tmp_path, monkeypatch, reporting_consent):
             assert parsed.path == f"/repos/{state.repository}/issues"
             assert query["state"] == ["all"]
             assert query["sort"] == ["created"]
-            assert query["direction"] == ["desc"]
-            since = query["since"][0]
-            rows = sorted(
-                (row for row in state.issues if row["updated_at"] > since),
-                key=lambda row: row["created_at"], reverse=True,
-            )
+            direction = query["direction"][0]
+            assert direction in {"asc", "desc"}
+            if direction == "desc":
+                since = query["since"][0]
+                rows = sorted(
+                    (row for row in state.issues if row["updated_at"] > since),
+                    key=lambda row: row["created_at"], reverse=True,
+                )
+            else:
+                assert "since" not in query
+                rows = sorted(
+                    state.issues,
+                    key=lambda row: (row["created_at"], row["number"]),
+                )
             size, page = int(query["per_page"][0]), int(query["page"][0])
             self._reply(rows[(page - 1) * size:page * size])
 
@@ -194,11 +202,10 @@ def test_search_positive_confirms_old_issue_without_listing_or_post(
     assert not github_http.posts
 
 
-@pytest.mark.parametrize("uncertain", [False, True])
 def test_delayed_search_index_uses_since_listing_to_find_issue(
-    tmp_path, reporting_consent, github_http, uncertain,
+    tmp_path, reporting_consent, github_http,
 ):
-    queue, _ = _queued(tmp_path, reporting_consent, uncertain=uncertain)
+    queue, _ = _queued(tmp_path, reporting_consent, uncertain=True)
     github_http.incomplete = True
     existing = _issue(github_http.repository, 21, body=_marker(), created=_NOW + 1)
     github_http.issues = [
@@ -212,9 +219,39 @@ def test_delayed_search_index_uses_since_listing_to_find_issue(
     assert not github_http.posts
     listing = _list_calls(github_http)
     assert len(listing) == 1
-    lower = _NOW if uncertain else _NOW - 86400 * 30
-    assert listing[0][2]["since"] == [_iso(lower - 301)]
+    assert listing[0][2]["direction"] == ["desc"]
+    assert listing[0][2]["since"] == [_iso(_NOW - 301)]
     assert sum(github_http.response_bytes) < 4096
+
+
+def test_historical_discovery_scans_old_issues_across_pages_with_retained_cursor(
+    tmp_path, reporting_consent, github_http,
+):
+    queue, now = _queued(tmp_path, reporting_consent, uncertain=False)
+    github_http.incomplete = False
+    existing = _issue(
+        github_http.repository, 165, body=_marker(),
+        created=_NOW - 86400 * 90, updated=_NOW - 86400 * 90,
+    )
+    github_http.issues = [
+        _issue(github_http.repository, number, created=_NOW - 86400 * 120 + number)
+        for number in range(1, 165)
+    ] + [existing]
+
+    c1 = publish_one(queue, _client(github_http))
+    assert c1["status"] == "retry"
+    assert c1["error"] == "github_reconciliation_window_exhausted"
+    assert [int(call[2]["page"][0]) for call in _list_calls(github_http)] == [1, 2, 3, 4, 5]
+    assert all("since" not in call[2] and call[2]["direction"] == ["asc"] for call in _list_calls(github_http))
+    assert not github_http.posts
+
+    now[0] += 4000
+    github_http.calls.clear()
+    c2 = publish_one(queue, _client(github_http))
+    assert c2["status"] == "reconciled"
+    assert c2["issue_url"] == existing["html_url"]
+    assert [int(call[2]["page"][0]) for call in _list_calls(github_http)] == [5, 6]
+    assert not github_http.posts
 
 
 @pytest.mark.parametrize("uncertain", [False, True])
@@ -231,7 +268,11 @@ def test_delayed_index_finds_issue_created_and_updated_exactly_at_window_lower_b
 
     assert result["status"] == "reconciled"
     assert result["issue_url"] == existing["html_url"]
-    assert _list_calls(github_http)[0][2]["since"] == [_iso(lower - 1)]
+    if uncertain:
+        assert _list_calls(github_http)[0][2]["since"] == [_iso(lower - 1)]
+    else:
+        assert "since" not in _list_calls(github_http)[0][2]
+        assert _list_calls(github_http)[0][2]["direction"] == ["asc"]
     assert queue.rows()[0]["state"] == "published"
     assert not github_http.posts
 

@@ -516,3 +516,10 @@ def test_round2_systemctl_rejection_and_symlink_drvfs_and_stat_timeout(tmp_path,
     finally:
         sleeper.terminate()
         sleeper.wait(timeout=5)
+
+
+def test_reporter_reexports_create_no_window_guard():
+    from mindie_diagnostics import github_transport, reporter
+
+    assert reporter._CREATE_NO_WINDOW == github_transport._CREATE_NO_WINDOW
+    assert reporter._CREATE_NO_WINDOW == getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)

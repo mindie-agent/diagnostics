@@ -38,6 +38,8 @@ import time
 
 from .filesystem import which_native
 
+_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
 
 class TransportError(RuntimeError):
     def __init__(
@@ -111,10 +113,7 @@ def _run_gh(command, data, *, deadline, max_bytes, cancel=None):
                 stdin_fp.seek(0)
             popen_kwargs = {"stdin": stdin_fp, "stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "bufsize": 0}
             if os.name == "nt":
-                popen_kwargs["creationflags"] = (
-                    subprocess.CREATE_NEW_PROCESS_GROUP
-                    | getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                )
+                popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | _CREATE_NO_WINDOW
             else:
                 popen_kwargs["start_new_session"] = True
             try:

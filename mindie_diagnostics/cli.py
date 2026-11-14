@@ -88,8 +88,9 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(prog="mindie-diagnostics", description="Local diagnostics and independently enabled automatic issue reporting")
     sub = result.add_subparsers(dest="command", required=True)
     bundle = sub.add_parser("bundle", help="export a bounded sanitized support bundle, without uploading")
-    bundle.add_argument("--root", required=True)
+    bundle.add_argument("--root", default=None, help="optional diagnostic log root (defaults to platform local state root)")
     bundle.add_argument("--operation-id")
+    bundle.add_argument("--incident-id", help="alias for --operation-id to inspect a specific local incident")
     bundle.add_argument("--output")
     status = sub.add_parser("status", help="inspect the local publishing queue without network access")
     status.add_argument("--state", required=True)
@@ -179,7 +180,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if result.get("status") not in {"unknown", "error", "failed"} else 1
     if args.command == "bundle":
         from .bundle import collect_bundle
-        print(json.dumps(collect_bundle(args.root, operation_id=args.operation_id, output=args.output), ensure_ascii=True))
+        selected_op = args.incident_id if args.incident_id is not None else args.operation_id
+        print(json.dumps(collect_bundle(args.root, operation_id=selected_op, output=args.output), ensure_ascii=True))
         return 0
     state = Path(args.state).resolve()
     if args.command == "status":

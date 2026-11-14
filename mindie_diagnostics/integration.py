@@ -33,6 +33,7 @@ import stat
 import time
 import threading
 import uuid
+from collections import deque
 from pathlib import Path
 
 from . import fallback as f
@@ -54,6 +55,8 @@ def _module_name(component):
         return "mindie_knowledge"
     if component == "remote-dev":
         return "remote_dev"
+    if component == "npu-top":
+        return "npu_top"
     if not isinstance(component, str):
         return ""
     return component.replace("-", "_")
@@ -117,8 +120,27 @@ def _component_meta(component):
         return (None, None)
 
 
-def _frame_dict(frame, component_module, line=None):
+def _frame_dict(frame, component_module, line=None, source_root=None):
     name = frame.f_globals.get("__name__")
+    filename = frame.f_code.co_filename
+    is_init = isinstance(filename, str) and os.path.basename(filename.replace("\\", "/")) == "__init__.py"
+    if source_root and isinstance(filename, str) and os.path.isabs(filename):
+        path = os.path.normpath(filename)
+        try:
+            owned = os.path.commonpath((source_root, path)) == source_root
+        except ValueError:
+            owned = False
+        if owned:
+            rel = os.path.relpath(path, source_root)
+            if rel.endswith(".py"):
+                parts = [p for p in rel[:-3].replace("\\", "/").split("/") if p and p != "."]
+                if parts and parts[-1] == "__init__":
+                    parts.pop()
+                    is_init = True
+                if parts and parts[0] == component_module:
+                    name = ".".join(parts)
+                else:
+                    name = ".".join([component_module] + parts)
     if not isinstance(name, str) or _MODULE.fullmatch(name) is None:
         return None
     if name == "mindie_diagnostics.integration":
@@ -130,33 +152,52 @@ def _frame_dict(frame, component_module, line=None):
     if name != component_module and not name.startswith(component_module + "."):
         return None
     function = frame.f_code.co_name
-    if not isinstance(function, str) or _IDENT.fullmatch(function) is None:
+    if not isinstance(function, str) or (
+        _IDENT.fullmatch(function) is None
+        and function not in ("<module>", "<lambda>", "<listcomp>", "<dictcomp>", "<setcomp>", "<genexpr>")
+    ):
         return None
     line = frame.f_lineno if line is None else line
     if isinstance(line, bool) or not isinstance(line, int) or not 1 <= line <= 10000000:
         return None
-    return {"module": name, "function": function, "line": line}
+    out = {"module": name, "function": function, "line": line}
+    if is_init:
+        out["init"] = True
+    return out
 
 
-def _stack_frames(component, exception):
+def _stack_frames(component, exception, *, source_root=None):
     module = _module_name(component)
     if not module:
-        return []
+        return [], False, False
+    norm_root = os.path.normpath(os.fspath(source_root)) if source_root is not None else None
+    if norm_root is not None and not os.path.isabs(norm_root):
+        norm_root = None
     frames = []
+    truncated, incomplete = False, False
     tb = exception.__traceback__ if isinstance(exception, BaseException) else None
     if tb is not None:
+        tail_tbs = deque(maxlen=256)
         walked = 0
-        while tb is not None and walked < _MAX_FRAMES and len(frames) < _MAX_FRAMES:
-            item = _frame_dict(tb.tb_frame, module, tb.tb_lineno)
-            if item is not None:
-                frames.append(item)
+        while tb is not None and walked < 4096:
+            tail_tbs.append((tb.tb_frame, tb.tb_lineno))
             tb = tb.tb_next
             walked += 1
-        return frames
+        if walked > 256:
+            truncated = True
+        if tb is not None:
+            truncated, incomplete = True, True
+        for frm, lineno in tail_tbs:
+            item = _frame_dict(frm, module, lineno, source_root=norm_root)
+            if item is not None:
+                frames.append(item)
+        if len(frames) > _MAX_FRAMES:
+            truncated = True
+        return frames[-_MAX_FRAMES:], truncated, incomplete
     try:
         frame = sys._getframe(1)
     except ValueError:
-        return []
+        return [], False, False
     hops = 0
     while frame is not None and hops < 8:
         current = frame.f_globals.get("__name__")
@@ -165,22 +206,48 @@ def _stack_frames(component, exception):
         frame = frame.f_back
         hops += 1
     walked = 0
-    while frame is not None and walked < _MAX_FRAMES:
-        item = _frame_dict(frame, module)
+    while frame is not None and walked < 256:
+        item = _frame_dict(frame, module, source_root=norm_root)
         if item is not None:
             frames.append(item)
         frame = frame.f_back
         walked += 1
-    return frames
+    if frame is not None or len(frames) > _MAX_FRAMES:
+        truncated = True
+    frames.reverse()
+    return frames[-_MAX_FRAMES:], truncated, False
 
 
-def _attach_frames(event, component, exception):
-    frames = _stack_frames(component, exception)
+def _attach_frames(event, component, exception, *, source_root=None):
+    frames, truncated, incomplete = _stack_frames(component, exception, source_root=source_root)
     if not frames:
         return
     canonical = json.dumps(frames, ensure_ascii=True, separators=(",", ":"), allow_nan=False)
     event["attributes"]["stack_frames"] = frames
     event["attributes"]["stack_fingerprint"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    if truncated or incomplete:
+        event["attributes"]["stack_truncated"] = True
+    if incomplete:
+        event["attributes"]["stack_incomplete"] = True
+
+
+def _sanitize_phases(phases) -> list[dict]:
+    if not isinstance(phases, (list, tuple)):
+        return []
+    clean = []
+    for item in phases[-16:]:
+        if not isinstance(item, dict):
+            continue
+        phase = item.get("phase")
+        status = item.get("status")
+        if not f._label(phase, 120) or status not in {"pending", "running", "success", "error", "cancelled", "skipped"}:
+            continue
+        entry = {"phase": phase, "status": status}
+        dur = f._duration(item.get("duration_ms"))
+        if dur is not None:
+            entry["duration_ms"] = dur
+        clean.append(entry)
+    return clean
 
 
 def record_failure(
@@ -200,76 +267,55 @@ def record_failure(
     incident_id=None,
     source_root=None,
     evidence=None,
+    reason_code=None,
+    substage=None,
+    contract_name=None,
+    soc_generation=None,
+    harness=None,
+    phases=None,
+    infer_build_meta: bool = True,
 ) -> dict:
     """Record one failure. Existing incident ids are not written again."""
     try:
         if f._valid_incident(incident_id):
             return f.record_failure(
-                component,
-                operation,
-                stage=stage,
-                category=category,
-                exception=exception,
-                host=host,
-                revision=revision,
-                version=version,
-                elapsed_ms=elapsed_ms,
-                exit_code=exit_code,
-                reportable=reportable,
-                root=root,
-                incident_id=incident_id,
+                component, operation, stage=stage, category=category, exception=exception,
+                host=host, revision=revision, version=version, elapsed_ms=elapsed_ms,
+                exit_code=exit_code, reportable=reportable, root=root, incident_id=incident_id,
+                reason_code=reason_code, substage=substage, contract_name=contract_name,
+                soc_generation=soc_generation, harness=harness,
             )
-        if version is None or revision is None:
-            meta_version, meta_revision = _component_meta(component)
-            if version is None:
-                version = meta_version
-            if revision is None:
-                revision = meta_revision
+        if infer_build_meta and version is None and revision is None:
+            version, revision = _component_meta(component)
         fresh = uuid.uuid4().hex
         event = f._build_event(
-            fresh,
-            component,
-            operation,
-            stage=stage,
-            category=category,
-            exception=exception,
-            host=host,
-            revision=revision,
-            version=version,
-            elapsed_ms=elapsed_ms,
-            exit_code=exit_code,
-            reportable=reportable,
+            fresh, component, operation, stage=stage, category=category, exception=exception,
+            host=host, revision=revision, version=version, elapsed_ms=elapsed_ms,
+            exit_code=exit_code, reportable=reportable, reason_code=reason_code,
+            substage=substage, contract_name=contract_name, soc_generation=soc_generation,
+            harness=harness,
         )
         if event is None:
-            return {
-                "recorded": False,
-                "incident_id": None,
-                "logging_failed": False,
-                "error": "invalid_arguments",
-            }
-        _attach_frames(event, component, exception)
+            return {"recorded": False, "incident_id": None, "logging_failed": False, "error": "invalid_arguments"}
+        from . import __version__ as diag_version
+        from .logging import active_operation_phases, append_failure_event
+        if f._label("v" + diag_version, 80):
+            event["attributes"]["diagnostics_version"] = "v" + diag_version
+        _attach_frames(event, component, exception, source_root=source_root)
         if isinstance(exception, BaseException):
             event["attributes"].update(exception_evidence(component, exception, source_root=source_root))
         event["attributes"].update(validate_evidence(component, evidence))
-        from .logging import append_failure_event
+        clean_phases = _sanitize_phases(active_operation_phases() if phases is None else phases)
+        if clean_phases:
+            event["attributes"]["phases"] = clean_phases
         selected_root = f._as_local_absolute(f.default_root() if root is None else root)
         if selected_root is not None and append_failure_event(component, selected_root, event):
             return {"recorded": True, "incident_id": fresh, "logging_failed": False}
         f._warn_once()
-        return {
-            "recorded": False,
-            "incident_id": None,
-            "logging_failed": True,
-            "error": "logging_failed",
-        }
+        return {"recorded": False, "incident_id": None, "logging_failed": True, "error": "logging_failed"}
     except Exception:
         f._warn_once()
-        return {
-            "recorded": False,
-            "incident_id": None,
-            "logging_failed": True,
-            "error": "logging_failed",
-        }
+        return {"recorded": False, "incident_id": None, "logging_failed": True, "error": "logging_failed"}
 
 
 def _error(category):
@@ -547,6 +593,18 @@ def _issue_url(value, repository):
     return prefix + number
 
 
+def _comment_url(value, repository, issue_number):
+    if not isinstance(value, str) or not f._valid_repo(repository) or type(issue_number) is not int or issue_number <= 0:
+        return None
+    prefix = "https://github.com/%s/issues/%d#issuecomment-" % (repository, issue_number)
+    if not value.startswith(prefix):
+        return None
+    cid = value[len(prefix):]
+    if not cid.isascii() or not cid.isdigit() or cid.startswith("0") or len(cid) > 16:
+        return None
+    return prefix + cid
+
+
 def _recent_row(row, repository):
     fingerprint, state, attempts, issue_number, issue_url, last_error, payload = row
     item = {}
@@ -567,11 +625,18 @@ def _recent_row(row, repository):
     if isinstance(payload, str) and len(payload.encode('utf-8')) <= 48000:
         try:
             data = json.loads(payload)
-            ids = data.get('incident_ids', []) if isinstance(data, dict) else []
-            if isinstance(ids, list):
-                ids = list(dict.fromkeys(value for value in ids[-80:] if f._valid_incident(value)))
-                item['incident_ids'] = ids[-8:]
-                item['incident_ids_truncated'] = len(ids) > 8
+            if isinstance(data, dict):
+                ids = data.get('incident_ids', [])
+                if isinstance(ids, list):
+                    ids = list(dict.fromkeys(value for value in ids[-80:] if f._valid_incident(value)))
+                    item['incident_ids'] = ids[-8:]
+                    item['incident_ids_truncated'] = len(ids) > 8
+                curl = _comment_url(data.get("comment_url"), repository, issue_number)
+                if curl is not None:
+                    item["comment_url"] = curl
+                pkind = data.get("publication_kind")
+                if pkind in {"issue", "comment"}:
+                    item["publication_kind"] = pkind
         except (ValueError, TypeError):
             pass
     return item

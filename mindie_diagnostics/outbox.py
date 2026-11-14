@@ -81,6 +81,8 @@ def _initialization_lock(path):
                     os.lseek(fd, 0, os.SEEK_SET)
                     msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
                     break
+                except TimeoutError:
+                    raise
                 except OSError as exc:
                     if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
                         raise
@@ -192,7 +194,36 @@ class Outbox:
             self._prune_published(db, now)
             if db.execute("SELECT 1 FROM seen WHERE operation_id=?", (operation_id,)).fetchone():
                 return False
-            existing = db.execute("SELECT payload,state,last_error FROM incidents WHERE fingerprint=?", (fingerprint,)).fetchone()
+            existing = db.execute("SELECT fingerprint,payload,state,last_error FROM incidents WHERE fingerprint=?", (fingerprint,)).fetchone()
+            if existing is None and isinstance(payload.get("events"), list):
+                from .reporting import scope_key
+                from .triage_card import _failure_event, fault_signature, legacy_fingerprint
+                attrs = _failure_event(payload).get("attributes", {})
+                if all(attrs.get(k) is None for k in ("substage", "reason_code", "contract_name")):
+                    legacy_pub = legacy_fingerprint(payload)
+                    legacy_key = scope_key(legacy_pub, consent) if consent is not None else legacy_pub
+                    if legacy_key and legacy_key != fingerprint:
+                        candidate = db.execute("SELECT fingerprint,payload,state,last_error FROM incidents WHERE fingerprint=?", (legacy_key,)).fetchone()
+                        if candidate is not None:
+                            try:
+                                cand_data = json.loads(candidate["payload"]) if candidate["payload"] else {}
+                            except (ValueError, TypeError):
+                                cand_data = {}
+                            same_fault = False
+                            if isinstance(cand_data, dict):
+                                if isinstance(cand_data.get("events"), list):
+                                    cand_attrs = _failure_event(cand_data).get("attributes", {})
+                                    same_fault = (
+                                        all(cand_attrs.get(k) is None for k in ("substage", "reason_code", "contract_name"))
+                                        and cand_attrs.get("error_code") == attrs.get("error_code")
+                                    )
+                                elif isinstance(cand_data.get("fault_signature"), str):
+                                    same_fault = cand_data["fault_signature"] == fault_signature(payload)
+                                elif attrs.get("error_code") is None:
+                                    same_fault = True
+                            if same_fault:
+                                existing = candidate
+                                fingerprint = existing["fingerprint"]
             if existing:
                 if (existing["state"] in ("exhausted", "expired", "permanent-failed", "blocked")
                         and not (existing["last_error"] or "").startswith("submission_uncertain")):
@@ -247,7 +278,7 @@ class Outbox:
         return value
 
     @classmethod
-    def _receipt(cls, fingerprint: str, payload: str, issue_url: str | None) -> str:
+    def _receipt(cls, fingerprint: str, payload: str, issue_url: str | None, consent: str | None = None) -> str:
         component = operation = None
         try:
             data = json.loads(payload) if isinstance(payload, str) else None
@@ -273,21 +304,48 @@ class Outbox:
             body["operation"] = operation
         public = data.get("public_fingerprint") if isinstance(data, dict) else None
         if not isinstance(public, str) or len(public) != 64 or any(c not in "0123456789abcdef" for c in public):
-            from .reporter import fingerprint as public_fingerprint
-            public = public_fingerprint(data or {})
+            from .triage_card import item_public_fingerprint
+            public = item_public_fingerprint({
+                "fingerprint": fingerprint,
+                "payload": data if isinstance(data, dict) else {},
+                "consent": cls._consent(consent),
+            })
         body["public_fingerprint"] = public
+        fault = data.get("fault_signature") if isinstance(data, dict) else None
+        if isinstance(fault, str) and len(fault) == 64 and all(c in "0123456789abcdef" for c in fault):
+            body["fault_signature"] = fault
+        elif isinstance(data, dict) and isinstance(data.get("events"), list) and data["events"]:
+            from .triage_card import fault_signature as compute_fault_signature
+            body["fault_signature"] = compute_fault_signature(data)
         if isinstance(issue_url, str) and issue_url and len(issue_url) <= 512 and "\n" not in issue_url and "\r" not in issue_url:
             body["issue_url"] = issue_url
+        comment_url = data.get("comment_url") if isinstance(data, dict) else None
+        if (
+            isinstance(comment_url, str)
+            and len(comment_url) <= 512
+            and "\n" not in comment_url
+            and "\r" not in comment_url
+            and isinstance(issue_url, str)
+            and comment_url.startswith(issue_url + "#issuecomment-")
+        ):
+            body["comment_url"] = comment_url
+        pkind = data.get("publication_kind") if isinstance(data, dict) else None
+        if pkind in {"issue", "comment"}:
+            body["publication_kind"] = pkind
+        elif "comment_url" in body:
+            body["publication_kind"] = "comment"
+        elif "issue_url" in body:
+            body["publication_kind"] = "issue"
         return json.dumps(body, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
 
     def _compact_terminal(self, db) -> None:
         rows = db.execute(
-            "SELECT fingerprint, payload, issue_url FROM incidents WHERE state IN "
+            "SELECT fingerprint, payload, issue_url, consent FROM incidents WHERE state IN "
             "('published','withdrawn','expired','exhausted','blocked','permanent-failed') "
             "AND (payload LIKE '%\"events\":%' OR payload NOT LIKE '%\"public_fingerprint\":%')"
         ).fetchall()
         for row in rows:
-            receipt = self._receipt(row["fingerprint"], row["payload"], row["issue_url"])
+            receipt = self._receipt(row["fingerprint"], row["payload"], row["issue_url"], row["consent"])
             if receipt != row["payload"]:
                 db.execute("UPDATE incidents SET payload=? WHERE fingerprint=?", (receipt, row["fingerprint"]))
 
@@ -399,30 +457,66 @@ class Outbox:
 
     def _compact_one(self, db, fingerprint: str) -> None:
         row = db.execute(
-            "SELECT fingerprint, payload, issue_url, state FROM incidents WHERE fingerprint=?",
+            "SELECT fingerprint, payload, issue_url, consent, state FROM incidents WHERE fingerprint=?",
             (fingerprint,),
         ).fetchone()
         if row is None or row["state"] not in _TERMINAL_STATES:
             return
-        receipt = self._receipt(row["fingerprint"], row["payload"], row["issue_url"])
+        receipt = self._receipt(row["fingerprint"], row["payload"], row["issue_url"], row["consent"])
         if receipt != row["payload"]:
             db.execute("UPDATE incidents SET payload=? WHERE fingerprint=?", (receipt, fingerprint))
 
     def update(self, item: dict[str, Any], **fields: Any) -> None:
+        meta_keys = {"comment_url", "publication_kind", "comment_cursor", "issue_cursor"}
+        meta = {k: fields.pop(k) for k in list(fields) if k in meta_keys}
         allowed = {"state", "next_attempt", "issue_number", "issue_url", "last_error"}
-        if not fields or set(fields) - allowed:
+        if (not fields and not meta) or set(fields) - allowed:
             raise ValueError("invalid outbox update")
         if "state" in fields and fields["state"] not in _ACTIVE_STATES + _TERMINAL_STATES:
             raise ValueError("invalid outbox state")
         with self.connect() as db:
-            cursor = db.execute("UPDATE incidents SET " + ",".join(f"{key}=?" for key in fields) + ",lease_until=0,lease_token=NULL WHERE fingerprint=? AND lease_token=?", (*fields.values(), item["fingerprint"], item["lease_token"]))
+            db.execute("BEGIN IMMEDIATE")
+            sql_fields = dict(fields)
+            if meta:
+                cur_row = db.execute("SELECT payload FROM incidents WHERE fingerprint=? AND lease_token=?", (item["fingerprint"], item["lease_token"])).fetchone()
+                if cur_row is None:
+                    raise RuntimeError("diagnostic worker lease lost")
+                cur_data = json.loads(cur_row["payload"]) if cur_row["payload"] else {}
+                if isinstance(cur_data, dict):
+                    if "comment_url" in meta and meta["comment_url"] is not None:
+                        cur_data["comment_url"] = meta["comment_url"]
+                    if "publication_kind" in meta and meta["publication_kind"] is not None:
+                        cur_data["publication_kind"] = meta["publication_kind"]
+                    if "comment_cursor" in meta:
+                        if meta["comment_cursor"] is None:
+                            cur_data.pop("_comment_cursor", None)
+                        else:
+                            cur_data["_comment_cursor"] = meta["comment_cursor"]
+                    if "issue_cursor" in meta:
+                        if meta["issue_cursor"] is None:
+                            cur_data.pop("_issue_cursor", None)
+                        else:
+                            cur_data["_issue_cursor"] = meta["issue_cursor"]
+                    sql_fields["payload"] = json.dumps(cur_data, ensure_ascii=True, separators=(",", ":"))
+                    if isinstance(item.get("payload"), dict):
+                        item["payload"].clear()
+                        item["payload"].update(cur_data)
+            cursor = db.execute("UPDATE incidents SET " + ",".join(f"{key}=?" for key in sql_fields) + ",lease_until=0,lease_token=NULL WHERE fingerprint=? AND lease_token=?", (*sql_fields.values(), item["fingerprint"], item["lease_token"]))
             if cursor.rowcount != 1:
                 raise RuntimeError("diagnostic worker lease lost")
             if fields.get("state") in _TERMINAL_STATES:
                 self._compact_one(db, item["fingerprint"])
             self._prune_published(db, self.clock())
 
-    def begin_post(self, item: dict[str, Any], *, hourly_limit: int | None = None) -> bool:
+    def begin_post(
+        self,
+        item: dict[str, Any],
+        *,
+        hourly_limit: int | None = None,
+        issue_number: int | None = None,
+        issue_url: str | None = None,
+        comment_cursor: dict[str, Any] | None = None,
+    ) -> bool:
         """Persist uncertainty BEFORE a mutating request, including process death.
 
         The claim count is diagnostic, never a permanent delivery cutoff.
@@ -434,10 +528,29 @@ class Outbox:
                 count = db.execute("SELECT COUNT(*) FROM publications WHERE at >= ?", (now - 3600,)).fetchone()[0]
                 if count >= hourly_limit:
                     return False
+            updates: dict[str, Any] = {"state": "uncertain", "attempt_timestamp": now}
+            if issue_number is not None:
+                updates["issue_number"] = issue_number
+                item["issue_number"] = issue_number
+            if issue_url is not None:
+                updates["issue_url"] = issue_url
+                item["issue_url"] = issue_url
+            if isinstance(item.get("payload"), dict) and (
+                comment_cursor is not None or "_issue_cursor" in item["payload"]
+            ):
+                merged = dict(item["payload"])
+                merged.pop("_issue_cursor", None)
+                if comment_cursor is not None:
+                    merged["_comment_cursor"] = comment_cursor
+                updates["payload"] = json.dumps(merged, ensure_ascii=True, separators=(",", ":"))
+                item["payload"].pop("_issue_cursor", None)
+                if comment_cursor is not None:
+                    item["payload"]["_comment_cursor"] = comment_cursor
+            set_clause = ",".join(f"{k}=?" for k in updates)
             cursor = db.execute(
-                "UPDATE incidents SET state='uncertain',attempt_timestamp=? WHERE fingerprint=? AND lease_token=? "
+                f"UPDATE incidents SET {set_clause} WHERE fingerprint=? AND lease_token=? "
                 "AND lease_until>? AND state IN ('pending','retry')",
-                (now, item["fingerprint"], item["lease_token"], now),
+                (*updates.values(), item["fingerprint"], item["lease_token"], now),
             )
             if cursor.rowcount != 1:
                 raise RuntimeError("diagnostic worker lease expired before publication")
@@ -447,8 +560,25 @@ class Outbox:
 
     def rows(self) -> list[dict[str, Any]]:
         with self.connect() as db:
-            rows = [dict(row) for row in db.execute("SELECT fingerprint,first_seen,last_seen,occurrences,state,attempts,next_attempt,issue_number,issue_url,last_error,json_extract(payload,'$.incident_ids') AS incident_ids FROM incidents ORDER BY (state='published'),last_seen DESC LIMIT ?", (self.capacity * 2,))]
+            rows = [
+                dict(row)
+                for row in db.execute(
+                    "SELECT fingerprint,first_seen,last_seen,occurrences,state,attempts,next_attempt,"
+                    "issue_number,issue_url,last_error,"
+                    "json_extract(payload,'$.incident_ids') AS incident_ids,"
+                    "json_extract(payload,'$.comment_url') AS comment_url,"
+                    "json_extract(payload,'$.publication_kind') AS publication_kind "
+                    "FROM incidents ORDER BY (state='published'),last_seen DESC LIMIT ?",
+                    (self.capacity * 2,),
+                )
+            ]
         for row in rows:
             value = self._consent(row.get("incident_ids"))
             row["incident_ids"] = [ident for ident in value[-80:] if self._incident_id(ident)] if isinstance(value, list) else []
+            curl = row.get("comment_url")
+            iurl = row.get("issue_url")
+            if not (isinstance(curl, str) and isinstance(iurl, str) and curl.startswith(iurl + "#issuecomment-")):
+                row.pop("comment_url", None)
+            if row.get("publication_kind") not in {"issue", "comment"}:
+                row.pop("publication_kind", None)
         return rows

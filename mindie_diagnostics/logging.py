@@ -30,7 +30,8 @@ and reader-aware recycling (`BACKUP_COUNT = 3`).
 """
 from __future__ import annotations
 
-from collections import OrderedDict
+from collections import OrderedDict, deque
+from contextvars import ContextVar
 from datetime import datetime, timezone
 import hashlib
 from importlib import metadata
@@ -65,6 +66,7 @@ _VERSIONS = {}
 _LOCK = threading.RLock()
 _LIVE_RECORDERS = weakref.WeakSet()
 _FAILURE_RECORDERS = OrderedDict()
+_ACTIVE_OPERATION: ContextVar[Operation | None] = ContextVar("mindie_diagnostics_active_op", default=None)
 
 
 def _after_fork():
@@ -113,26 +115,56 @@ def _package(component):
 
 
 def _exception_info(exc):
-    """No frame locals, source line reads or absolute paths."""
+    """No frame locals, source line reads, exception free text, or absolute paths."""
     try:
         chain, frames, seen = [], [], set()
+        truncated, incomplete = False, False
         current = exc
-        while current is not None and id(current) not in seen and len(chain) < 8:
+        for _ in range(64):
+            if not isinstance(current, BaseException) or id(current) in seen:
+                break
             seen.add(id(current))
             chain.append(type(current).__name__)
             tb = current.__traceback__
-            while tb is not None and len(frames) < 24:
-                frame = tb.tb_frame
+            tail_tbs = deque(maxlen=256)
+            steps = 0
+            while tb is not None and steps < 4096:
+                tail_tbs.append((tb.tb_frame, tb.tb_lineno))
+                tb = tb.tb_next
+                steps += 1
+            if steps > 256:
+                truncated = True
+            if tb is not None:
+                truncated = True
+                incomplete = True
+            for frame, lineno in tail_tbs:
                 module = frame.f_globals.get("__name__", "unknown")
                 function = frame.f_code.co_name
-                frames.append({"module": _text(module, 160), "function": _text(function, 100),
-                               "line": tb.tb_lineno})
-                tb = tb.tb_next
+                filename = frame.f_code.co_filename
+                entry = {"module": _text(module, 160), "function": _text(function, 100),
+                         "line": lineno}
+                if isinstance(filename, str) and os.path.basename(filename.replace("\\", "/")) == "__init__.py":
+                    entry["init"] = True
+                frames.append(entry)
             current = current.__cause__ or (None if current.__suppress_context__ else current.__context__)
+        if isinstance(current, BaseException) and id(current) not in seen:
+            truncated = True
+            incomplete = True
+        if len(chain) > 8:
+            truncated = True
+            chain = [chain[0], *chain[-7:]]
+        if len(frames) > 24:
+            truncated = True
+            frames = frames[-24:]
         canonical = json.dumps({"chain": chain, "frames": frames}, sort_keys=True, separators=(",", ":"))
-        return {"error_type": type(exc).__name__, "exception_message": _text(str(exc), 1200),
-                "exception_chain": chain, "stack_frames": frames,
-                "stack_fingerprint": hashlib.sha256(canonical.encode()).hexdigest()}
+        out = {"error_type": type(exc).__name__,
+               "exception_chain": chain, "stack_frames": frames,
+               "stack_fingerprint": hashlib.sha256(canonical.encode()).hexdigest()}
+        if truncated or incomplete:
+            out["stack_truncated"] = True
+        if incomplete:
+            out["stack_incomplete"] = True
+        return out
     except Exception:
         return {"error_type": type(exc).__name__, "exception_capture_failed": True}
 
@@ -460,6 +492,7 @@ class Operation:
         self._finished_ns = None
         self.status = "pending"
         self._binding = None
+        self._op_token = None
         self._failure = {}
         self._phases = []
         self.parent_phase_id = None
@@ -477,6 +510,7 @@ class Operation:
             context["phase_id"] = self.phase_id
         self._binding = bind_context(context)
         self._binding.__enter__()
+        self._op_token = _ACTIVE_OPERATION.set(self)
         self.event(self._level, "phase.start" if self._parent else "operation.start", **self._attributes)
         return self
 
@@ -497,6 +531,8 @@ class Operation:
                                             "parent_phase_id": self.parent_phase_id,
                                             "status": self.status, "duration_ms": round(self._duration(), 3)})
         finally:
+            if self._op_token is not None:
+                _ACTIVE_OPERATION.reset(self._op_token)
             if self._binding is not None:
                 self._binding.__exit__(exc_type, exc, traceback)
         return False
@@ -513,7 +549,7 @@ class Operation:
             if self.phase_id:
                 payload.update(phase_id=self.phase_id, phase=self.name, parent_phase_id=self.parent_phase_id)
             # Preserve bounded structured traceback beyond the generic shallow attrs.
-            for key in ("exception_chain", "stack_frames", "stack_fingerprint"):
+            for key in ("exception_chain", "stack_frames", "stack_fingerprint", "stack_truncated", "stack_incomplete"):
                 if key in attributes:
                     payload["attributes"][key] = attributes[key]
             self.recorder._emit(payload)
@@ -552,6 +588,22 @@ class Operation:
                 "dropped_records": self.recorder.dropped_records,
                 "phases": list(self._phases),
                 **({"phase_id": self.phase_id, "phase": self.name} if self.phase_id else {})}
+
+
+def active_operation_phases() -> list[dict]:
+    """Return bounded phase breadcrumbs from any active in-process Operation."""
+    current = _ACTIVE_OPERATION.get()
+    if current is None:
+        return []
+    root = current._parent or current
+    items = [
+        {"phase": p["phase"], "status": p["status"], "duration_ms": p["duration_ms"]}
+        for p in root._phases[-15:]
+        if isinstance(p, dict) and isinstance(p.get("phase"), str)
+    ]
+    if current._parent is not None and current.status == "running":
+        items.append({"phase": current.name, "status": "running", "duration_ms": round(current._duration(), 3)})
+    return items[-16:]
 
 
 def configure(component, *, root=None, level=None, version=None):

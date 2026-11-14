@@ -26,6 +26,8 @@ from . import fallback as f
 
 _FILE = re.compile(r'\d+-[0-9a-f]{32}\.jsonl(?:\.[1-3])?\Z')
 _LABEL = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.:+-]{0,119}\Z')
+_MODULE = re.compile(r'[A-Za-z_][A-Za-z0-9_.]{0,159}\Z')
+_FUNCTION = re.compile(r'(?:[A-Za-z_][A-Za-z0-9_]{0,99}|<module>|<lambda>)\Z')
 _STAMP = re.compile(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,6})?Z\Z')
 
 
@@ -121,13 +123,33 @@ def recent_failures(roots, *, config=None):
                         item['timestamp'] = stamp
                     attrs = row.get('attributes')
                     if isinstance(attrs, dict):
-                        for key in ('stage', 'category', 'error_type', 'error_code', 'path'):
+                        for key in ('stage', 'substage', 'category', 'error_type', 'error_code',
+                                    'reason_code', 'contract_name', 'path', 'platform', 'arch', 'py_version'):
                             value = attrs.get(key)
                             if isinstance(value, str) and _LABEL.fullmatch(value):
                                 item[key] = value
-                        errno_value = attrs.get('errno')
-                        if type(errno_value) is int and -2147483648 <= errno_value <= 2147483647:
-                            item['errno'] = errno_value
+                        for int_key in ('errno', 'exit_code'):
+                            int_val = attrs.get(int_key)
+                            if type(int_val) is int and -2147483648 <= int_val <= 2147483647:
+                                item[int_key] = int_val
+                        chain = attrs.get('exception_chain')
+                        if isinstance(chain, list):
+                            safe_chain = [c for c in chain[:8] if isinstance(c, str) and _LABEL.fullmatch(c)]
+                            if safe_chain:
+                                item['exception_chain'] = safe_chain
+                        raw_frames = attrs.get('stack_frames')
+                        if isinstance(raw_frames, list):
+                            safe_frames = []
+                            for frame in raw_frames[-8:]:
+                                if not isinstance(frame, dict):
+                                    continue
+                                mod, fn, ln = frame.get('module'), frame.get('function'), frame.get('line')
+                                if (isinstance(mod, str) and _MODULE.fullmatch(mod)
+                                        and isinstance(fn, str) and _FUNCTION.fullmatch(fn)
+                                        and type(ln) is int and 0 < ln < 10**7):
+                                    safe_frames.append({'module': mod, 'function': fn, 'line': ln})
+                            if safe_frames:
+                                item['stack_frames'] = safe_frames
                     records.append(item)
                 except (ValueError, TypeError):
                     continue

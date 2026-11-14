@@ -21,8 +21,8 @@ issue markers (`<!-- mindie-incident:<sha256> -->`), and publishes via `publish_
 - `GitHub.begin_cycle` shares a deadline (default 30s) and 8 MiB response budget
   across one search page, up to five listing pages, and POST (reserving up to 15s).
 - `_run_gh` spawns `gh` in an isolated process group (`start_new_session=True` /
-  `CREATE_NEW_PROCESS_GROUP`) and reaps the entire process group on timeout/cancel
-  (`SIGTERM` -> 2.0s grace -> `SIGKILL`).
+  `CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW`) and reaps the entire group on
+  timeout/cancel (`SIGTERM` -> 2.0s grace -> `SIGKILL`).
 
 [Side-Effect Policy]
 - Mutates external GitHub issues only when `reporting.json` consent is actively
@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlsplit
 
-from .github_transport import TransportError, _parse_response, _run_gh
+from .github_transport import _CREATE_NO_WINDOW, TransportError, _parse_response, _run_gh
 from .outbox import Outbox
 from .reporting import ConsentUnavailable, ConsentWithdrawn, check_remote_action, guard_consent, require_consent
 from .triage_card import (

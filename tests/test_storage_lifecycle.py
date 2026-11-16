@@ -805,8 +805,12 @@ def test_orphan_profile_defers_when_the_target_volume_anchor_is_unavailable(tmp_
     (profiles / active_name).mkdir()
     dead = profiles / ("b" * 20)
     dead.mkdir()
+    unmounted_drive = next(
+        letter for letter in "QZYXWVUTSRPONMLKJIHGFE"
+        if not Path(f"{letter}:/").exists() and not Path(f"{letter}:\\").exists()
+    )
     (dead / "profile.json").write_text(json.dumps({
-        "schema": 1, "root": "D:/unmounted-policy-root",
+        "schema": 1, "root": f"{unmounted_drive}:/unmounted-policy-root",
     }))
     monkeypatch.setattr(fallback, "_as_local_absolute", lambda value: Path(value))
     monkeypatch.setattr(retirement, "os", _WindowsOS())

@@ -456,8 +456,9 @@ def _retirement_decision(config, *, unit_dir=None, worker=None, deadline=None):
         or status not in (None, 'not_started', 'stopped', 'absent'))
     try:
         from .service import service_status
+        effective_unit_dir = f.service_directory(config) if unit_dir is None else unit_dir
         native = service_status(
-            unit_dir=unit_dir,
+            unit_dir=effective_unit_dir,
             runner=_bounded_runner(deadline) if deadline is not None else None,
         )
     except subprocess.TimeoutExpired:
@@ -487,13 +488,11 @@ def _retirement_decision(config, *, unit_dir=None, worker=None, deadline=None):
     if not complete:
         return {'allowed': False, 'keep': ()}
     keep = tuple(sorted(live | ({source} if source is not None else set())))
-    if source is not None:
-        return {'allowed': True, 'keep': keep}
-    if unit_exists:
-        resolved = _service_definition_source(unit_dir, config, deadline)
-        if resolved is not None:
-            return {'allowed': True, 'keep': (resolved, *keep)}
+    resolved = _service_definition_source(effective_unit_dir, config, deadline)
+    if unit_exists and resolved is None and source is None:
         return {'allowed': False, 'keep': ()}
+    if resolved is not None:
+        keep = tuple(sorted({resolved, *keep}))
     return {'allowed': True, 'keep': keep}
 
 
@@ -524,10 +523,11 @@ def _maintain_retirement(config, deadline, *, unit_dir=None):
         return None
     if deadline - time.monotonic() < 1.5:
         return None
-    decision = _retirement_decision(config, unit_dir=unit_dir, deadline=deadline)
-    if not decision['allowed']:
-        return _deferred_retirement()
     try:
+        effective_unit_dir = f.service_directory(config) if unit_dir is None else unit_dir
+        decision = _retirement_decision(config, unit_dir=effective_unit_dir, deadline=deadline)
+        if not decision['allowed']:
+            return _deferred_retirement()
         with runtime_transaction(config, create=False, timeout=0.2) as root:
             if root is None:
                 return None

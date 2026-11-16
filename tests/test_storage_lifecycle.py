@@ -12,6 +12,7 @@ import time
 
 import pytest
 
+from mindie_diagnostics import fallback as policy
 from mindie_diagnostics import reporting_commands as commands
 from mindie_diagnostics import reporting_runtime as runtime
 from mindie_diagnostics import runtime_retirement as retirement
@@ -36,6 +37,22 @@ def _runtime_root(config: Path) -> Path:
     root = config.with_suffix(".runtime")
     root.mkdir(mode=0o700)
     return root
+
+
+def _linked_config(tmp_path: Path) -> Path:
+    consent = tmp_path / "consent.json"
+    consent.write_text(json.dumps({
+        "schema": "mindie-consent/1",
+        "choice": "contribute",
+        "choice_revision": "e" * 32,
+    }))
+    config = tmp_path / "diagnostics.json"
+    result = configure_reporting(
+        True, config=config, repository="owner/repo",
+        roots=[str(tmp_path / "logs")], consent_config=consent,
+    )
+    assert result["status"] == "configured"
+    return config
 
 
 def _generation(generations: Path, source_hash: str) -> Path:
@@ -403,6 +420,63 @@ def test_maintain_defers_when_live_process_scan_is_incomplete(tmp_path, monkeypa
         assert entries[source_hash].is_dir()
 
 
+def test_maintain_resolves_linked_profile_service_directory_for_retirement(tmp_path, monkeypatch):
+    config = _linked_config(tmp_path)
+    root = _runtime_root(config)
+    generations = root / "generations"
+    generations.mkdir(mode=0o700)
+    live, previous, current = _hash("service-a"), _hash("previous-b"), _hash("current-c")
+    entries = {source_hash: _generation(generations, source_hash)
+               for source_hash in (live, previous, current)}
+    (root / "current.json").write_text(json.dumps({
+        "schema": 1, "source_hash": current, "version": "0.5.14",
+        "revision": None, "previous_source_hash": previous,
+    }))
+    unit_dir = policy.service_directory(config)
+    assert unit_dir is not None
+    unit_dir.mkdir(parents=True)
+    _service_definition(unit_dir, entries[live])
+    monkeypatch.setattr(commands, "_worker_view",
+                        lambda config: {"status": "not_started"})
+    monkeypatch.setattr(retirement, "live_generation_hashes",
+                        lambda roots, deadline=None: (set(), True))
+    seen = []
+
+    def status(*, unit_dir=None, runner=None):
+        seen.append(unit_dir)
+        return ({"status": "idle"} if unit_dir == policy.service_directory(config)
+                else {"status": "absent"})
+
+    monkeypatch.setattr(service, "service_status", status)
+
+    result = commands.maintain(config, budget_seconds=20)
+
+    assert seen and seen[0] == policy.service_directory(config)
+    assert result["retirement"]["status"] == "deferred"
+    assert result["retirement"]["reason"] == "worker_generation_unconfirmed"
+    # The installed service definition still names A while the live worker is
+    # unconfirmed: A must survive even though current/previous are C/B.
+    for source_hash in (live, previous, current):
+        assert entries[source_hash].is_dir()
+
+
+def test_maintain_keeps_a_generation_named_by_the_service_definition(tmp_path, monkeypatch):
+    config, root, entries, live, previous, current = _three_generations(tmp_path)
+    unit_dir = tmp_path / "units"
+    _service_definition(unit_dir, entries[live])
+    monkeypatch.setattr(commands, "_worker_view",
+                        lambda config: {"healthy": True, "runtime_source": current})
+    monkeypatch.setattr(service, "service_status", lambda **kwargs: {"status": "active"})
+    monkeypatch.setattr(retirement, "live_generation_hashes",
+                        lambda roots, deadline=None: (set(), True))
+
+    result = commands.maintain(config, budget_seconds=20, unit_dir=unit_dir)
+
+    assert result["retired_generations"] == []
+    for source_hash in (live, previous, current):
+        assert entries[source_hash].is_dir()
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX ps process inspection")
 def test_live_generation_scan_finds_a_real_process_path(tmp_path):
     source_hash = "a" * 64
@@ -429,6 +503,50 @@ def test_live_generation_scan_finds_a_real_process_path(tmp_path):
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX ps process inspection")
+def test_posix_scan_uses_unlimited_width_and_strips_columns(tmp_path, monkeypatch):
+    source_hash = "b" * 64
+    command = (
+        f"{tmp_path}/generations/{source_hash}/"
+        + "nested/" * 30
+        + "venv/bin/python -m mindie_diagnostics.worker"
+    )
+    assert len(command) > 200
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = list(argv)
+        captured["env"] = dict(kwargs["env"])
+        return subprocess.CompletedProcess(argv, 0, stdout=command.encode())
+
+    monkeypatch.setenv("COLUMNS", "80")
+    monkeypatch.setattr(retirement.subprocess, "run", fake_run)
+
+    found, complete = retirement.live_generation_hashes(
+        (tmp_path / "generations",), deadline=time.monotonic() + 5)
+
+    assert os.environ["COLUMNS"] == "80"
+    assert captured["argv"] == ["ps", "-ww", "-axo", "command="]
+    assert "COLUMNS" not in captured["env"]
+    assert found == {source_hash}
+    assert complete is True
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX ps process inspection")
+def test_posix_scan_treats_a_capped_read_as_incomplete(tmp_path, monkeypatch):
+    monkeypatch.setattr(retirement, "_PROCESS_TEXT_LIMIT", 64)
+    monkeypatch.setattr(retirement.subprocess, "run",
+                        lambda argv, **kwargs: subprocess.CompletedProcess(
+                            argv, 0, stdout=b"x" * 64))
+
+    assert retirement._posix_process_text(time.monotonic() + 5) is None
+    found, complete = retirement.live_generation_hashes(
+        (tmp_path / "generations",), deadline=time.monotonic() + 5)
+
+    assert found == set()
+    assert complete is False
 
 
 def test_service_definition_scan_counts_every_entry_and_stops_at_cap(tmp_path, monkeypatch):

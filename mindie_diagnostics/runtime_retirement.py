@@ -30,9 +30,11 @@
     iterating `os.scandir`; no unbounded `list()`/`sorted()` scan precedes the
     first deadline check, and `_ENTRY_LIMIT` bounds each directory.
   * Process inspection is read-only and bounded: POSIX uses a
-    `ps -axo command=` subprocess with the remaining budget as its timeout;
-    Windows enumerates `CreateToolhelp32Snapshot` and reads each candidate
-    image with `QueryFullProcessImageNameW`, checking the deadline per entry.
+    `ps -ww -axo command=` subprocess with `COLUMNS` removed from its child
+    environment and the remaining budget as its timeout; a capped, truncated
+    or timed-out read is incomplete. Windows enumerates
+    `CreateToolhelp32Snapshot` and reads each candidate image with
+    `QueryFullProcessImageNameW`, checking the deadline per entry.
     A scan that cannot complete reports `complete=False` and callers defer.
   * No lock is acquired here; callers own `runtime_transaction`.
 
@@ -62,6 +64,7 @@ _TH32CS_SNAPPROCESS = 0x2
 _ERROR_NO_MORE_FILES = 18
 _IMAGE_CHARS = 32768
 _PYTHON_IMAGES = frozenset(("python.exe", "pythonw.exe"))
+_PROCESS_TEXT_LIMIT = 8 * 1024 * 1024
 
 
 class _Retirement(list):
@@ -278,11 +281,17 @@ def _posix_process_text(deadline):
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         return None
+    # `ps` truncates `command=` to the inherited COLUMNS width unless `-ww`
+    # disables wrapping. Both the flag and the clean child environment are
+    # required: some procps builds still consult COLUMNS with `-ww`.
+    child_env = dict(os.environ)
+    child_env.pop("COLUMNS", None)
     try:
         completed = subprocess.run(
-            ["ps", "-axo", "command="],
+            ["ps", "-ww", "-axo", "command="],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
+            env=child_env,
             timeout=remaining,
             check=False,
         )
@@ -295,8 +304,13 @@ def _posix_process_text(deadline):
     if completed.returncode != 0:
         return None
     try:
-        return completed.stdout.decode("utf-8", "surrogateescape")
-    except (AttributeError, UnicodeError):
+        output = completed.stdout
+        # A capped read may have dropped the only live-generation path. Never
+        # report such output as a complete scan.
+        if len(output) >= _PROCESS_TEXT_LIMIT:
+            return None
+        return output.decode("utf-8", "surrogateescape")
+    except (AttributeError, TypeError, UnicodeError):
         return None
 
 

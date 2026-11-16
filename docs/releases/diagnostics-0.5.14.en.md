@@ -1,0 +1,12 @@
+# mindie-diagnostics 0.5.14
+
+## Storage Lifecycle & Windows/macOS/Linux Retention Fixes
+
+- **Windows writer liveness (`D-3`)**: `_writer_exited` now uses `kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` plus `GetExitCodeProcess`, distinguishing an exited PID (`ERROR_INVALID_PARAMETER=87`), a protected/other-user live process (`ERROR_ACCESS_DENIED=5`), and `STILL_ACTIVE=259` without spawning `tasklist` or `powershell`. Windows `.jsonl` pruning no longer stays at zero forever.
+- **Deterministic retention scans**: one pass now admits up to `16384` lightweight `DirEntry` metadata entries (`4096` component directories), so the old `4096` cutoff cannot starve the oldest segments when `scandir` returns newest entries first. An emptied `<root>/events/<component>` is removed after its last segment.
+- **Worker self-log pruning (`D-2`)**: after policy roots, `maintain()` prunes `<state>/diagnostics` locally with `prune(state_diag, queue=None, ...)`, retiring 60s `worker.cycle` segments without recursively ingesting them into the GitHub outbox.
+- **Rotation retention while reporting is off**: on segment rotation (at most once per 300s per writer) the logger opportunistically runs `prune(root, timeout=0.5)`. Only fully consumed segments are deleted, and cleanup failures never affect business logging.
+- **Atomic generation retirement (`D-1`)**: `current.json` carries at most one `previous_source_hash`, forming the `current + previous + live worker` rollback closure. `retire_other_generations` atomically renames an eligible generation to `.trash-*` before bounded deletion; if an open `pythonw.exe`/`.dll` makes the rename fail on Windows, the original generation stays byte-for-byte intact and is reported as deferred. Stale `.staging-*` directories (>30 minutes) and legacy generations converge. `maintain()` also retires opportunistically when the runtime transaction is idle, so installed users converge on the next 60s maintenance cycle.
+- **Windows profile marker**: newly created `%LOCALAPPDATA%\mindie\diagnostics\<profile>` directories receive `profile.json`; `prune_orphan_windows_profiles` only retires marked profiles whose recorded policy root no longer exists and whose atomic rename succeeds.
+- **Service staging cleanup (`D-4`)**: systemd unit publication uses `shutil.rmtree(..., ignore_errors=True)` for its temporary directory, so leftover files can no longer make `rmdir` fail.
+- **Version**: `0.5.14`.

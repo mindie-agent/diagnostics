@@ -14,6 +14,9 @@ and reader-aware recycling (`BACKUP_COUNT = 3`).
   bytes, so this path takes no reader-registry or cursor lock. Only recycling
   an existing owned segment needs reader/cursor coordination.
 - Only fully consumed closed segments recycle; backpressure forbids new slots.
+- A rotation (at most once per 300s) opportunistically applies retention to the
+  same root, so disabled reporting still retires old consumed segments instead
+  of leaving every rotated `.1`-`.3` family forever.
 [Timeouts & Locks]
 - `_mutex` and `_LOCK` use `blocking=False` on emit/append paths.
 - Fresh-slot allocation is bounded by `BACKUP_COUNT + 1` and has no clock
@@ -223,6 +226,7 @@ class _Handler(std_logging.Handler):
         self.current = None
         self.owned = {}
         self.credit = None
+        self._next_prune = 0.0
         self.setFormatter(std_logging.Formatter('%(message)s'))
 
     def _drop(self):
@@ -321,6 +325,28 @@ class _Handler(std_logging.Handler):
         # A cold/free slot needs no reader metadata; only recycling does.
         return self._fresh(blocked) or self._recycle(size, blocked)
 
+    def _maybe_prune(self):
+        """Rotation-triggered retention, bounded and never fatal to logging."""
+        now = time.monotonic()
+        if now < self._next_prune:
+            return
+        self._next_prune = now + 300
+
+        def once():
+            from .maintenance import prune
+            try:
+                prune(self.root, queue=None, timeout=0.5)
+            except TimeoutError:
+                raise
+            except (OSError, ValueError):
+                return
+
+        try:
+            once()
+        except TimeoutError:
+            # The logger is non-throwing; retention retries after the cooldown.
+            pass
+
     def emit(self, record):
         try:
             raw = (self.format(record) + '\n').encode('utf-8')
@@ -332,12 +358,17 @@ class _Handler(std_logging.Handler):
             cap = MAX_LOG_BYTES
             if blocked:
                 cap = min(cap, self.credit if self.credit is not None else present)
+            rotated = self.stream is not None and present + len(raw) > cap
             if self.stream is None or present + len(raw) > cap:
                 blocked = self.pressure(force=True)
                 if not self._select(len(raw), blocked):
                     self._drop()
                     return
             self.stream.write(raw)
+            if rotated:
+                # Only rotation retires old segments; events on the active
+                # segment never pay a retention scan.
+                self._maybe_prune()
         except Exception:
             self.handleError(record)
 

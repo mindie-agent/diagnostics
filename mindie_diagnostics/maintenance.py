@@ -9,8 +9,9 @@ signal backpressure to active log writers when retention limits remain exceeded.
 - Called only by maintenance/worker flows, never inline during ordinary tool
   operations.
 - Never deletes a segment unless: (1) all registered readers have consumed it
-  (`fully_consumed`), (2) it is at least 300s old, and (3) its POSIX writer PID
-  definitively exited (`ESRCH`).
+  (`fully_consumed`), (2) it is at least 300s old, and (3) its writer PID
+  definitively exited (POSIX `ESRCH`, Windows `OpenProcess` +
+  `GetExitCodeProcess`; no console subprocess probe).
 
 [Timeouts & Locks]
 - The caller's monotonic budget (default 5.0s) reserves 50ms for releasing the
@@ -27,6 +28,7 @@ signal backpressure to active log writers when retention limits remain exceeded.
 """
 from __future__ import annotations
 
+import ctypes
 import os
 import json
 import stat
@@ -34,26 +36,89 @@ import uuid
 from pathlib import Path
 import re
 import time
+from types import SimpleNamespace
 
 from .reader_registry import reader_guard, cursor_snapshot, fully_consumed
 
 _FILE = re.compile(r"(\d+)-[0-9a-f]{32}\.jsonl(?:\.[1-3])?\Z")
 _CLEANUP_S = .05
+_FOLDER_LIMIT = 4096
+# Metadata-only DirEntry scans are cheap; a 4096-entry cutoff starved old
+# segments on Windows and in state/diagnostics backlogs when scandir returned
+# newest entries first. Bound one prune pass, never a single component.
+_ENTRY_LIMIT = 16384
+_STILL_ACTIVE = 259
+_ERROR_INVALID_PARAMETER = 87
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+
+def _kernel32():
+    """Configured kernel32 functions; never a tasklist/powershell call."""
+    try:
+        dll = ctypes.WinDLL("kernel32", use_last_error=True)
+    except TimeoutError:
+        raise
+    except (AttributeError, OSError):
+        try:
+            dll = ctypes.windll.kernel32
+        except TimeoutError:
+            raise
+        except (AttributeError, OSError):
+            return None
+    # CDLL.__getattr__ returns a fresh function object on every access, so the
+    # prototypes below must be attached to retained objects. HANDLE is
+    # pointer-sized; without restype ctypes truncates it to c_int.
+    open_process = dll.OpenProcess
+    get_exit_code = dll.GetExitCodeProcess
+    close_handle = dll.CloseHandle
+    try:
+        open_process.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)
+        open_process.restype = ctypes.c_void_p
+        get_exit_code.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32))
+        get_exit_code.restype = ctypes.c_int
+        close_handle.argtypes = (ctypes.c_void_p,)
+        close_handle.restype = ctypes.c_int
+    except (AttributeError, TypeError):
+        pass
+    return SimpleNamespace(
+        OpenProcess=open_process,
+        GetExitCodeProcess=get_exit_code,
+        CloseHandle=close_handle,
+    )
 
 
 def _writer_exited(pid: int) -> bool:
-    """Only positive POSIX PIDs with a definitive ESRCH are safe to prune."""
-    if os.name != "posix" or pid <= 0:
+    """True only when the OS proves this writer PID no longer exists."""
+    if pid <= 0:
         return False
+    if os.name == "posix":
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except TimeoutError:
+            raise
+        except (OSError, ValueError, OverflowError):
+            return False
+        return False
+    if os.name != "nt":
+        return False
+    kernel32 = _kernel32()
+    if kernel32 is None:
+        # Non-Windows host masquerading as nt (tests) or a broken ctypes table.
+        return False
+    handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        # 87 means the PID does not exist; 5 means a protected or other-user
+        # live process owns it. Any other observation is not proof of exit.
+        return ctypes.get_last_error() == _ERROR_INVALID_PARAMETER
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    except TimeoutError:
-        raise
-    except (OSError, ValueError, OverflowError):
+        exit_code = ctypes.c_uint32(0)
+        if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return exit_code.value != _STILL_ACTIVE
         return False
-    return False
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def _marker(root, result, blocked, now):
@@ -89,7 +154,7 @@ def prune(root: str | Path, *, max_bytes: int = 128 * 1024 * 1024,
     if not root.exists():
         return result
     deadline = time.monotonic() + max(0, float(timeout) - _CLEANUP_S)
-    files, visited, incomplete = [], 0, False
+    files, folders_seen, entries_seen, incomplete = [], 0, 0, False
     total, remaining, now = 0, 0, clock()
     try:
         if events.is_symlink():
@@ -97,24 +162,29 @@ def prune(root: str | Path, *, max_bytes: int = 128 * 1024 * 1024,
         if events.is_dir():
             with os.scandir(events) as folders:
                 for folder in folders:
-                    visited += 1
-                    if visited > 4096 or time.monotonic() >= deadline:
+                    folders_seen += 1
+                    if folders_seen > _FOLDER_LIMIT or time.monotonic() >= deadline:
                         incomplete = True
                         break
                     if folder.is_symlink() or not folder.is_dir(follow_symlinks=False):
                         continue
                     with os.scandir(folder.path) as entries:
                         for entry in entries:
-                            visited += 1
-                            if visited > 4096 or time.monotonic() >= deadline:
+                            entries_seen += 1
+                            if entries_seen > _ENTRY_LIMIT or time.monotonic() >= deadline:
                                 incomplete = True
                                 break
                             if (entry.is_symlink() or not _FILE.fullmatch(entry.name)
                                     or not entry.is_file(follow_symlinks=False)):
                                 continue
-                            path = Path(entry.path)
-                            info = path.stat(follow_symlinks=False)
-                            files.append((info.st_mtime, info.st_size, path,
+                            # DirEntry.stat avoids a path lookup per candidate.
+                            try:
+                                info = entry.stat(follow_symlinks=False)
+                            except TimeoutError:
+                                raise
+                            except OSError:
+                                continue
+                            files.append((info.st_mtime, info.st_size, Path(entry.path),
                                           info.st_ino, info.st_dev, info.st_mtime_ns))
                     if incomplete:
                         break
@@ -170,6 +240,15 @@ def prune(root: str | Path, *, max_bytes: int = 128 * 1024 * 1024,
                 except FileNotFoundError:
                     incomplete = True
                     continue
+                # Keep `<root>/events` from accumulating thousands of empty
+                # component directories after their last segment is pruned.
+                if path.parent.parent == events:
+                    try:
+                        path.parent.rmdir()
+                    except TimeoutError:
+                        raise
+                    except OSError:
+                        pass
                 total -= size
                 remaining -= 1
                 result['removed_files'] += 1

@@ -27,7 +27,8 @@ provisioning (`ensure`), and bounded automatic runtime handoff (`upgrade_running
 
 [Side-Effect Policy]
 - Coordinates runtime generation preparation and native service installation
-  under `runtime_transaction`.
+  under `runtime_transaction`. Opportunistic retention/generation retirement is
+  bounded and never changes a healthy runtime or service status.
 """
 from __future__ import annotations
 
@@ -168,6 +169,25 @@ def maintain(config=None, *, update_running=False, unit_dir=None, budget_seconds
         except (OSError, ValueError, RuntimeError) as exc:
             result['status'] = 'degraded'
             result['retention'].append({'status': 'unavailable', 'category': type(exc).__name__})
+    # The worker writes `worker.cycle` events under its own state directory.
+    # That root is not a policy root (and must never be ingested back into the
+    # GitHub outbox), so it needs an explicit local-only retention pass.
+    state_diag = Path(f.state_path(config)).absolute() / 'diagnostics'
+    known_roots = {os.path.normcase(os.path.abspath(os.path.expanduser(root)))
+                   for root in roots}
+    if (os.path.normcase(str(state_diag)) not in known_roots
+            and (state_diag / 'events').exists()
+            and deadline - time.monotonic() >= _SETTLEMENT_RESERVE_S):
+        try:
+            result['retention'].append(prune(
+                state_diag, queue=None,
+                timeout=max(0, deadline - time.monotonic() - _SETTLEMENT_RESERVE_S),
+            ))
+        except TimeoutError:
+            raise
+        except (OSError, ValueError, RuntimeError) as exc:
+            result['status'] = 'degraded'
+            result['retention'].append({'status': 'unavailable', 'category': type(exc).__name__})
     if any(row.get('limited') for row in result['ingestion'] + result['retention']):
         result['status'] = 'degraded'
     if update_running:
@@ -178,6 +198,15 @@ def maintain(config=None, *, update_running=False, unit_dir=None, budget_seconds
         result['reporter_update'] = update
         if update.get('status') not in {'current', 'skipped', 'updated'}:
             result['status'] = 'degraded'
+    # Retroactive convergence: installed users carry legacy generations that
+    # predate this release. Opportunistically use the same runtime transaction
+    # after ordinary maintenance, but never let cleanup change the outcome.
+    try:
+        retirement = _maintain_retirement(config, deadline)
+    except TimeoutError:
+        retirement = {'retirement_warning': 'TimeoutError'}
+    if retirement:
+        result.update(retirement)
     return result
 
 
@@ -232,10 +261,22 @@ def ensure(config=None, *, unit_dir=None):
                 worker = _worker_view(config)
             native_status = service_status(unit_dir=unit_dir, runner=runner)
             ready = worker.get('healthy') and worker.get('runtime_source') == runtime['source_hash'] and native_status.get('status') == 'active'
-            return {'status': 'running' if ready else 'degraded',
-                    'runtime': runtime, 'service': native, 'service_status': native_status, 'worker': worker,
-                    'legacy_service': migration,
-                    'recovery_hint': 'Inspect reporting status; an explicit reporting ensure may restart a stopped worker.'}
+            response = {'status': 'running' if ready else 'degraded',
+                        'runtime': runtime, 'service': native, 'service_status': native_status, 'worker': worker,
+                        'legacy_service': migration,
+                        'recovery_hint': 'Inspect reporting status; an explicit reporting ensure may restart a stopped worker.'}
+            if ready:
+                # The new current is healthy: current + previous + the live
+                # worker generation are the only rollback-closure artifacts.
+                try:
+                    current = _read_current_or_none(root)
+                    previous = (current.get('previous_source_hash') if current
+                                else runtime.get('previous_source_hash'))
+                    extra = [previous, worker.get('runtime_source')]
+                    response.update(_retirement_summary(root, runtime['source_hash'], extra))
+                except TimeoutError:
+                    response['retirement_warning'] = 'TimeoutError'
+            return response
     except ServiceError as exc:
         return {'status': 'degraded', 'category': exc.category}
     except TimeoutError:
@@ -282,6 +323,67 @@ def _safe_category(exc, fallback_category):
     if isinstance(exc, RuntimeError) and text.replace('_', '').isalnum() and len(text) < 80:
         return text
     return fallback_category
+
+
+def _read_current_or_none(root):
+    from .reporting_runtime import _read_current
+    try:
+        return _read_current(root)
+    except TimeoutError:
+        raise
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
+def _retirement_summary(root, keep_source_hash, extra_keep, *, budget_seconds=3.0):
+    """Best-effort cleanup summary; it never invalidates a healthy handoff."""
+    from .reporting_runtime import retire_other_generations
+    keep = [value for value in extra_keep if value]
+    try:
+        retired = retire_other_generations(
+            root, keep_source_hash, extra_keep=keep, budget_seconds=budget_seconds,
+        )
+    except TimeoutError:
+        raise
+    except (OSError, ValueError, RuntimeError) as exc:
+        return {'retirement_warning': _safe_category(exc, type(exc).__name__)}
+    summary = {'retired_generations': list(retired)}
+    deferred = getattr(retired, 'deferred', ())
+    if deferred:
+        summary['retirement_deferred'] = list(deferred)
+    return summary
+
+
+def _maintain_retirement(config, deadline):
+    """Opportunistic retroactive cleanup under the existing runtime lock."""
+    from .reporting_runtime import runtime_transaction
+    pointer = Path(f.policy_path(config)).with_suffix('.runtime') / 'current.json'
+    if not pointer.exists() and not pointer.is_symlink():
+        return None
+    if deadline - time.monotonic() < 1.5:
+        return None
+    try:
+        with runtime_transaction(config, create=False, timeout=0.2) as root:
+            if root is None:
+                return None
+            current = _read_current_or_none(root)
+            if current is None:
+                return None
+            extra = [current.get('previous_source_hash'),
+                     _worker_view(config).get('runtime_source')]
+            budget = max(0.0, min(3.0, deadline - time.monotonic() - 1.0))
+            return _retirement_summary(
+                root, current['source_hash'], extra, budget_seconds=budget,
+            )
+    except TimeoutError:
+        raise
+    except RuntimeError as exc:
+        if str(exc) == 'runtime_busy':
+            # Another ensure/upgrade owns the transaction: normal and quiet.
+            return None
+        return {'retirement_warning': _safe_category(exc, 'runtime_retirement_failed')}
+    except (OSError, ValueError) as exc:
+        return {'retirement_warning': type(exc).__name__}
 
 
 def _enabled_policy(config, required_revision=None):
@@ -400,12 +502,21 @@ def upgrade_running(config=None, *, unit_dir=None, deadline=None):
                         and native_status.get('status') == 'active'):
                     _publish(root, {'schema': 1, 'source_hash': source_hash,
                                     'version': version, 'revision': revision})
-                    return {'status': 'updated', 'reason': 'reporter_updated',
-                            'previous': previous, 'new': target,
-                            'runtime': {'python': runtime['python']},
-                            'service': {'status': native_status.get('status'),
-                                        'changed': replacement.get('changed')},
-                            'rollback': 'not_needed'}
+                    updated = {'status': 'updated', 'reason': 'reporter_updated',
+                               'previous': previous, 'new': target,
+                               'runtime': {'python': runtime['python']},
+                               'service': {'status': native_status.get('status'),
+                                           'changed': replacement.get('changed')},
+                               'rollback': 'not_needed'}
+                    try:
+                        committed = _read_current_or_none(root)
+                        previous_hash = (committed.get('previous_source_hash') if committed
+                                         else current['source_hash'])
+                        extra = [previous_hash, worker.get('runtime_source')]
+                        updated.update(_retirement_summary(root, source_hash, extra))
+                    except TimeoutError:
+                        updated['retirement_warning'] = 'TimeoutError'
+                    return updated
                 failure = 'readback_unconfirmed'
             except subprocess.TimeoutExpired:
                 failure = 'update_deadline_exceeded'

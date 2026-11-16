@@ -22,7 +22,7 @@ wheels = [
 
 [[package]]
 name = "mindie-diagnostics"
-version = "0.5.12"
+version = "0.5.15"
 source = { editable = "." }
 
 [package.optional-dependencies]

@@ -147,6 +147,19 @@ def test_r3_5_update_failure_policy_context_and_over_limit_chain():
         cur = nxt
     assert update_failure_policy(cur) == ("prerequisite", False, "update_prerequisite_unavailable")
 
+    resolver_err = RuntimeError("command failed (128)")
+    resolver_err.category = "resolver"  # type: ignore[attr-defined]
+    assert update_failure_policy(resolver_err) == ("connectivity", False, "update_transport_unavailable")
+
+    for non_bug_cat in ("busy", "deferred", "prerequisite"):
+        wrapped_non_bug = RuntimeError("setup helper deferred")
+        cause = RuntimeError("lock busy")
+        cause.category = non_bug_cat  # type: ignore[attr-defined]
+        wrapped_non_bug.__cause__ = cause
+        assert update_failure_policy(wrapped_non_bug) == (
+            "prerequisite", False, "update_prerequisite_unavailable",
+        )
+
 
 def test_r3_7_deep_300_recursion_reaches_true_fault_and_incomplete_stack_omits_fault_tag(tmp_path):
     deep_file = tmp_path / "mindie_knowledge" / "deep300.py"

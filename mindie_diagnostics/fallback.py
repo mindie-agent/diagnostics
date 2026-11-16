@@ -368,12 +368,14 @@ def update_failure_policy(exception):
         category = getattr(current, "category", None)
         if code in {"release_transport_unavailable", "release_http_error"}:
             return "connectivity", False, code
-        if category in {"temporary_network", "rate_limited", "deadline"}:
+        if category in {"temporary_network", "rate_limited", "deadline", "resolver"}:
             return "connectivity", False, "update_transport_unavailable"
         if category in {"authentication", "certificate"}:
             return "credentials", False, "update_credentials_required"
         if category in {"permission", "hook_trust"}:
             return "permission", False, "update_permission_required"
+        if category in {"busy", "deferred", "prerequisite"}:
+            return "prerequisite", False, "update_prerequisite_unavailable"
         if category == "cancelled":
             return "cancelled", False, "update_cancelled"
         if ssl is not None and isinstance(current, ssl.SSLCertVerificationError):

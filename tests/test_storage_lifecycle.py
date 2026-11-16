@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import time
@@ -45,6 +46,16 @@ def _generation(generations: Path, source_hash: str) -> Path:
     nested.mkdir(parents=True)
     (nested / "pythonw.exe").write_bytes(b"locked-binary")
     return entry
+
+
+def _service_definition(unit_dir: Path, generation: Path) -> Path:
+    unit_dir.mkdir(exist_ok=True)
+    path = unit_dir / "mindie-worker.service"
+    path.write_text(
+        f"ExecStart={generation / 'venv' / 'bin' / 'python'} "
+        "-m mindie_diagnostics.worker\n"
+    )
+    return path
 
 
 def _exited_pid() -> int:
@@ -326,6 +337,156 @@ def test_maintain_defers_generation_retirement_when_worker_source_is_unconfirmed
         assert entries[source_hash].is_dir()
 
 
+def _three_generations(tmp_path):
+    config = _config(tmp_path)
+    root = _runtime_root(config)
+    generations = root / "generations"
+    generations.mkdir(mode=0o700)
+    live, previous, current = _hash("live-a"), _hash("previous-b"), _hash("current-c")
+    entries = {source_hash: _generation(generations, source_hash)
+               for source_hash in (live, previous, current)}
+    (root / "current.json").write_text(json.dumps({
+        "schema": 1, "source_hash": current, "version": "0.5.14",
+        "revision": None, "previous_source_hash": previous,
+    }))
+    return config, root, entries, live, previous, current
+
+
+def test_maintain_keeps_live_generation_when_worker_health_is_missing(tmp_path, monkeypatch):
+    config, root, entries, live, previous, current = _three_generations(tmp_path)
+    unit_dir = tmp_path / "units"
+    _service_definition(unit_dir, entries[current])
+    monkeypatch.setattr(commands, "_worker_view",
+                        lambda config: {"status": "not_started"})
+    monkeypatch.setattr(service, "service_status", lambda **kwargs: {"status": "absent"})
+    monkeypatch.setattr(retirement, "live_generation_hashes",
+                        lambda roots, deadline=None: ({live}, True))
+
+    result = commands.maintain(config, budget_seconds=20, unit_dir=unit_dir)
+
+    # The service definition names C, but the live process still runs A.
+    assert result["retired_generations"] == []
+    for source_hash in (live, previous, current):
+        assert entries[source_hash].is_dir()
+
+
+def test_maintain_defers_when_service_unit_exists_without_healthy_worker(tmp_path, monkeypatch):
+    config, root, entries, live, previous, current = _three_generations(tmp_path)
+    unit_dir = tmp_path / "units"
+    _service_definition(unit_dir, entries[current])
+    monkeypatch.setattr(commands, "_worker_view",
+                        lambda config: {"status": "not_started"})
+    monkeypatch.setattr(service, "service_status", lambda **kwargs: {"status": "active"})
+
+    result = commands.maintain(config, budget_seconds=20, unit_dir=unit_dir)
+
+    # A service unit without a healthy worker cannot prove that A is gone, even
+    # though the unit definition already names C.
+    assert result["retirement"]["status"] == "deferred"
+    assert result["retirement"]["reason"] == "worker_generation_unconfirmed"
+    for source_hash in (live, previous, current):
+        assert entries[source_hash].is_dir()
+
+
+def test_maintain_defers_when_live_process_scan_is_incomplete(tmp_path, monkeypatch):
+    config, root, entries, live, previous, current = _three_generations(tmp_path)
+    monkeypatch.setattr(commands, "_worker_view",
+                        lambda config: {"status": "not_started"})
+    monkeypatch.setattr(service, "service_status", lambda **kwargs: {"status": "absent"})
+    monkeypatch.setattr(retirement, "live_generation_hashes",
+                        lambda roots, deadline=None: (set(), False))
+
+    result = commands.maintain(config, budget_seconds=20)
+
+    assert result["retirement"]["status"] == "deferred"
+    for source_hash in (live, previous, current):
+        assert entries[source_hash].is_dir()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX ps process inspection")
+def test_live_generation_scan_finds_a_real_process_path(tmp_path):
+    source_hash = "a" * 64
+    generation = tmp_path / "generations" / source_hash
+    proc = subprocess.Popen(
+        [sys.executable, "-I", "-c", "import time; time.sleep(30)", str(generation)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        found, complete = set(), False
+        while time.monotonic() < deadline:
+            found, complete = retirement.live_generation_hashes(
+                (tmp_path / "generations",), deadline=time.monotonic() + 2)
+            if found:
+                break
+            time.sleep(0.05)
+        assert complete is True
+        assert source_hash in found
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+
+def test_service_definition_scan_counts_every_entry_and_stops_at_cap(tmp_path, monkeypatch):
+    unit_dir = tmp_path / "units"
+    unit_dir.mkdir()
+
+    class _Entry:
+        def __init__(self, index):
+            self.path = str(unit_dir / f"{index:03d}.file")
+
+        def is_file(self, follow_symlinks=False):
+            return True
+
+    class _Scan:
+        def __enter__(self):
+            return iter(_Entry(index) for index in range(100))
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(commands.os, "scandir", lambda path: _Scan())
+
+    files = commands._service_definition_files(unit_dir, None, time.monotonic() + 5)
+
+    scanned = [path for path in files
+               if path.parent == unit_dir and path.name.endswith(".file")]
+    assert len(scanned) == commands._SERVICE_ENTRY_LIMIT
+
+
+def test_service_definition_scan_stops_at_deadline(tmp_path, monkeypatch):
+    unit_dir = tmp_path / "units"
+    unit_dir.mkdir()
+
+    class _Entry:
+        def __init__(self, index):
+            self.path = str(unit_dir / f"{index:03d}.file")
+
+        def is_file(self, follow_symlinks=False):
+            return True
+
+    class _Scan:
+        def __enter__(self):
+            return iter(_Entry(index) for index in range(10))
+
+        def __exit__(self, *exc):
+            return False
+
+    clock = iter((0.0, 10.0))
+    monkeypatch.setattr(commands.os, "scandir", lambda path: _Scan())
+    monkeypatch.setattr(commands.time, "monotonic", lambda: next(clock))
+
+    files = commands._service_definition_files(unit_dir, None, 5.0)
+
+    scanned = [path for path in files
+               if path.parent == unit_dir and path.name.endswith(".file")]
+    assert len(scanned) == 1
+
+
 def test_maintain_runs_bounded_windows_orphan_profile_cleanup(tmp_path, monkeypatch):
     config = _config(tmp_path)
     calls = []
@@ -344,7 +505,7 @@ def test_maintain_runs_bounded_windows_orphan_profile_cleanup(tmp_path, monkeypa
     assert result["orphan_profiles"]["swept_trash"] == [".trash-old"]
 
 
-def test_remove_tree_removes_a_junction_link_without_traversing_its_target(tmp_path, monkeypatch):
+def test_remove_tree_detects_windows_junction_without_os_path_isjunction(tmp_path, monkeypatch):
     sentinel = tmp_path / "sentinel"
     sentinel.mkdir()
     keep = sentinel / "keep.txt"
@@ -352,21 +513,79 @@ def test_remove_tree_removes_a_junction_link_without_traversing_its_target(tmp_p
     trash = tmp_path / ".trash-junction"
     trash.mkdir()
     junction = trash / "junction"
-    try:
-        junction.symlink_to(sentinel, target_is_directory=True)
-    except OSError:
-        pytest.skip("symlink/junction simulation unavailable")
+    junction.mkdir()
 
-    monkeypatch.setattr(retirement, "_is_junction", lambda path: Path(path) == junction)
-    real_rmdir = retirement._rmdir
-    monkeypatch.setattr(
-        retirement, "_rmdir",
-        lambda path: os.unlink(path) if Path(path) == junction else real_rmdir(path),
-    )
+    real_lstat = os.lstat
+    real_scandir = os.scandir
+    scans = []
+
+    class _JunctionStat:
+        st_mode = stat.S_IFDIR
+        st_file_attributes = stat.S_IFDIR | 0x410  # DIRECTORY | REPARSE_POINT
+        st_reparse_tag = 0xA0000003  # IO_REPARSE_TAG_MOUNT_POINT
+
+    class _PathWithoutIsjunction:
+        def __getattr__(self, attribute):
+            if attribute == "isjunction":
+                raise AttributeError(attribute)
+            return getattr(os.path, attribute)
+
+    class _WindowsOS:
+        name = "nt"
+        path = _PathWithoutIsjunction()
+
+        def lstat(self, path):
+            if Path(path) == junction:
+                return _JunctionStat()
+            return real_lstat(path)
+
+        def scandir(self, path):
+            scans.append(Path(path))
+            return real_scandir(path)
+
+        def __getattr__(self, attribute):
+            return getattr(os, attribute)
+
+    monkeypatch.setattr(retirement, "os", _WindowsOS())
+
+    # Simulate Python 3.11, where os.path has no isjunction at all.
+    assert not hasattr(retirement.os.path, "isjunction")
+    assert retirement._is_junction(junction) is True
+    assert retirement._remove_tree(trash, time.monotonic() + 5) is True
+    assert junction not in scans  # a junction is never traversed
+    assert not trash.exists()
+    assert keep.read_text() == "outside"
+    assert sentinel.is_dir()
+
+
+def test_remove_tree_unlinks_a_symlink_without_touching_its_target(tmp_path):
+    target = tmp_path / "target"
+    target.mkdir()
+    keep = target / "keep.txt"
+    keep.write_text("outside")
+    trash = tmp_path / ".trash-link"
+    trash.mkdir()
+    link = trash / "link"
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation unavailable")
 
     assert retirement._remove_tree(trash, time.monotonic() + 5) is True
     assert keep.read_text() == "outside"
-    assert sentinel.is_dir() and not trash.exists()
+    assert target.is_dir() and not trash.exists()
+
+
+def test_lstat_timeout_propagates_from_junction_detection(tmp_path, monkeypatch):
+    def timeout_lstat(path):
+        raise TimeoutError("simulated lstat timeout")
+
+    monkeypatch.setattr(retirement.os, "lstat", timeout_lstat)
+
+    with pytest.raises(TimeoutError):
+        retirement._is_junction(tmp_path / "entry")
+    with pytest.raises(TimeoutError):
+        retirement._remove_tree(tmp_path / "entry", time.monotonic() + 5)
 
 
 class _WindowsOS:
@@ -374,6 +593,89 @@ class _WindowsOS:
 
     def __getattr__(self, attribute):
         return getattr(os, attribute)
+
+
+def test_remove_tree_continues_after_a_child_disappears(tmp_path, monkeypatch):
+    root = tmp_path / "tree"
+    root.mkdir()
+    first = root / "first.txt"
+    first.write_text("first")
+    second = root / "second.txt"
+    second.write_text("second")
+    third = root / "third.txt"
+    third.write_text("third")
+    real_unlink = retirement._unlink
+    disappeared = []
+
+    def unlink_once(path):
+        path = Path(path)
+        if path == first and not disappeared:
+            disappeared.append(path)
+            real_unlink(path)
+            raise FileNotFoundError(path)
+        return real_unlink(path)
+
+    monkeypatch.setattr(retirement, "_unlink", unlink_once)
+
+    assert retirement._remove_tree(root, time.monotonic() + 5) is True
+    assert disappeared == [first]
+    assert not first.exists() and not second.exists() and not third.exists()
+    assert not root.exists()
+
+
+def test_remove_tree_returns_false_when_the_root_survives(tmp_path, monkeypatch):
+    root = tmp_path / "tree"
+    root.mkdir()
+    child = root / "child.txt"
+    child.write_text("child")
+    real_rmdir = retirement._rmdir
+
+    def fail_root(path):
+        if Path(path) == root:
+            raise OSError("root is held open")
+        return real_rmdir(path)
+
+    monkeypatch.setattr(retirement, "_rmdir", fail_root)
+
+    assert retirement._remove_tree(root, time.monotonic() + 5) is False
+    assert root.is_dir()
+    assert not child.exists()
+
+
+def test_profile_idle_requires_a_complete_scan(tmp_path, monkeypatch):
+    profile = tmp_path / ("a" * 20)
+    profile.mkdir()
+    monkeypatch.setattr(retirement, "_bounded_entries",
+                        lambda path, deadline: ([], False))
+
+    assert retirement._profile_idle(profile, time.monotonic() + 5) is False
+
+
+def test_orphan_profile_cleanup_rechecks_deadline_before_replace(tmp_path, monkeypatch):
+    profiles = tmp_path / "profiles"
+    profiles.mkdir()
+    active_name = "a" * 20
+    (profiles / active_name).mkdir()
+    dead = profiles / ("b" * 20)
+    dead.mkdir()
+    (dead / "profile.json").write_text(json.dumps({
+        "schema": 1, "root": str(tmp_path / "missing-root"),
+    }))
+    monkeypatch.setattr(retirement, "os", _WindowsOS())
+    monkeypatch.setattr(runtime, "_generations", lambda root: profiles / active_name)
+    monkeypatch.setattr(retirement, "_profile_idle",
+                        lambda path, deadline: time.sleep(0.3) or True)
+    replaced = []
+    monkeypatch.setattr(retirement.os, "replace",
+                        lambda source, destination: replaced.append(source))
+
+    result = retirement.prune_orphan_windows_profiles(
+        tmp_path / "active-root", budget_seconds=0.2)
+
+    # The scan consumed the whole budget: do not rename the profile to trash.
+    assert replaced == []
+    assert dead.is_dir()
+    assert dead.name in result.deferred
 
 
 def test_orphan_profile_defers_when_the_target_volume_anchor_is_unavailable(tmp_path, monkeypatch):

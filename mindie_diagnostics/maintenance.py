@@ -15,9 +15,11 @@ signal backpressure to active log writers when retention limits remain exceeded.
 - File identity is re-read with `os.stat(follow_symlinks=False)` whenever a
   `DirEntry` reports zero `st_dev`/`st_ino` (Windows `DirEntry.stat` leaves
   them zero), so cursor matching and the pre-unlink check agree.
-- A stale `blocked=True` marker may be recovered at most once per 300s. The
-  claimant atomically advances `checked_at` before scanning, then a bounded
-  rotation/recovery prune may clear the marker for a cold-start writer.
+- A stale `blocked=True` marker may be recovered at most once per 300s. After
+  acquiring the exclusive claim the claimant re-reads the marker, verifies
+  `blocked`/`checked_at` are still stale, then atomically advances
+  `checked_at` before scanning; a caller holding a stale pre-claim read
+  therefore cannot run a second recovery inside the same cooldown.
 
 [Timeouts & Locks]
 - The caller's monotonic budget (default 5.0s) reserves 50ms for releasing the
@@ -187,10 +189,11 @@ def _marker_state(path):
 def claim_recovery(root, *, cooldown: float = 300.0, now=None) -> bool:
     """Atomically claim a stale blocked-marker recovery pass.
 
-    The marker's `checked_at` is advanced under an exclusive claim file before
-    any scanning, so concurrent blocked writers observe the cooldown instead of
-    stampeding the same recovery prune. A crashed claimant is reclaimable once
-    its claim file is itself older than the cooldown.
+    The marker is re-read under the exclusive claim file before `checked_at`
+    is advanced, so a caller that read the stale marker before another caller
+    claimed cannot run a second recovery prune inside the same cooldown. A
+    crashed claimant is reclaimable once its claim file is itself older than
+    the cooldown.
     """
     root = Path(root)
     if root.is_symlink():
@@ -240,7 +243,18 @@ def claim_recovery(root, *, cooldown: float = 300.0, now=None) -> bool:
         return False
     try:
         os.close(descriptor)
-        state = dict(state)
+        # Two callers can read the stale marker before either claims. Re-read
+        # it under the exclusive claim so the loser sees the winner's advanced
+        # checked_at (or a cleared blocked flag) and stays inside the cooldown.
+        current = _marker_state(root / 'retention-state.json')
+        checked = current.get('checked_at') if current is not None else None
+        if (current is None or current.get('blocked') is not True
+                or isinstance(checked, bool)
+                or not isinstance(checked, (int, float))
+                or not math.isfinite(checked) or now - checked < cooldown):
+            claim.unlink()
+            return False
+        state = dict(current)
         state['checked_at'] = now
         _write_marker(root, state)
         return True

@@ -1,43 +1,36 @@
 """Explicit local reporting lifecycle commands (`maintain`, `ensure`, `upgrade_running`).
 
 [Role]
-Implements offline maintenance (`maintain`), explicit runtime + native service
-provisioning (`ensure`), and bounded automatic runtime handoff (`upgrade_running`).
+Offline maintenance, explicit runtime + native service provisioning (`ensure`),
+and bounded automatic runtime handoff (`upgrade_running`).
 
 [Invariants]
 - Never invoked automatically when a tool records a local failure.
-- `maintain` phases (consent, intake, retention) are independent: each degrades
-  the status without cancelling the others; intake needs an enabled policy.
-- `upgrade_running` upgrades only a verified live worker, including degraded
-  workers, when the installed distribution is strictly newer (`_source_order == "newer"`) and at
-  least 60s of budget remain (`61s` from `maintain`).
-- `current.json` is published only AFTER the replaced service passes health and
-  `runtime_source` readback verification; otherwise rolls back to `old_python`.
-- Generation retirement is admitted only when the live worker's source hash is
-  confirmed, or a native service definition independently resolves it; an
-  unavailable/unconfirmable worker defers retirement
-  (`worker_generation_unconfirmed`) with a non-fatal warning.
+- `maintain` phases (consent, intake, retention) are independent and degrade
+  only their own status; intake requires an enabled policy.
+- `upgrade_running` only upgrades a verified live worker when the installed
+  distribution is strictly newer (`_source_order == "newer"`) and at least 60s
+  remain (`61s` from `maintain`); `current.json` is published only after
+  health/`runtime_source` readback, otherwise it rolls back to `old_python`.
+- Generation retirement requires a complete live-process scan; a service unit
+  that exists while the worker is not healthy defers, and `not_started` plus a
+  service definition is not proof that no older worker runs. Unconfirmed
+  workers defer retirement (`worker_generation_unconfirmed`).
 - Opportunistic Windows orphan-profile cleanup runs from `maintain` inside the
-  remaining monotonic budget and never changes the aggregate status.
+  remaining budget and never changes the aggregate status.
 
 [Timeouts & Locks]
-- `maintain`'s capped monotonic budget admits stages instead of
-  capping wall clock: roots, intake and retention start only with
-  `_SETTLEMENT_RESERVE_S = 3.0s` left, intake scans until `deadline - 3.0s`, and
-  work already inside a lawful 3-5s SQLite wait may outlive the budget.
-- Retention receives the remaining budget minus that settlement reserve;
-  reader snapshots admit their SQLite wait only when it fits.
-- The retirement guard's native status probe uses a runner capped at the
-  remaining budget; profile cleanup is capped at 3s and starts only with
-  `>= 0.5s` left.
-- `upgrade_running` reserves `_ROLLBACK_RESERVE_S = 20.0s` for rollback before
-  `deadline`, caps lock acquisition at `_LOCK_WAIT_S = 12.0s`, and polls worker
-  readback for up to `_READBACK_S = 8.0s`.
+- `maintain` shares one capped monotonic budget: retention/intake start with
+  `_SETTLEMENT_RESERVE_S = 3.0s` left and work inside a lawful 3-5s SQLite wait
+  may outlive it.
+- The retirement process scan and native status probe share the caller
+  deadline; profile cleanup is capped at 3s and starts only with `>= 0.5s`.
+- `upgrade_running` reserves `_ROLLBACK_RESERVE_S = 20.0s`, caps lock
+  acquisition at `_LOCK_WAIT_S = 12.0s`, and polls readback for `_READBACK_S`.
 
 [Side-Effect Policy]
-- Coordinates runtime generation preparation and native service installation
-  under `runtime_transaction`. Opportunistic retention/generation retirement is
-  bounded and never changes a healthy runtime or service status.
+- Coordinates runtime/service changes under `runtime_transaction`; opportunistic
+  retention/retirement is bounded and cannot change a healthy runtime status.
 """
 from __future__ import annotations
 
@@ -317,6 +310,7 @@ _ROLLBACK_RESERVE_S = 20.0
 _LOCK_WAIT_S = 12.0
 _SOURCE_HASH = re.compile(r'[0-9a-f]{64}\Z')
 _SERVICE_HASH = re.compile(rb'([0-9a-f]{64})[\\/]+venv[\\/]+(?:Scripts|bin)[\\/]')
+_SERVICE_ENTRY_LIMIT = 64
 
 
 def _utcnow():
@@ -373,14 +367,19 @@ def _verified_worker_source(view):
     return source if isinstance(source, str) and _SOURCE_HASH.fullmatch(source) else None
 
 
-def _service_definition_files(unit_dir, config):
-    """Bounded candidate definitions for the installed native worker."""
+def _service_definition_files(unit_dir, config, deadline=None):
+    """Bounded candidate definitions: 64 scan entries under one deadline."""
     files = []
+    if deadline is None:
+        deadline = time.monotonic() + 1.0
     if unit_dir is not None:
         try:
             with os.scandir(Path(unit_dir)) as scan:
+                entries = 0
                 for entry in scan:
-                    if len(files) >= 16:
+                    entries += 1
+                    # Every entry, file or not, consumes one bounded slot.
+                    if entries > _SERVICE_ENTRY_LIMIT or time.monotonic() >= deadline:
                         break
                     try:
                         if entry.is_file(follow_symlinks=False):
@@ -411,10 +410,12 @@ def _service_definition_files(unit_dir, config):
     return files
 
 
-def _service_definition_source(unit_dir, config):
+def _service_definition_source(unit_dir, config, deadline=None):
     """Resolve the generation hash from an installed service definition."""
     seen = set()
-    for path in _service_definition_files(unit_dir, config):
+    for path in _service_definition_files(unit_dir, config, deadline):
+        if deadline is not None and time.monotonic() >= deadline:
+            break
         try:
             key = os.fspath(path)
         except TypeError:
@@ -437,7 +438,7 @@ def _service_definition_source(unit_dir, config):
 
 
 def _retirement_decision(config, *, unit_dir=None, worker=None, deadline=None):
-    """Never retire generations while a live worker's source is unconfirmed."""
+    """Never retire a generation whose live worker cannot be confirmed."""
     try:
         view = worker if isinstance(worker, dict) else _worker_view(config)
     except TimeoutError:
@@ -445,12 +446,11 @@ def _retirement_decision(config, *, unit_dir=None, worker=None, deadline=None):
     except (OSError, ValueError, RuntimeError):
         return {'allowed': False, 'keep': ()}
     source = _verified_worker_source(view)
-    if source is not None:
-        return {'allowed': True, 'keep': (source,)}
     status = view.get('status') if isinstance(view, dict) else None
+    healthy = bool(isinstance(view, dict) and view.get('healthy') is True)
     maybe_alive = bool(
         (isinstance(view, dict)
-         and (view.get('healthy') is True or view.get('running') is True
+         and (healthy or view.get('running') is True
               or (type(view.get('pid')) is int and view.get('pid') > 0
                   and status not in ('stopped', 'not_started'))))
         or status not in (None, 'not_started', 'stopped', 'absent'))
@@ -468,17 +468,33 @@ def _retirement_decision(config, *, unit_dir=None, worker=None, deadline=None):
         native = None
     if not isinstance(native, dict):
         return {'allowed': False, 'keep': ()}
-    # An unavailable/alive-but-unidentified worker may be a process from an
-    # older generation than the unit now names, so a service definition is not
-    # proof of its runtime while the worker itself could still be alive.
-    if maybe_alive:
+    # `not_started` from a missing health file proves nothing while a service
+    # unit still exists: an older process A may still be the running worker
+    # even though the service definition already names C.
+    unit_exists = native.get('status') not in (None, 'absent')
+    if (source is None and maybe_alive) or (unit_exists and not healthy):
         return {'allowed': False, 'keep': ()}
-    if native.get('status') not in (None, 'absent'):
-        resolved = _service_definition_source(unit_dir, config)
+    from .runtime_retirement import generation_roots, live_generation_hashes
+    try:
+        roots = generation_roots(config)
+        live, complete = (
+            live_generation_hashes(roots, deadline=deadline) if roots
+            else (set(), False))
+    except TimeoutError:
+        raise
+    except (OSError, ValueError, RuntimeError):
+        return {'allowed': False, 'keep': ()}
+    if not complete:
+        return {'allowed': False, 'keep': ()}
+    keep = tuple(sorted(live | ({source} if source is not None else set())))
+    if source is not None:
+        return {'allowed': True, 'keep': keep}
+    if unit_exists:
+        resolved = _service_definition_source(unit_dir, config, deadline)
         if resolved is not None:
-            return {'allowed': True, 'keep': (resolved,)}
+            return {'allowed': True, 'keep': (resolved, *keep)}
         return {'allowed': False, 'keep': ()}
-    return {'allowed': True, 'keep': ()}
+    return {'allowed': True, 'keep': keep}
 
 
 def _retirement_summary(root, keep_source_hash, extra_keep, *, budget_seconds=3.0):

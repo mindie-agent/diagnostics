@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 import subprocess
@@ -276,3 +277,47 @@ def test_windows_dir_entry_zero_identity_falls_back_to_os_stat(tmp_path, monkeyp
     # The cursor comparison and the pre-unlink identity check both used the
     # real non-zero identity returned by os.stat, not DirEntry's zeros.
     assert seen == [(identity.st_ino, identity.st_size)]
+
+
+def test_back_to_back_recovery_claim_runs_prune_once(tmp_path, monkeypatch):
+    now = time.time()
+    stale = {
+        "schema": 1, "blocked": True, "limited": True,
+        "checked_at": now - 3600,
+    }
+    marker = tmp_path / "retention-state.json"
+    marker.write_text(json.dumps(stale))
+    marker.chmod(0o600)
+    prunes = []
+
+    def recover():
+        if not maintenance.claim_recovery(tmp_path, cooldown=300, now=now):
+            return False
+        try:
+            prunes.append(1)
+        finally:
+            maintenance.release_recovery(tmp_path)
+        return True
+
+    # Caller one reads the stale marker, claims recovery, advances checked_at
+    # to `now`, prunes, and releases.
+    assert recover() is True
+
+    # Caller two had already read the same stale marker before caller one
+    # claimed. Its post-claim re-read must observe the advanced checked_at and
+    # must not run a second recovery prune inside the cooldown.
+    real_marker_state = maintenance._marker_state
+    reads = []
+
+    def stale_preclaim_read(path):
+        reads.append(1)
+        if len(reads) == 1:
+            return dict(stale)
+        return real_marker_state(path)
+
+    monkeypatch.setattr(maintenance, "_marker_state", stale_preclaim_read)
+
+    assert recover() is False
+    assert prunes == [1]
+    assert json.loads(marker.read_text())["checked_at"] == now
+    assert not (tmp_path / ".retention-recovery").exists()

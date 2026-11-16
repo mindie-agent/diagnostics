@@ -21,8 +21,10 @@ current.json and transaction lock remain the only activation authority.
 [Side-Effect Policy]
 - Failed staging directories (`.staging-<uuid>`) are cleaned up in `finally`
   without mutating `current.json`.
-- `retire_other_generations` removes superseded generation directories only
-  after a successful service handoff.
+- `retire_other_generations` is two-phase: an eligible generation is first
+  atomically renamed to `.trash-*`; only then is the trash removed. A Windows
+  open handle makes the rename fail, leaving the generation byte-for-byte
+  intact for a later attempt.
 """
 
 import hashlib
@@ -38,6 +40,13 @@ from contextlib import contextmanager
 from pathlib import Path
 from .fallback import _private_mkdir
 from .filesystem import path_identity
+from .runtime_retirement import (
+    _Retirement,
+    _bounded_entries,
+    _native_path,
+    _remove_tree,
+    prune_orphan_windows_profiles,
+)
 
 _PKG = "mindie_diagnostics"
 _DIST = "mindie-diagnostics"
@@ -51,6 +60,7 @@ _VERIFY = (
     "print(json.dumps({'v':m.version('mindie-diagnostics'),'p':p.__file__}))"
 )
 _LOCK_WAIT = 12.0  # Bounded seconds to acquire the runtime transaction lock.
+_STAGING_MAX_AGE_S = 1800.0
 
 
 def _fail(category):
@@ -357,6 +367,17 @@ def _publish_json(root, name, payload):
 
 
 def _publish(root, payload):
+    """Advance current.json while retaining exactly one rollback hash."""
+    current = _read_current(root)
+    payload = dict(payload)
+    if current is None:
+        payload.pop("previous_source_hash", None)
+    elif current.get("source_hash") == payload.get("source_hash"):
+        # A no-op republish must not drop the already committed rollback hash.
+        if "previous_source_hash" in current:
+            payload["previous_source_hash"] = current.get("previous_source_hash")
+    else:
+        payload["previous_source_hash"] = current["source_hash"]
     _publish_json(root, "current.json", payload)
 
 
@@ -433,30 +454,125 @@ def _generations(root):
     return path if str(path).startswith("\\\\?\\") else Path("\\\\?\\" + str(path))
 
 
-def retire_other_generations(root, keep_source_hash):
-    """Retire owned artifacts after handoff, including the legacy layout."""
+def _write_windows_profile(root, generations):
+    """Mark a Windows profile so orphan cleanup never guesses at unmarked dirs."""
+    if os.name != "nt":
+        return
+    marker = Path(generations) / "profile.json"
+    if marker.exists() or marker.is_symlink():
+        return
+    payload = {"schema": 1, "root": str(Path(root).resolve())}
+    try:
+        _write(marker, json.dumps(payload, separators=(",", ":")).encode() + b"\n")
+    except TimeoutError:
+        raise
+    except (OSError, RuntimeError):
+        pass
+
+
+def retire_other_generations(root, keep_source_hash, *, extra_keep=(),
+                             budget_seconds=3.0):
+    """Two-phase retire of superseded generations and stale staging dirs.
+
+    First sweep interrupted `.trash-*` removals, then atomically rename each
+    eligible entry to `.trash-*` before deleting it. A failed rename (Windows
+    open pythonw.exe/.dll) leaves the original generation untouched.
+    """
     from mindie_diagnostics.fallback import _owned
 
-    if not _is_source_hash(keep_source_hash):
+    # A single hash stays the historical signature; an iterable keep-set is
+    # accepted as well and folded into the same never-touch closure.
+    if isinstance(keep_source_hash, str):
+        primary, extra = keep_source_hash, extra_keep
+    else:
+        values = list(keep_source_hash or ())
+        if not values:
+            _fail("runtime_untrusted")
+        primary, extra = values[0], [*values[1:], *extra_keep]
+    if not _is_source_hash(primary):
         _fail("runtime_untrusted")
+    if isinstance(extra, str):
+        extra = (extra,)
     root = Path(root)
     _require_dir(root, _owned)
-    retired = []
+    keep = {primary}
+    keep.update(value for value in extra if _is_source_hash(value))
+    deadline = time.monotonic() + max(0.0, float(budget_seconds))
+    retired, deferred, staging_retired, now = [], [], [], time.time()
     for generations in dict.fromkeys((_generations(root), root / "generations")):
         if not generations.exists() and not generations.is_symlink():
             continue
         _require_dir(generations, _owned)
-        for entry in sorted(generations.iterdir(), key=lambda p: p.name):
-            if entry.name == keep_source_hash:
+        try:
+            entries, _complete = _bounded_entries(generations, deadline)
+        except TimeoutError:
+            raise
+        except OSError:
+            continue
+        entries.sort(key=lambda entry: entry.name)
+        # Phase 1: finish a prior process's interrupted trash sweep.
+        for entry in entries:
+            if time.monotonic() >= deadline:
+                return _Retirement(retired, deferred, staging_retired)
+            if not entry.name.startswith(".trash-"):
                 continue
-            if entry.is_symlink() or not _is_source_hash(entry.name) or not entry.is_dir():
+            if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
                 continue
-            if not _owned(entry.lstat()):
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except TimeoutError:
+                raise
+            except OSError:
                 continue
-            shutil.rmtree(entry, ignore_errors=True)
-            if not entry.exists():
-                retired.append(entry.name)
-    return retired
+            if not _owned(info):
+                continue
+            try:
+                if not _remove_tree(Path(entry.path), deadline):
+                    deferred.append(entry.name)
+            except TimeoutError:
+                raise
+            except PermissionError:
+                continue
+            except OSError:
+                deferred.append(entry.name)
+        # Phase 2: detach eligible entries, then delete only the detached trash.
+        for entry in entries:
+            if time.monotonic() >= deadline:
+                return _Retirement(retired, deferred, staging_retired)
+            name = entry.name
+            staging = name.startswith(".staging-")
+            if not staging and (name in keep or not _is_source_hash(name)):
+                continue
+            if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                continue
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except TimeoutError:
+                raise
+            except OSError:
+                continue
+            if not _owned(info):
+                continue
+            if staging and now - info.st_mtime < _STAGING_MAX_AGE_S:
+                continue
+            trash = generations / f".trash-{name[:16]}-{uuid.uuid4().hex[:8]}"
+            try:
+                os.replace(_native_path(entry.path), _native_path(trash))
+            except TimeoutError:
+                raise
+            except OSError:
+                # An open Windows handle: the source stays 100% intact.
+                deferred.append(name)
+                continue
+            (staging_retired if staging else retired).append(name)
+            try:
+                if not _remove_tree(trash, deadline):
+                    deferred.append(trash.name)
+            except TimeoutError:
+                raise
+            except OSError:
+                deferred.append(trash.name)
+    return _Retirement(retired, deferred, staging_retired)
 
 
 @contextmanager
@@ -583,6 +699,7 @@ def _prepare_locked(config, *, publish=True, source=None, deadline=None):
     version, revision, files, source_hash = source if source is not None else _collect_source()
     root = _ensure_dir(_root_path(config), _as_local_absolute, _owned)
     generations = _ensure_dir(_generations(root), _as_local_absolute, _owned)
+    _write_windows_profile(root, generations)
     if os.name == "nt" and len(str(generations / source_hash / "venv/Scripts/pythonw.exe")) >= 260:
         _fail("runtime_artifact_path_too_long")
     current = _read_current(root)
@@ -623,6 +740,10 @@ def _prepare_locked(config, *, publish=True, source=None, deadline=None):
         previous = None if current is None else current.get("revision")
         if changed and publish:
             _publish(root, {"schema": 1, "source_hash": source_hash, "version": version, "revision": revision})
+        previous_source_hash = None
+        if current is not None:
+            previous_source_hash = (current.get("source_hash") if changed
+                                    else current.get("previous_source_hash"))
         return {
             "status": "ready",
             "python": str(py),
@@ -630,6 +751,7 @@ def _prepare_locked(config, *, publish=True, source=None, deadline=None):
             "revision": revision,
             "source_hash": source_hash,
             "previous_revision": previous,
+            "previous_source_hash": previous_source_hash,
             "changed": changed,
             "published": bool(changed and publish),
         }

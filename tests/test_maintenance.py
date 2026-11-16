@@ -1,6 +1,10 @@
+import json
 import os
 import sqlite3
+import subprocess
+import sys
 import time
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -123,4 +127,197 @@ def test_windows_never_uses_os_kill_as_a_probe(monkeypatch):
     def unsafe(*args):
         pytest.fail('Windows os.kill must not be used for retention')
     monkeypatch.setattr(maintenance, 'os', SimpleNamespace(name='nt', kill=unsafe))
+    monkeypatch.setattr(maintenance, '_kernel32', lambda: None)
     assert maintenance._writer_exited(123) is False
+
+
+def test_real_exited_process_pid_is_definitively_dead_on_current_os():
+    windowless = {'creationflags': subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {}
+    proc = subprocess.Popen([sys.executable, '-I', '-c', 'pass'], **windowless)
+    proc.wait(timeout=10)
+    assert maintenance._writer_exited(proc.pid) is True
+
+
+def _fake_kernel32(*, handle=0, error=0, exit_code=None, exit_ok=True):
+    calls = []
+
+    def open_process(access, inherit, pid):
+        calls.append(('open', access, inherit, pid))
+        return handle
+
+    def get_exit_code(opened, pointer):
+        calls.append(('exit', opened))
+        if exit_ok:
+            pointer._obj.value = exit_code
+        return 1 if exit_ok else 0
+
+    def close(opened):
+        calls.append(('close', opened))
+        return 1
+
+    return SimpleNamespace(
+        OpenProcess=open_process,
+        GetExitCodeProcess=get_exit_code,
+        CloseHandle=close,
+    ), calls
+
+
+@pytest.mark.parametrize(('handle', 'error', 'exit_code', 'closed', 'exited'), [
+    (0, 87, None, False, True),    # ERROR_INVALID_PARAMETER: PID is gone.
+    (0, 5, None, False, False),    # ERROR_ACCESS_DENIED: live protected PID.
+    (0, 6, None, False, False),    # Unknown observation is not proof of exit.
+    (0x1234, 0, 259, True, False),  # STILL_ACTIVE.
+    (0x1234, 0, 0, True, True),     # Exited with code 0.
+    (0x1234, 0, None, True, False),  # GetExitCodeProcess failed.
+])
+def test_windows_writer_exit_contract_uses_kernel32_only(
+        monkeypatch, handle, error, exit_code, closed, exited):
+    kernel32, calls = _fake_kernel32(
+        handle=handle, error=error, exit_code=exit_code,
+        exit_ok=exit_code is not None,
+    )
+    monkeypatch.setattr(maintenance, '_kernel32', lambda: kernel32)
+    monkeypatch.setattr(maintenance.ctypes, 'get_last_error', lambda: error, raising=False)
+    monkeypatch.setattr(maintenance, 'os', SimpleNamespace(
+        name='nt', kill=lambda *args: pytest.fail('os.kill is not a Windows probe')))
+
+    assert maintenance._writer_exited(4242) is exited
+    assert calls[0] == ('open', 0x1000, False, 4242)
+    assert (('close', handle) in calls) is closed
+
+
+def test_prune_collects_more_than_the_old_4096_entry_cutoff(tmp_path, monkeypatch):
+    monkeypatch.setattr(maintenance, '_writer_exited', lambda pid: True)
+    folder = tmp_path / 'events' / 'test'
+    folder.mkdir(parents=True)
+    for index in range(4100):
+        (folder / (str(100000 + index) + '-' + 'a' * 32 + '.jsonl')).write_text('x')
+    result = prune(tmp_path, max_bytes=1, clock=lambda: 10**10, timeout=10)
+    assert result['removed_files'] == 4100
+    assert not folder.exists()
+    assert (tmp_path / 'retention-state.json').exists()
+
+
+def test_prune_removes_emptied_component_directory(tmp_path, monkeypatch):
+    monkeypatch.setattr(maintenance, '_writer_exited', lambda pid: True)
+    folder = tmp_path / 'events' / 'only'
+    folder.mkdir(parents=True)
+    path = folder / ('1-' + 'a' * 32 + '.jsonl')
+    path.write_text('x')
+    os.utime(path, (1, 1))
+    assert prune(tmp_path, max_bytes=1)['removed_files'] == 1
+    assert not folder.exists()
+
+
+def test_windows_dir_entry_zero_identity_falls_back_to_os_stat(tmp_path, monkeypatch):
+    from mindie_diagnostics import reader_registry
+
+    folder = tmp_path / 'events' / 'windows-identity'
+    folder.mkdir(parents=True)
+    path = folder / (str(123456) + '-' + 'b' * 32 + '.jsonl')
+    path.write_text('event\n')
+    os.utime(path, (1, 1))
+    identity = path.stat(follow_symlinks=False)
+
+    db_path = tmp_path / 'reader.db'
+    db = sqlite3.connect(db_path)
+    try:
+        db.execute('CREATE TABLE cursors (path TEXT PRIMARY KEY,inode TEXT,offset INTEGER)')
+        db.execute('INSERT INTO cursors VALUES (?,?,?)',
+                   (str(path), str(identity.st_ino), identity.st_size))
+        db.commit()
+    finally:
+        db.close()
+    reader_registry.register_reader(tmp_path, db_path)
+
+    class _ZeroStatEntry:
+        def __init__(self, entry):
+            self._entry = entry
+
+        def stat(self, follow_symlinks=False):
+            info = self._entry.stat(follow_symlinks=follow_symlinks)
+            # Windows DirEntry.stat leaves file identity at zero.
+            return SimpleNamespace(st_mtime=info.st_mtime, st_size=info.st_size,
+                                   st_ino=0, st_dev=0, st_mtime_ns=info.st_mtime_ns)
+
+        def __getattr__(self, attribute):
+            return getattr(self._entry, attribute)
+
+    real_scandir = os.scandir
+
+    class _ZeroIdentityOS:
+        name = 'nt'
+
+        def __getattr__(self, attribute):
+            return getattr(os, attribute)
+
+        @staticmethod
+        def scandir(directory):
+            @contextmanager
+            def scanned():
+                with real_scandir(directory) as scan:
+                    yield (_ZeroStatEntry(entry) for entry in scan)
+            return scanned()
+
+    seen = []
+    from mindie_diagnostics.reader_registry import fully_consumed as real_consumed
+
+    def capture(cursors, candidate, inode, size):
+        seen.append((inode, size))
+        return real_consumed(cursors, candidate, inode, size)
+
+    monkeypatch.setattr(maintenance, 'os', _ZeroIdentityOS())
+    monkeypatch.setattr(maintenance, '_writer_exited', lambda pid: True)
+    monkeypatch.setattr(maintenance, 'fully_consumed', capture)
+
+    result = prune(tmp_path, max_bytes=1)
+
+    assert result['removed_files'] == 1
+    assert not path.exists()
+    # The cursor comparison and the pre-unlink identity check both used the
+    # real non-zero identity returned by os.stat, not DirEntry's zeros.
+    assert seen == [(identity.st_ino, identity.st_size)]
+
+
+def test_back_to_back_recovery_claim_runs_prune_once(tmp_path, monkeypatch):
+    now = time.time()
+    stale = {
+        "schema": 1, "blocked": True, "limited": True,
+        "checked_at": now - 3600,
+    }
+    marker = tmp_path / "retention-state.json"
+    marker.write_text(json.dumps(stale))
+    marker.chmod(0o600)
+    prunes = []
+
+    def recover():
+        if not maintenance.claim_recovery(tmp_path, cooldown=300, now=now):
+            return False
+        try:
+            prunes.append(1)
+        finally:
+            maintenance.release_recovery(tmp_path)
+        return True
+
+    # Caller one reads the stale marker, claims recovery, advances checked_at
+    # to `now`, prunes, and releases.
+    assert recover() is True
+
+    # Caller two had already read the same stale marker before caller one
+    # claimed. Its post-claim re-read must observe the advanced checked_at and
+    # must not run a second recovery prune inside the cooldown.
+    real_marker_state = maintenance._marker_state
+    reads = []
+
+    def stale_preclaim_read(path):
+        reads.append(1)
+        if len(reads) == 1:
+            return dict(stale)
+        return real_marker_state(path)
+
+    monkeypatch.setattr(maintenance, "_marker_state", stale_preclaim_read)
+
+    assert recover() is False
+    assert prunes == [1]
+    assert json.loads(marker.read_text())["checked_at"] == now
+    assert not (tmp_path / ".retention-recovery").exists()

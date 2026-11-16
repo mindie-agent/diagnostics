@@ -303,29 +303,34 @@ def _publish(path, text, runner):
     # An isolated sibling directory keeps systemd-analyze from loading a broken
     # old unit alongside the candidate. It remains on the same filesystem.
     staging = Path(tempfile.mkdtemp(prefix='.mindie-unit-', dir=path.parent))
-    descriptor, temporary = tempfile.mkstemp(prefix="mindie-diagnostics-", suffix=".service", dir=staging)
+    temporary = None
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
-            stream.write(text)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.chmod(temporary, 0o644)
-        # Parse the exact staged file before replacing a working installation.
-        # This does not contact a service manager or execute ExecStart. Some
-        # minimal systemd installations omit this optional inspection binary.
-        analyzer = which_native("systemd-analyze", which_fn=shutil.which)
-        if analyzer:
-            checked = _run(runner, [analyzer, "verify", "--man=no", temporary], action="unit.verify")
-            warnings = _unit_verification_warnings(checked.stderr, temporary)
-            if warnings:
-                # Invalid non-fatal directives may be ignored with exit zero.
-                raise ServiceError("unit_verification_warning", action="unit.verify", detail="; ".join(warnings))
-        os.replace(temporary, path)
-        return "verified" if analyzer else "unavailable"
+        descriptor, temporary = tempfile.mkstemp(
+            prefix="mindie-diagnostics-", suffix=".service", dir=staging,
+        )
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+                stream.write(text)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(temporary, 0o644)
+            # Parse the exact staged file before replacing a working installation.
+            # This does not contact a service manager or execute ExecStart. Some
+            # minimal systemd installations omit this optional inspection binary.
+            analyzer = which_native("systemd-analyze", which_fn=shutil.which)
+            if analyzer:
+                checked = _run(runner, [analyzer, "verify", "--man=no", temporary], action="unit.verify")
+                warnings = _unit_verification_warnings(checked.stderr, temporary)
+                if warnings:
+                    # Invalid non-fatal directives may be ignored with exit zero.
+                    raise ServiceError("unit_verification_warning", action="unit.verify", detail="; ".join(warnings))
+            os.replace(temporary, path)
+            return "verified" if analyzer else "unavailable"
+        finally:
+            if temporary is not None and os.path.exists(temporary):
+                os.unlink(temporary)
     finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
-        staging.rmdir()
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 def _is_real_runner(runner) -> bool:

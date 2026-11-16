@@ -196,6 +196,28 @@ def test_posix_private_leaf_and_rotated_files(tmp_path, monkeypatch):
     assert len(files) > 1
     assert all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in files)
 
+def test_rotation_opportunistically_prunes_once_per_cooldown(tmp_path, monkeypatch):
+    from mindie_diagnostics import maintenance
+
+    calls = []
+
+    def prune(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {}
+
+    monkeypatch.setattr(maintenance, "prune", prune)
+    monkeypatch.setattr(module, "MAX_LOG_BYTES", 600)
+    recorder = module.configure("rotation-prune", root=tmp_path)
+    try:
+        for _ in range(20):
+            recorder.event("INFO", "sample", preview="x" * 200)
+    finally:
+        recorder.close()
+    assert calls and calls[0][0][0] == tmp_path
+    assert calls[0][1] == {"queue": None, "timeout": 0.5}
+    assert len(calls) == 1
+
+
 def test_fork_resets_locks_held_by_another_thread(tmp_path):
     import os
     import signal

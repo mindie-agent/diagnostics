@@ -14,6 +14,12 @@ and reader-aware recycling (`BACKUP_COUNT = 3`).
   bytes, so this path takes no reader-registry or cursor lock. Only recycling
   an existing owned segment needs reader/cursor coordination.
 - Only fully consumed closed segments recycle; backpressure forbids new slots.
+- A rotation (at most once per 300s) opportunistically applies retention to the
+  same root, so disabled reporting still retires old consumed segments instead
+  of leaving every rotated `.1`-`.3` family forever.
+- A cold-start writer facing a stale `blocked=True` marker may claim one
+  0.5s recovery prune per 300s; the claim advances `checked_at` atomically
+  before scanning, and the blocked state is re-read before allocation.
 [Timeouts & Locks]
 - `_mutex` and `_LOCK` use `blocking=False` on emit/append paths.
 - Fresh-slot allocation is bounded by `BACKUP_COUNT + 1` and has no clock
@@ -23,6 +29,8 @@ and reader-aware recycling (`BACKUP_COUNT = 3`).
   ceiling: `cursor_snapshot` keeps its 3.0s SQLite wait floor, so recycling can
   overrun. Unknown/over-budget recycling drops with `logging_failed = True`;
   fresh slots make no registry or SQLite call.
+- The stale-`blocked` recovery path runs at most one 0.5s prune per 300s behind
+  an exclusive claim and shares `prune`'s bounded monotonic budget.
 
 [Side-Effect Policy]
 - Fork-safe via `os.register_at_fork(after_in_child=_after_fork)`: resets locks
@@ -58,6 +66,8 @@ MAX_LOG_BYTES = 1_048_576
 BACKUP_COUNT = 3
 _RECYCLE_BUDGET_S = 0.1
 _REGISTRY_WAIT_S = 0.05
+_BLOCKED_RECOVERY_S = 300.0
+_RECOVERY_PRUNE_S = 0.5
 _COMPONENT = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,79}\Z")
 _SENSITIVE = re.compile(r"password|secret|token|credential|authorization|cookie|private.?key|api.?key|command|stdout|stderr|body|transcript|(?:^|_)(?:env|environment|args|argv|payload|text|headers)(?:$|_)", re.I)
 _LEVELS = {"DEBUG": 10, "INFO": 20, "WARN": 30, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}
@@ -223,6 +233,8 @@ class _Handler(std_logging.Handler):
         self.current = None
         self.owned = {}
         self.credit = None
+        self._next_prune = 0.0
+        self._next_recovery = 0.0
         self.setFormatter(std_logging.Formatter('%(message)s'))
 
     def _drop(self):
@@ -321,6 +333,67 @@ class _Handler(std_logging.Handler):
         # A cold/free slot needs no reader metadata; only recycling does.
         return self._fresh(blocked) or self._recycle(size, blocked)
 
+    def _maybe_prune(self):
+        """Rotation-triggered retention, bounded and never fatal to logging."""
+        now = time.monotonic()
+        if now < self._next_prune:
+            return
+        self._next_prune = now + 300
+
+        def once():
+            from .maintenance import prune
+            try:
+                prune(self.root, queue=None, timeout=0.5)
+            except TimeoutError:
+                raise
+            except (OSError, ValueError):
+                return
+
+        try:
+            once()
+        except TimeoutError:
+            # The logger is non-throwing; retention retries after the cooldown.
+            pass
+
+    def _recover_blocked(self):
+        """One rate-limited recovery prune for a stale blocked marker."""
+        now = time.monotonic()
+        if now < self._next_recovery:
+            return False
+        self._next_recovery = now + _BLOCKED_RECOVERY_S
+        from .maintenance import claim_recovery, prune, release_recovery
+        try:
+            if not claim_recovery(self.root, cooldown=_BLOCKED_RECOVERY_S):
+                return False
+        except TimeoutError:
+            return False
+        except (OSError, ValueError):
+            return False
+        try:
+            try:
+                prune(self.root, queue=None, timeout=_RECOVERY_PRUNE_S)
+            except TimeoutError:
+                pass
+            except (OSError, ValueError):
+                pass
+            # The sweep may retire the now-empty component directory along
+            # with the old writer's last segment; recreate it before _fresh.
+            from .fallback import _private_mkdir
+            try:
+                _private_mkdir(self.paths[0].parent, parents=True, exist_ok=True)
+            except TimeoutError:
+                pass
+            except OSError:
+                pass
+        finally:
+            try:
+                release_recovery(self.root)
+            except TimeoutError:
+                pass
+            except OSError:
+                pass
+        return True
+
     def emit(self, record):
         try:
             raw = (self.format(record) + '\n').encode('utf-8')
@@ -332,12 +405,19 @@ class _Handler(std_logging.Handler):
             cap = MAX_LOG_BYTES
             if blocked:
                 cap = min(cap, self.credit if self.credit is not None else present)
+            rotated = self.stream is not None and present + len(raw) > cap
             if self.stream is None or present + len(raw) > cap:
                 blocked = self.pressure(force=True)
+                if blocked and self._recover_blocked():
+                    blocked = self.pressure(force=True)
                 if not self._select(len(raw), blocked):
                     self._drop()
                     return
             self.stream.write(raw)
+            if rotated:
+                # Only rotation retires old segments; events on the active
+                # segment never pay a retention scan.
+                self._maybe_prune()
         except Exception:
             self.handleError(record)
 

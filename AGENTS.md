@@ -6,7 +6,7 @@ This repository implements the shared local failure recorder, privacy redaction 
 
 | Module | Responsibility & Key Entry Points |
 | :--- | :--- |
-| [`mindie_diagnostics/fallback.py`](mindie_diagnostics/fallback.py) | Standalone stdlib-only local failure recorder (`record_failure`) and reporting policy reader (`read_policy`, `consent_status`, `scope_key`). Can be vendored as a single file; never spawns services or raises into callers. |
+| [`mindie_diagnostics/fallback.py`](mindie_diagnostics/fallback.py) | Internal stdlib-only local failure recorder (`record_failure`) and reporting policy reader (`read_policy`, `consent_status`, `scope_key`) inside `mindie_diagnostics`. Never copy-paste or vendor across repositories (depend on the pinned `mindie-diagnostics` package per Iron Rule 3); never spawns services or raises into callers. |
 | [`mindie_diagnostics/integration.py`](mindie_diagnostics/integration.py) | Installed-package metadata enrichment (`record_failure`), atomic policy configuration (`configure_reporting`), and read-only status aggregation (`reporting_status`). |
 | [`mindie_diagnostics/logging.py`](mindie_diagnostics/logging.py) | Per-process structured JSONL logger (`Recorder`, `Operation`, `append_failure_event`) with `O_EXCL` first-use slots, reader-aware segment recycling (`MAX_LOG_BYTES = 1 MiB`, `BACKUP_COUNT = 3`) and fork-safe lock reset. |
 | [`mindie_diagnostics/redact.py`](mindie_diagnostics/redact.py) | Pure `r2` privacy/credential scanner (`scan_text`, `scan_tree`, `redact_text`, `Allowlist`) with 21 deterministic rules and zero external dependencies. |

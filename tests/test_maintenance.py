@@ -3,6 +3,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -205,3 +206,73 @@ def test_prune_removes_emptied_component_directory(tmp_path, monkeypatch):
     os.utime(path, (1, 1))
     assert prune(tmp_path, max_bytes=1)['removed_files'] == 1
     assert not folder.exists()
+
+
+def test_windows_dir_entry_zero_identity_falls_back_to_os_stat(tmp_path, monkeypatch):
+    from mindie_diagnostics import reader_registry
+
+    folder = tmp_path / 'events' / 'windows-identity'
+    folder.mkdir(parents=True)
+    path = folder / (str(123456) + '-' + 'b' * 32 + '.jsonl')
+    path.write_text('event\n')
+    os.utime(path, (1, 1))
+    identity = path.stat(follow_symlinks=False)
+
+    db_path = tmp_path / 'reader.db'
+    db = sqlite3.connect(db_path)
+    try:
+        db.execute('CREATE TABLE cursors (path TEXT PRIMARY KEY,inode TEXT,offset INTEGER)')
+        db.execute('INSERT INTO cursors VALUES (?,?,?)',
+                   (str(path), str(identity.st_ino), identity.st_size))
+        db.commit()
+    finally:
+        db.close()
+    reader_registry.register_reader(tmp_path, db_path)
+
+    class _ZeroStatEntry:
+        def __init__(self, entry):
+            self._entry = entry
+
+        def stat(self, follow_symlinks=False):
+            info = self._entry.stat(follow_symlinks=follow_symlinks)
+            # Windows DirEntry.stat leaves file identity at zero.
+            return SimpleNamespace(st_mtime=info.st_mtime, st_size=info.st_size,
+                                   st_ino=0, st_dev=0, st_mtime_ns=info.st_mtime_ns)
+
+        def __getattr__(self, attribute):
+            return getattr(self._entry, attribute)
+
+    real_scandir = os.scandir
+
+    class _ZeroIdentityOS:
+        name = 'nt'
+
+        def __getattr__(self, attribute):
+            return getattr(os, attribute)
+
+        @staticmethod
+        def scandir(directory):
+            @contextmanager
+            def scanned():
+                with real_scandir(directory) as scan:
+                    yield (_ZeroStatEntry(entry) for entry in scan)
+            return scanned()
+
+    seen = []
+    from mindie_diagnostics.reader_registry import fully_consumed as real_consumed
+
+    def capture(cursors, candidate, inode, size):
+        seen.append((inode, size))
+        return real_consumed(cursors, candidate, inode, size)
+
+    monkeypatch.setattr(maintenance, 'os', _ZeroIdentityOS())
+    monkeypatch.setattr(maintenance, '_writer_exited', lambda pid: True)
+    monkeypatch.setattr(maintenance, 'fully_consumed', capture)
+
+    result = prune(tmp_path, max_bytes=1)
+
+    assert result['removed_files'] == 1
+    assert not path.exists()
+    # The cursor comparison and the pre-unlink identity check both used the
+    # real non-zero identity returned by os.stat, not DirEntry's zeros.
+    assert seen == [(identity.st_ino, identity.st_size)]

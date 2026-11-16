@@ -42,6 +42,7 @@ from .fallback import _private_mkdir
 from .filesystem import path_identity
 from .runtime_retirement import (
     _Retirement,
+    _bounded_entries,
     _native_path,
     _remove_tree,
     prune_orphan_windows_profiles,
@@ -503,12 +504,12 @@ def retire_other_generations(root, keep_source_hash, *, extra_keep=(),
             continue
         _require_dir(generations, _owned)
         try:
-            with os.scandir(generations) as scan:
-                entries = sorted(scan, key=lambda entry: entry.name)
+            entries, _complete = _bounded_entries(generations, deadline)
         except TimeoutError:
             raise
         except OSError:
             continue
+        entries.sort(key=lambda entry: entry.name)
         # Phase 1: finish a prior process's interrupted trash sweep.
         for entry in entries:
             if time.monotonic() >= deadline:

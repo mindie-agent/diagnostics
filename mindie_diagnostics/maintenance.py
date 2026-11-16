@@ -6,12 +6,18 @@ whose writer process has exited, and writes `<root>/retention-state.json` to
 signal backpressure to active log writers when retention limits remain exceeded.
 
 [Invariants]
-- Called only by maintenance/worker flows, never inline during ordinary tool
-  operations.
+- Called by maintenance/worker flows and by a rate-limited recovery path from a
+  blocked log writer, never inline during ordinary tool operations.
 - Never deletes a segment unless: (1) all registered readers have consumed it
   (`fully_consumed`), (2) it is at least 300s old, and (3) its writer PID
   definitively exited (POSIX `ESRCH`, Windows `OpenProcess` +
   `GetExitCodeProcess`; no console subprocess probe).
+- File identity is re-read with `os.stat(follow_symlinks=False)` whenever a
+  `DirEntry` reports zero `st_dev`/`st_ino` (Windows `DirEntry.stat` leaves
+  them zero), so cursor matching and the pre-unlink check agree.
+- A stale `blocked=True` marker may be recovered at most once per 300s. The
+  claimant atomically advances `checked_at` before scanning, then a bounded
+  rotation/recovery prune may clear the marker for a cold-start writer.
 
 [Timeouts & Locks]
 - The caller's monotonic budget (default 5.0s) reserves 50ms for releasing the
@@ -21,16 +27,20 @@ signal backpressure to active log writers when retention limits remain exceeded.
   wait plus cleanup must fit before it opens each reader; otherwise cursors
   are unknown and this call deletes nothing. Callers may explicitly provide
   a smaller budget; that call explicitly reports incomplete reader inspection.
+- The writer-triggered recovery prune is capped at 0.5s and is admitted only
+  through `claim_recovery`'s exclusive claim file; no unbounded work is added
+  to the emit path.
 
 [Side-Effect Policy]
-- Unlinks only verified consumed log segments and atomically updates
-  `retention-state.json`.
+- Unlinks only verified consumed log segments, writes a temporary exclusive
+  recovery claim, and atomically updates `retention-state.json`.
 """
 from __future__ import annotations
 
 import ctypes
-import os
 import json
+import math
+import os
 import stat
 import uuid
 from pathlib import Path
@@ -121,12 +131,7 @@ def _writer_exited(pid: int) -> bool:
         kernel32.CloseHandle(handle)
 
 
-def _marker(root, result, blocked, now):
-    data = {"schema": 1, "blocked": bool(blocked), "limited": bool(result['limited']),
-            "checked_at": now, "remaining_bytes": result['remaining_bytes'],
-            "remaining_files": result['remaining_files'],
-            "unread_files": result['unread_files'],
-            "active_or_unknown_files": result['active_or_unknown_files']}
+def _write_marker(root, data):
     raw = json.dumps(data, separators=(",", ":")).encode()
     if len(raw) > 2048:
         raise ValueError("retention status exceeds bound")
@@ -139,6 +144,125 @@ def _marker(root, result, blocked, now):
         os.replace(temporary, root / 'retention-state.json')
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _marker(root, result, blocked, now):
+    _write_marker(root, {
+        "schema": 1, "blocked": bool(blocked), "limited": bool(result['limited']),
+        "checked_at": now, "remaining_bytes": result['remaining_bytes'],
+        "remaining_files": result['remaining_files'],
+        "unread_files": result['unread_files'],
+        "active_or_unknown_files": result['active_or_unknown_files'],
+    })
+
+
+def _marker_state(path):
+    """Read a bounded regular retention marker without following a symlink."""
+    try:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= 2048:
+            return None
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+    except TimeoutError:
+        raise
+    except OSError:
+        return None
+    try:
+        raw = os.read(descriptor, 2049)
+    except TimeoutError:
+        raise
+    except OSError:
+        return None
+    finally:
+        os.close(descriptor)
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError, UnicodeError):
+        return None
+    if not isinstance(data, dict) or data.get('schema') != 1:
+        return None
+    return data
+
+
+def claim_recovery(root, *, cooldown: float = 300.0, now=None) -> bool:
+    """Atomically claim a stale blocked-marker recovery pass.
+
+    The marker's `checked_at` is advanced under an exclusive claim file before
+    any scanning, so concurrent blocked writers observe the cooldown instead of
+    stampeding the same recovery prune. A crashed claimant is reclaimable once
+    its claim file is itself older than the cooldown.
+    """
+    root = Path(root)
+    if root.is_symlink():
+        return False
+    state = _marker_state(root / 'retention-state.json')
+    if state is None or state.get('blocked') is not True:
+        return False
+    checked = state.get('checked_at')
+    if isinstance(checked, bool) or not isinstance(checked, (int, float)):
+        return False
+    if not math.isfinite(checked):
+        return False
+    now = time.time() if now is None else float(now)
+    cooldown = max(0.0, float(cooldown))
+    if now - checked < cooldown:
+        return False
+    claim = root / '.retention-recovery'
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0)
+
+    def acquire():
+        try:
+            return os.open(claim, flags, 0o600)
+        except FileExistsError:
+            try:
+                stale = now - claim.lstat().st_mtime >= cooldown
+            except TimeoutError:
+                raise
+            except OSError:
+                return None
+            if not stale:
+                return None
+            try:
+                claim.unlink()
+                return os.open(claim, flags, 0o600)
+            except TimeoutError:
+                raise
+            except (FileExistsError, OSError):
+                return None
+
+    try:
+        descriptor = acquire()
+    except TimeoutError:
+        raise
+    except OSError:
+        return False
+    if descriptor is None:
+        return False
+    try:
+        os.close(descriptor)
+        state = dict(state)
+        state['checked_at'] = now
+        _write_marker(root, state)
+        return True
+    except TimeoutError:
+        raise
+    except (OSError, ValueError):
+        try:
+            claim.unlink()
+        except TimeoutError:
+            raise
+        except OSError:
+            pass
+        return False
+
+
+def release_recovery(root) -> None:
+    try:
+        (Path(root) / '.retention-recovery').unlink()
+    except TimeoutError:
+        raise
+    except OSError:
+        pass
 
 
 def prune(root: str | Path, *, max_bytes: int = 128 * 1024 * 1024,
@@ -177,9 +301,13 @@ def prune(root: str | Path, *, max_bytes: int = 128 * 1024 * 1024,
                             if (entry.is_symlink() or not _FILE.fullmatch(entry.name)
                                     or not entry.is_file(follow_symlinks=False)):
                                 continue
-                            # DirEntry.stat avoids a path lookup per candidate.
+                            # DirEntry.stat avoids a path lookup per candidate,
+                            # but Windows leaves st_dev/st_ino zero there while
+                            # Path.stat/os.stat fills them from the file handle.
                             try:
                                 info = entry.stat(follow_symlinks=False)
+                                if info.st_ino == 0 or info.st_dev == 0:
+                                    info = os.stat(entry.path, follow_symlinks=False)
                             except TimeoutError:
                                 raise
                             except OSError:

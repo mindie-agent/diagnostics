@@ -259,7 +259,7 @@ def test_orphan_profile_cleanup_skips_active_live_and_unmarked_dirs(tmp_path, mo
     (busy / "profile.json").write_text(json.dumps({
         "schema": 1, "root": str(tmp_path / "busy-root"),
     }))
-    executable = busy / "venv" / "Scripts" / "pythonw.exe"
+    executable = busy / ("f" * 64) / "venv" / "Scripts" / "pythonw.exe"
     executable.parent.mkdir(parents=True)
     executable.write_bytes(b"mapped")
 
@@ -297,3 +297,166 @@ def test_service_publish_removes_staging_with_leftover_files(tmp_path, monkeypat
     assert service._publish(path, "[Unit]\nDescription=x\n", None) == "unavailable"
     assert path.is_file()
     assert not list(unit_dir.glob(".mindie-unit-*"))
+
+
+def test_maintain_defers_generation_retirement_when_worker_source_is_unconfirmed(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    root = _runtime_root(config)
+    generations = root / "generations"
+    generations.mkdir(mode=0o700)
+    live, previous, current = _hash("live-a"), _hash("previous-b"), _hash("current-c")
+    entries = {source_hash: _generation(generations, source_hash)
+               for source_hash in (live, previous, current)}
+    (root / "current.json").write_text(json.dumps({
+        "schema": 1, "source_hash": current, "version": "0.5.14",
+        "revision": None, "previous_source_hash": previous,
+    }))
+    monkeypatch.setattr(commands, "_worker_view",
+                        lambda config: {"status": "unavailable", "healthy": False})
+    monkeypatch.setattr(service, "service_status", lambda **kwargs: {"status": "absent"})
+
+    result = commands.maintain(config, budget_seconds=20)
+
+    assert result["retirement"]["status"] == "deferred"
+    assert result["retirement"]["reason"] == "worker_generation_unconfirmed"
+    assert result["retirement_warning"] == "worker_generation_unconfirmed"
+    # The failed ensure history advanced current/previous, but the live worker
+    # generation must survive an unreadable health record.
+    for source_hash in (live, previous, current):
+        assert entries[source_hash].is_dir()
+
+
+def test_maintain_runs_bounded_windows_orphan_profile_cleanup(tmp_path, monkeypatch):
+    config = _config(tmp_path)
+    calls = []
+
+    def cleanup(active_root, *, budget_seconds=0):
+        calls.append((active_root, budget_seconds))
+        return retirement._Retirement(["dead-profile"], swept=[".trash-old"])
+
+    monkeypatch.setattr(retirement, "prune_orphan_windows_profiles", cleanup)
+
+    result = commands.maintain(config, budget_seconds=20)
+
+    assert len(calls) == 1
+    assert calls[0][1] <= 3.0
+    assert result["orphan_profiles"]["retired_profiles"] == ["dead-profile"]
+    assert result["orphan_profiles"]["swept_trash"] == [".trash-old"]
+
+
+def test_remove_tree_removes_a_junction_link_without_traversing_its_target(tmp_path, monkeypatch):
+    sentinel = tmp_path / "sentinel"
+    sentinel.mkdir()
+    keep = sentinel / "keep.txt"
+    keep.write_text("outside")
+    trash = tmp_path / ".trash-junction"
+    trash.mkdir()
+    junction = trash / "junction"
+    try:
+        junction.symlink_to(sentinel, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink/junction simulation unavailable")
+
+    monkeypatch.setattr(retirement, "_is_junction", lambda path: Path(path) == junction)
+    real_rmdir = retirement._rmdir
+    monkeypatch.setattr(
+        retirement, "_rmdir",
+        lambda path: os.unlink(path) if Path(path) == junction else real_rmdir(path),
+    )
+
+    assert retirement._remove_tree(trash, time.monotonic() + 5) is True
+    assert keep.read_text() == "outside"
+    assert sentinel.is_dir() and not trash.exists()
+
+
+class _WindowsOS:
+    name = "nt"
+
+    def __getattr__(self, attribute):
+        return getattr(os, attribute)
+
+
+def test_orphan_profile_defers_when_the_target_volume_anchor_is_unavailable(tmp_path, monkeypatch):
+    from mindie_diagnostics import fallback
+
+    profiles = tmp_path / "profiles"
+    profiles.mkdir()
+    active_name = "a" * 20
+    (profiles / active_name).mkdir()
+    dead = profiles / ("b" * 20)
+    dead.mkdir()
+    (dead / "profile.json").write_text(json.dumps({
+        "schema": 1, "root": "D:/unmounted-policy-root",
+    }))
+    monkeypatch.setattr(fallback, "_as_local_absolute", lambda value: Path(value))
+    monkeypatch.setattr(retirement, "os", _WindowsOS())
+    monkeypatch.setattr(runtime, "_generations", lambda root: profiles / active_name)
+
+    result = retirement.prune_orphan_windows_profiles(tmp_path / "active-root")
+
+    assert list(result) == []
+    assert result.deferred == (dead.name,)
+    assert result.volume_unavailable == (dead.name,)
+    assert dead.is_dir()
+
+
+def test_orphan_profile_trash_sweep_resumes_an_interrupted_pass(tmp_path, monkeypatch):
+    profiles = tmp_path / "profiles"
+    profiles.mkdir()
+    active_name = "a" * 20
+    (profiles / active_name).mkdir()
+    dead = profiles / ("b" * 20)
+    dead.mkdir()
+    (dead / "profile.json").write_text(json.dumps({
+        "schema": 1, "root": str(tmp_path / "missing-root"),
+    }))
+    monkeypatch.setattr(retirement, "os", _WindowsOS())
+    monkeypatch.setattr(runtime, "_generations", lambda root: profiles / active_name)
+    real_remove = retirement._remove_tree
+    calls = []
+
+    def timed_out_once(path, deadline):
+        calls.append(Path(path).name)
+        if len(calls) == 1:
+            return False
+        return real_remove(path, deadline)
+
+    monkeypatch.setattr(retirement, "_remove_tree", timed_out_once)
+
+    first = retirement.prune_orphan_windows_profiles(tmp_path / "active-root")
+    trash = list(profiles.glob(".trash-*"))
+    assert list(first) == [dead.name]
+    assert len(trash) == 1 and trash[0].name in first.deferred
+
+    second = retirement.prune_orphan_windows_profiles(tmp_path / "active-root")
+
+    assert not trash[0].exists()
+    assert trash[0].name in second.swept
+
+
+def test_blocked_writer_recovers_after_stale_marker_and_writes_its_event(tmp_path):
+    from mindie_diagnostics import logging as log
+
+    events = tmp_path / "events" / "blocked-recovery"
+    events.mkdir(parents=True)
+    old = events / f"{_exited_pid()}-{'a' * 32}.jsonl"
+    old.write_text('{"schema":1}\n')
+    os.utime(old, (1, 1))
+    marker = tmp_path / "retention-state.json"
+    marker.write_text(json.dumps({
+        "schema": 1, "blocked": True, "limited": True,
+        "checked_at": time.time() - 3600,
+    }))
+    marker.chmod(0o600)
+    recorder = log.configure("blocked-recovery", root=tmp_path)
+    try:
+        recorder.event("INFO", "recovered")
+        path = Path(recorder.record_ref)
+        assert path.is_file()
+        assert "recovered" in path.read_text()
+    finally:
+        recorder.close()
+
+    assert not old.exists()
+    state = json.loads(marker.read_text())
+    assert state["blocked"] is False

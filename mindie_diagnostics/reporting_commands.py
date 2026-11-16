@@ -13,6 +13,12 @@ provisioning (`ensure`), and bounded automatic runtime handoff (`upgrade_running
   least 60s of budget remain (`61s` from `maintain`).
 - `current.json` is published only AFTER the replaced service passes health and
   `runtime_source` readback verification; otherwise rolls back to `old_python`.
+- Generation retirement is admitted only when the live worker's source hash is
+  confirmed, or a native service definition independently resolves it; an
+  unavailable/unconfirmable worker defers retirement
+  (`worker_generation_unconfirmed`) with a non-fatal warning.
+- Opportunistic Windows orphan-profile cleanup runs from `maintain` inside the
+  remaining monotonic budget and never changes the aggregate status.
 
 [Timeouts & Locks]
 - `maintain`'s capped monotonic budget admits stages instead of
@@ -21,6 +27,9 @@ provisioning (`ensure`), and bounded automatic runtime handoff (`upgrade_running
   work already inside a lawful 3-5s SQLite wait may outlive the budget.
 - Retention receives the remaining budget minus that settlement reserve;
   reader snapshots admit their SQLite wait only when it fits.
+- The retirement guard's native status probe uses a runner capped at the
+  remaining budget; profile cleanup is capped at 3s and starts only with
+  `>= 0.5s` left.
 - `upgrade_running` reserves `_ROLLBACK_RESERVE_S = 20.0s` for rollback before
   `deadline`, caps lock acquisition at `_LOCK_WAIT_S = 12.0s`, and polls worker
   readback for up to `_READBACK_S = 8.0s`.
@@ -34,6 +43,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -202,11 +212,17 @@ def maintain(config=None, *, update_running=False, unit_dir=None, budget_seconds
     # predate this release. Opportunistically use the same runtime transaction
     # after ordinary maintenance, but never let cleanup change the outcome.
     try:
-        retirement = _maintain_retirement(config, deadline)
+        retirement = _maintain_retirement(config, deadline, unit_dir=unit_dir)
     except TimeoutError:
         retirement = {'retirement_warning': 'TimeoutError'}
     if retirement:
         result.update(retirement)
+    try:
+        profiles = _maintain_orphan_profiles(config, deadline)
+    except TimeoutError:
+        profiles = {'orphan_profiles_warning': 'TimeoutError'}
+    if profiles:
+        result.update(profiles)
     return result
 
 
@@ -268,14 +284,19 @@ def ensure(config=None, *, unit_dir=None):
             if ready:
                 # The new current is healthy: current + previous + the live
                 # worker generation are the only rollback-closure artifacts.
-                try:
-                    current = _read_current_or_none(root)
-                    previous = (current.get('previous_source_hash') if current
-                                else runtime.get('previous_source_hash'))
-                    extra = [previous, worker.get('runtime_source')]
-                    response.update(_retirement_summary(root, runtime['source_hash'], extra))
-                except TimeoutError:
-                    response['retirement_warning'] = 'TimeoutError'
+                decision = _retirement_decision(
+                    config, unit_dir=unit_dir, worker=worker, deadline=deadline)
+                if not decision['allowed']:
+                    response.update(_deferred_retirement())
+                else:
+                    try:
+                        current = _read_current_or_none(root)
+                        previous = (current.get('previous_source_hash') if current
+                                    else runtime.get('previous_source_hash'))
+                        extra = [previous, worker.get('runtime_source'), *decision['keep']]
+                        response.update(_retirement_summary(root, runtime['source_hash'], extra))
+                    except TimeoutError:
+                        response['retirement_warning'] = 'TimeoutError'
             return response
     except ServiceError as exc:
         return {'status': 'degraded', 'category': exc.category}
@@ -294,6 +315,8 @@ _UPDATE_BUDGET_S = 180.0
 _READBACK_S = 8.0
 _ROLLBACK_RESERVE_S = 20.0
 _LOCK_WAIT_S = 12.0
+_SOURCE_HASH = re.compile(r'[0-9a-f]{64}\Z')
+_SERVICE_HASH = re.compile(rb'([0-9a-f]{64})[\\/]+venv[\\/]+(?:Scripts|bin)[\\/]')
 
 
 def _utcnow():
@@ -335,6 +358,129 @@ def _read_current_or_none(root):
         return None
 
 
+def _deferred_retirement():
+    """Non-fatal retirement summary when the live worker generation is unknown."""
+    summary = {'status': 'deferred', 'reason': 'worker_generation_unconfirmed'}
+    return {'retirement': summary, 'retirement_status': summary['status'],
+            'retirement_reason': summary['reason'],
+            'retirement_warning': summary['reason']}
+
+
+def _verified_worker_source(view):
+    if not isinstance(view, dict):
+        return None
+    source = view.get('runtime_source')
+    return source if isinstance(source, str) and _SOURCE_HASH.fullmatch(source) else None
+
+
+def _service_definition_files(unit_dir, config):
+    """Bounded candidate definitions for the installed native worker."""
+    files = []
+    if unit_dir is not None:
+        try:
+            with os.scandir(Path(unit_dir)) as scan:
+                for entry in scan:
+                    if len(files) >= 16:
+                        break
+                    try:
+                        if entry.is_file(follow_symlinks=False):
+                            files.append(Path(entry.path))
+                    except TimeoutError:
+                        raise
+                    except OSError:
+                        continue
+        except TimeoutError:
+            raise
+        except OSError:
+            pass
+    try:
+        from .service import _unit_path
+        files.append(_unit_path(unit_dir))
+    except TimeoutError:
+        raise
+    except (AttributeError, OSError, ValueError):
+        pass
+    try:
+        from .platform_service import _paths as service_paths
+        manifest, _label, unit = service_paths(unit_dir)
+        files.extend((manifest, unit))
+    except TimeoutError:
+        raise
+    except (AttributeError, OSError, ValueError):
+        pass
+    return files
+
+
+def _service_definition_source(unit_dir, config):
+    """Resolve the generation hash from an installed service definition."""
+    seen = set()
+    for path in _service_definition_files(unit_dir, config):
+        try:
+            key = os.fspath(path)
+        except TypeError:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            raw = f._read_regular_bounded(path, 32768)
+        except TimeoutError:
+            raise
+        except (OSError, ValueError):
+            continue
+        if not raw:
+            continue
+        match = _SERVICE_HASH.search(raw)
+        if match is not None:
+            return match.group(1).decode('ascii')
+    return None
+
+
+def _retirement_decision(config, *, unit_dir=None, worker=None, deadline=None):
+    """Never retire generations while a live worker's source is unconfirmed."""
+    try:
+        view = worker if isinstance(worker, dict) else _worker_view(config)
+    except TimeoutError:
+        raise
+    except (OSError, ValueError, RuntimeError):
+        return {'allowed': False, 'keep': ()}
+    source = _verified_worker_source(view)
+    if source is not None:
+        return {'allowed': True, 'keep': (source,)}
+    status = view.get('status') if isinstance(view, dict) else None
+    maybe_alive = bool(
+        (isinstance(view, dict)
+         and (view.get('healthy') is True or view.get('running') is True
+              or (type(view.get('pid')) is int and view.get('pid') > 0
+                  and status not in ('stopped', 'not_started'))))
+        or status not in (None, 'not_started', 'stopped', 'absent'))
+    try:
+        from .service import service_status
+        native = service_status(
+            unit_dir=unit_dir,
+            runner=_bounded_runner(deadline) if deadline is not None else None,
+        )
+    except subprocess.TimeoutExpired:
+        native = None
+    except TimeoutError:
+        raise
+    except (OSError, ValueError, RuntimeError):
+        native = None
+    if not isinstance(native, dict):
+        return {'allowed': False, 'keep': ()}
+    # An unavailable/alive-but-unidentified worker may be a process from an
+    # older generation than the unit now names, so a service definition is not
+    # proof of its runtime while the worker itself could still be alive.
+    if maybe_alive:
+        return {'allowed': False, 'keep': ()}
+    if native.get('status') not in (None, 'absent'):
+        resolved = _service_definition_source(unit_dir, config)
+        if resolved is not None:
+            return {'allowed': True, 'keep': (resolved,)}
+        return {'allowed': False, 'keep': ()}
+    return {'allowed': True, 'keep': ()}
+
+
 def _retirement_summary(root, keep_source_hash, extra_keep, *, budget_seconds=3.0):
     """Best-effort cleanup summary; it never invalidates a healthy handoff."""
     from .reporting_runtime import retire_other_generations
@@ -354,7 +500,7 @@ def _retirement_summary(root, keep_source_hash, extra_keep, *, budget_seconds=3.
     return summary
 
 
-def _maintain_retirement(config, deadline):
+def _maintain_retirement(config, deadline, *, unit_dir=None):
     """Opportunistic retroactive cleanup under the existing runtime lock."""
     from .reporting_runtime import runtime_transaction
     pointer = Path(f.policy_path(config)).with_suffix('.runtime') / 'current.json'
@@ -362,6 +508,9 @@ def _maintain_retirement(config, deadline):
         return None
     if deadline - time.monotonic() < 1.5:
         return None
+    decision = _retirement_decision(config, unit_dir=unit_dir, deadline=deadline)
+    if not decision['allowed']:
+        return _deferred_retirement()
     try:
         with runtime_transaction(config, create=False, timeout=0.2) as root:
             if root is None:
@@ -369,8 +518,7 @@ def _maintain_retirement(config, deadline):
             current = _read_current_or_none(root)
             if current is None:
                 return None
-            extra = [current.get('previous_source_hash'),
-                     _worker_view(config).get('runtime_source')]
+            extra = [current.get('previous_source_hash'), *decision['keep']]
             budget = max(0.0, min(3.0, deadline - time.monotonic() - 1.0))
             return _retirement_summary(
                 root, current['source_hash'], extra, budget_seconds=budget,
@@ -384,6 +532,36 @@ def _maintain_retirement(config, deadline):
         return {'retirement_warning': _safe_category(exc, 'runtime_retirement_failed')}
     except (OSError, ValueError) as exc:
         return {'retirement_warning': type(exc).__name__}
+
+
+def _maintain_orphan_profiles(config, deadline):
+    """Opportunistically resume marked Windows profile cleanup within budget."""
+    remaining = deadline - time.monotonic()
+    if remaining < 0.5:
+        return None
+    from .runtime_retirement import prune_orphan_windows_profiles
+    runtime_root = Path(f.policy_path(config)).with_suffix('.runtime')
+    try:
+        retired = prune_orphan_windows_profiles(
+            runtime_root, budget_seconds=max(0.0, min(3.0, remaining - 0.5)))
+    except TimeoutError:
+        raise
+    except (OSError, ValueError, RuntimeError) as exc:
+        return {'orphan_profiles_warning': _safe_category(
+            exc, 'orphan_profile_cleanup_failed')}
+    summary = {'retired_profiles': list(retired)}
+    deferred = getattr(retired, 'deferred', ())
+    if deferred:
+        summary['deferred_profiles'] = list(deferred)
+    volume = getattr(retired, 'volume_unavailable', ())
+    if volume:
+        summary['deferred_volume_unavailable'] = list(volume)
+    swept = getattr(retired, 'swept', ())
+    if swept:
+        summary['swept_trash'] = list(swept)
+    if summary['retired_profiles'] or deferred or volume or swept:
+        return {'orphan_profiles': summary}
+    return None
 
 
 def _enabled_policy(config, required_revision=None):
@@ -508,14 +686,20 @@ def upgrade_running(config=None, *, unit_dir=None, deadline=None):
                                'service': {'status': native_status.get('status'),
                                            'changed': replacement.get('changed')},
                                'rollback': 'not_needed'}
-                    try:
-                        committed = _read_current_or_none(root)
-                        previous_hash = (committed.get('previous_source_hash') if committed
-                                         else current['source_hash'])
-                        extra = [previous_hash, worker.get('runtime_source')]
-                        updated.update(_retirement_summary(root, source_hash, extra))
-                    except TimeoutError:
-                        updated['retirement_warning'] = 'TimeoutError'
+                    decision = _retirement_decision(
+                        config, unit_dir=unit_dir, worker=worker, deadline=deadline)
+                    if not decision['allowed']:
+                        updated.update(_deferred_retirement())
+                    else:
+                        try:
+                            committed = _read_current_or_none(root)
+                            previous_hash = (committed.get('previous_source_hash') if committed
+                                             else current['source_hash'])
+                            extra = [previous_hash, worker.get('runtime_source'),
+                                     *decision['keep']]
+                            updated.update(_retirement_summary(root, source_hash, extra))
+                        except TimeoutError:
+                            updated['retirement_warning'] = 'TimeoutError'
                     return updated
                 failure = 'readback_unconfirmed'
             except subprocess.TimeoutExpired:

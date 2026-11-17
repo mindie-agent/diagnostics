@@ -1,41 +1,89 @@
-"""CLI entry point (`mindie-diagnostics`) for bundles, services, reporting, and worker loop.
+"""CLI entry point (`mindie-diagnostics`) for bundles, services, reporting, and Scale-to-Zero drain worker.
 
 [Role]
 Provides the `mindie-diagnostics` command-line interface (`bundle`, `status`,
-`service`, `reporting`, `worker`) and executes the supervised worker loop
-(`run_cycle`: `consent` -> `ingest` -> `retention` -> `report`).
+`service`, `reporting`, `worker`) and executes the bounded coalesced Scale-to-Zero
+drain worker (`run_cycle`: `consent` -> `ingest` -> `retention` -> `report`).
 
 [Invariants]
 - Each stage in `run_cycle` is isolated so an ingestion or retention failure
   does not prevent the outbox from draining (`publish_one`).
 - Once the owner stop event is observed, `run_cycle` keeps every result and
-  cursor already collected but starts no further root, retention or remote
+  cursor already collected but starts no further root, retention, or remote
   stage, reporting that as `limited` + `degraded`.
-- The worker re-reads `reporting.json` at the start of every cycle and
-  immediately withdraws unconsented items and exits 0 if reporting is disabled.
+- Scale-to-Zero Worker: acquires a non-blocking coalescing lock
+  (`<state>/worker-drain.lock`), drains a bounded batch (`<= 8` items), schedules
+  a durable OS retry wake ONLY when active Outbox work remains, and **exits
+  immediately when idle**—eliminating the 24/7 idle daemon loop.
 
 [Timeouts & Locks]
-- Worker loop sleeps on `stop.wait(args.interval)` (minimum 5s) and handles
-  `SIGINT`/`SIGTERM` by setting the shared `stop` event passed to `GitHub` and
-  to `ingest`, so a stop ends the running scan between complete records and
-  admits no new stage, instead of finishing every root first.
+- Coalesces concurrent worker wakes via `flock`/`msvcrt` on `worker-drain.lock`.
+- Handles `SIGINT`/`SIGTERM` by setting the shared `stop` event passed to
+  `GitHub` and `ingest`.
 
 [Side-Effect Policy]
 - Emits single-line ASCII JSON results to stdout and exits non-zero on
-  `error`, `degraded`, or `configuration_unavailable` states.
+  `error`, `degraded` (under `--once`), or `configuration_unavailable` states.
 """
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from datetime import datetime
+import errno
 import json
 import os
+from pathlib import Path
 import signal
 import threading
-from pathlib import Path
 
 from .outbox import Outbox
 from .reporter import DEFAULT_REPOSITORY, GitHub, ingest, publish_one
+
+MAX_DRAIN_BATCH = 8
+
+
+@contextmanager
+def _try_drain_lock(state: Path):
+    """Acquire non-blocking single-flight drain lock; yields `True` if acquired, `False` if coalesced."""
+    state.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock_path = state / "worker-drain.lock"
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    acquired = False
+    try:
+        if os.fstat(fd).st_size == 0:
+            os.write(fd, b"0")
+        if os.name == "nt":
+            import msvcrt
+            try:
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                acquired = True
+            except TimeoutError:
+                raise
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                    raise
+        else:
+            import fcntl
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except BlockingIOError:
+                acquired = False
+        yield acquired
+    finally:
+        try:
+            if acquired:
+                if os.name == "nt":
+                    import msvcrt
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
 
 def run_cycle(args, queue, github, recorder, health, *, since=None, cancel=None):
@@ -111,7 +159,7 @@ def parser() -> argparse.ArgumentParser:
     service_sub.add_parser('ensure', parents=[install], help='add roots to the owned local reporter while retaining state and credentials')
     service_sub.add_parser('status')
     service_sub.add_parser('remove')
-    worker = sub.add_parser("worker", help="run the local pure reporter under an independent reporting policy")
+    worker = sub.add_parser("worker", help="run bounded Scale-to-Zero drain worker under an independent reporting policy")
     worker.add_argument("--root", action="append", default=[], help="accepted on the command line; each cycle uses the reporting policy roots")
     worker.add_argument("--state", required=True)
     worker.add_argument("--repository", default=DEFAULT_REPOSITORY)
@@ -183,7 +231,7 @@ def main(argv: list[str] | None = None) -> int:
         selected_op = args.incident_id if args.incident_id is not None else args.operation_id
         print(json.dumps(collect_bundle(args.root, operation_id=selected_op, output=args.output), ensure_ascii=True))
         return 0
-    state = Path(args.state).resolve()
+    state = Path(os.path.realpath(args.state))
     if args.command == "status":
         from .health import read_health
         from .fallback import _lstat_or_missing
@@ -203,46 +251,44 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError:
             parser().error('--since must be an ISO timestamp with a timezone')
     from . import fallback as f
+    from .wake_schedule import clear_retry_wake, sync_retry_wake
     try:
         policy = f.read_policy(args.reporting_config)
     except f.PolicyUnavailable:
         print(json.dumps({'status': 'configuration_unavailable', 'category': 'reporting_policy_unavailable'}))
         return 1
-    if (policy is None or policy['repository'] != args.repository
-            or Path(args.state).absolute() != f.state_path(args.reporting_config)):
+    expected_state = Path(os.path.realpath(f.state_path(args.reporting_config)))
+    if policy is None or policy['repository'] != args.repository or state != expected_state:
         print(json.dumps({'status': 'configuration_unavailable', 'category': 'reporting_policy_mismatch'}))
         return 1
-    os.environ['MINDIE_DIAGNOSTICS_CONFIG'] = str(f.policy_path(args.reporting_config))
-    args.root = list(policy['roots'])
-    from . import configure, __version__
-    recorder = configure("mindie-diagnostics", root=state / "diagnostics", version=__version__)
-    queue = Outbox(state / "reporter.sqlite3")
-    stop = threading.Event()
-    github = GitHub(args.repository, executable=args.gh, cancel=stop)
-    for signum in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(signum, lambda *_: stop.set())
-    from .health import Health
-    with Health(state, recorder, interval=args.interval) as health:
-        while not stop.is_set():
+    with _try_drain_lock(state) as acquired:
+        if not acquired:
+            print(json.dumps({'status': 'coalesced', 'mode': 'on_demand'}), flush=True)
+            return 0
+        os.environ['MINDIE_DIAGNOSTICS_CONFIG'] = str(f.policy_path(args.reporting_config))
+        args.root = list(policy['roots'])
+        from . import configure, __version__
+        from .health import Health
+        recorder = configure("mindie-diagnostics", root=state / "diagnostics", version=__version__)
+        queue = Outbox(state / "reporter.sqlite3")
+        stop = threading.Event()
+        github = GitHub(args.repository, executable=args.gh, cancel=stop)
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(signum, lambda *_: stop.set())
+        with Health(state, recorder, interval=args.interval) as health:
             try:
                 policy = f.read_policy(args.reporting_config)
             except f.PolicyUnavailable:
-                health.update(status='degraded', stage='configuration')
+                health.finish_drain(status='degraded', next_wake_at=None)
                 print(json.dumps({'status': 'configuration_unavailable', 'category': 'reporting_policy_unavailable'}), flush=True)
-                if args.once:
-                    return 1
-                stop.wait(args.interval)
-                continue
+                return 1
             if policy is None:
-                health.update(status='degraded', stage='configuration')
+                health.finish_drain(status='degraded', next_wake_at=None)
                 print(json.dumps({'status': 'configuration_unavailable', 'category': 'reporting_policy_missing'}), flush=True)
-                if args.once:
-                    return 1
-                stop.wait(args.interval)
-                continue
-            if (policy is None or policy['decision'] != 'enabled' or policy['repository'] != args.repository
-                    or Path(args.state).absolute() != f.state_path(args.reporting_config)):
+                return 1
+            if policy['decision'] != 'enabled' or policy['repository'] != args.repository:
                 queue.withdraw_unconsented()
+                clear_retry_wake(state, args.reporting_config)
                 from .reader_registry import unregister_reader
                 for root in args.root:
                     if (Path(root) / '.readers' / 'registry.json').exists():
@@ -252,14 +298,34 @@ def main(argv: list[str] | None = None) -> int:
                             raise
                         except (OSError, ValueError, RuntimeError):
                             pass
+                health.finish_drain(status='idle', next_wake_at=None)
                 return 0
             args.root = list(policy['roots'])
             result = run_cycle(args, queue, github, recorder, health, since=since, cancel=stop)
+            drained = 1 if (isinstance(result.get('reporter'), dict) and result['reporter'].get('status') in {'published', 'reconciled', 'commented', 'duplicate'}) else 0
+            batches = [result['reporter']] if result.get('reporter') is not None else []
+            while (not args.once and not stop.is_set() and result['status'] == 'ok'
+                   and drained > 0 and len(batches) < MAX_DRAIN_BATCH):
+                extra = publish_one(queue, github)
+                batches.append(extra)
+                if extra.get('status') in {'published', 'reconciled', 'commented', 'duplicate'}:
+                    drained += 1
+                    continue
+                if extra.get('status') in {'recording_failed', 'retry', 'uncertain', 'blocked', 'rate_limited', 'exhausted', 'permanent-failed'}:
+                    result['status'] = 'degraded'
+                break
+            if len(batches) > 1:
+                result['reporter_batches'] = batches
+            next_due = queue.next_retry_at()
+            wake_info = sync_retry_wake(state, args.reporting_config, next_wake_at=next_due, now=queue.clock())
+            health.finish_drain(
+                status='idle' if result['status'] == 'ok' else 'degraded',
+                next_wake_at=wake_info.get('next_wake_at'),
+            )
+            result['mode'] = 'on_demand'
+            result['next_wake_at'] = wake_info.get('next_wake_at')
             print(json.dumps(result, ensure_ascii=True), flush=True)
-            if args.once:
-                return int(result['status'] != 'ok')
-            stop.wait(args.interval)
-    return 0
+            return int(result['status'] != 'ok') if args.once else 0
 
 
 if __name__ == "__main__":

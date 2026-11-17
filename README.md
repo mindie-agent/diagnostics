@@ -163,8 +163,8 @@ result = record_failure(
 | 文档主题 | 中文文档 | English |
 | --- | --- | --- |
 | 文档中心导航 | [docs/README.md](./docs/README.md) | [docs/README.en.md](./docs/README.en.md) |
-| 架构、隐私白名单与日志轮转详解 | [docs/architecture-and-privacy.md](./docs/architecture-and-privacy.md) | [docs/architecture-and-privacy.en.md](./docs/architecture-and-privacy.en.md) |
-| 出站对账窗口有界化与日志回收预算对齐 | [docs/outbound-reconciliation-followup.md](./docs/outbound-reconciliation-followup.md) | [docs/outbound-reconciliation-followup.en.md](./docs/outbound-reconciliation-followup.en.md) |
+| 架构、Scale-to-Zero 排空、隐私白名单与日志轮转 | [docs/architecture-and-privacy.md](./docs/architecture-and-privacy.md) | [docs/architecture-and-privacy.en.md](./docs/architecture-and-privacy.en.md) |
+| 历史方案归档索引 | [docs/archive/README.md](./docs/archive/README.md) | [docs/archive/README.md](./docs/archive/README.md) |
 
 ---
 

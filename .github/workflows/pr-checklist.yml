@@ -25,4 +25,4 @@ jobs:
         if: github.event_name == 'pull_request'
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
-        run: python3 .github/scripts/check_pr_checklist.py
+        run: python3 .github/scripts/check_pr_checklist.py --profile state-service

@@ -36,12 +36,13 @@ When you explicitly opt in (`reporting configure --enabled true` and `reporting 
 
 | Category | Fields |
 | --- | --- |
-| **✅ Allowlisted (Included)** | Component name, package version & Git commit revision, operation & stage name, static error category, monotonic duration, process exit/cleanup flags, and product code stack frames (file & line numbers within MindIE packages) |
+| **✅ Allowlisted (Included)** | Component name (including `mindie-harness`), package version & Git commit revision, operation & stage name, static error category, monotonic duration, process exit/cleanup flags, and owned product stack frames (including co-owned `mindie_harness.*` substrate frames on host-plugin incidents) |
 | **🚫 Strictly Excluded (Never Sent)** | Raw exception message text (`str(e)`), shell commands, `stdout` / `stderr`, prompts, conversation transcripts, environment variable values, credentials/keys, session or job IDs, user file paths, and remote host IPs or hostnames |
 
-**Anti-Spam & Instant Revocation Guarantees**:
-- **Idempotent Reconciliation (No Duplicate Issue Spam)**: Each candidate goes through at most 3 processing cycles. If a network drop leaves a `POST` request uncertain, the next cycle checks GitHub first rather than blindly reposting. If an open or closed Issue with the same fault fingerprint already exists, it links to that Issue without commenting or reopening it.
-- **Immediate Revocation When Disabled**: The active queue holds at most 1,000 candidates (for 7 days) and keeps at most 1,000 compact receipts (for 30 days). Running `configure --enabled false` **immediately invalidates all pending items in the queue**; re-enabling later never backfills events recorded while reporting was off.
+**Scale-to-Zero Drain, Safe `7d` Pending Expiry & Instant Revocation**:
+- **Scale-to-Zero On-Demand Drain Worker (Zero 24/7 Idle Daemon, Zero 15s Heartbeat `fsync`s)**: The worker coalesces concurrent invocations via non-blocking `worker-drain.lock`, drains up to 8 ready items per run, schedules a durable OS retry wake (`<state>/next-wake.json` + companion timer) **only** when active `pending`/`retry`/`uncertain` work remains, and **exits `0` immediately when idle** (`mode="on_demand"`, `status="idle"`). Missing idle heartbeats are never treated as crashes, and OS service units never set `KeepAlive` respawn loops. Legacy OS services across `<config>.state/service` and user service directories are unloaded (awaiting `launchctl bootout` on macOS and preserving user-disabled choices) before old runtime venvs are retired.
+- **Idempotent Reconciliation & Pending-Only `7d` Expiry**: Only never-dispatched `pending` incidents (`attempts == 0` and `attempt_timestamp IS NULL`) older than **7 days** transition to `state="expired"`. **Uncertain `POST` receipts (`uncertain`), published Issue deduplication fingerprints (`published`), consent revisions (`choice_revision`), and withdrawal receipts (`withdrawn`) never expire by age and never replay blind writes.**
+- **Immediate Revocation & Symlink-Friendly Config/Log Roots**: User config files (`diagnostics.json`, `mindie-consent.json`) and log roots managed via Stow, Nix, or Git worktree symlinks resolve cleanly to their canonical targets while internal `.jsonl` segments retain strict `O_NOFOLLOW` protection. Running `configure --enabled false` **immediately withdraws all unsent items**, and re-enabling later never backfills unconsented history.
 
 ---
 

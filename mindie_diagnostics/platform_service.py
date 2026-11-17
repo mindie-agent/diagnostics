@@ -561,14 +561,8 @@ def install_service(roots, state, repository, *, python=None, gh=None, interval=
         fixed_since = existing["since"] if existing else common._since(since)
         interpreter, version = common._interpreter(
             (lambda command, **kwargs: runner(
-                command,
-                **{
-                    **kwargs,
-                    "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                    **({"errors": "replace"} if kwargs.get("text") else {}),
-                },
-            )) if os.name == "nt" else runner,
-            python,
+                command, **{**kwargs, "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0), **({"errors": "replace"} if kwargs.get("text") else {})},
+            )) if os.name == "nt" else runner, python,
         )
         launcher = _physical(interpreter)
         if sys.platform == "win32":
@@ -583,14 +577,12 @@ def install_service(roots, state, repository, *, python=None, gh=None, interval=
         _verify_unit(unit, existing)
         physical_roots = []
         for root in roots:
-            directory = Path(root)
-            if directory.is_symlink():
-                raise common.ServiceError('unsafe_diagnostic_root')
+            directory = Path(os.path.realpath(root)) if Path(root).is_symlink() else Path(root)
             _private_mkdir(directory, parents=True, exist_ok=True)
             physical_roots.append(str(_physical(directory)))
         roots = list(dict.fromkeys(physical_roots))
-        if any(item.is_symlink() for item in (state, *state.parents)):
-            raise common.ServiceError('unsafe_state_directory')
+        if state.is_symlink() or any(item.is_symlink() for item in state.parents):
+            state = Path(os.path.realpath(state))
         _private_mkdir(state, parents=True, exist_ok=True)
         state = _physical(state)
         environment_file, network_changed = service_environment.prepare(manifest.parent, environment_file)
@@ -613,6 +605,8 @@ def install_service(roots, state, repository, *, python=None, gh=None, interval=
         elif sys.platform == "darwin":
             payload = plistlib.dumps({"Label": label, "ProgramArguments": [str(launcher), *config["launch_args"]],
                                       "RunAtLoad": True,
+                                      "WatchPaths": [str(Path(r) / "events" / ".notify") for r in roots],
+                                      "ThrottleInterval": 10,
                                       "WorkingDirectory": str(manifest.parent), "Umask": 0o077,
                                       "StandardOutPath": "/dev/null", "StandardErrorPath": "/dev/null"})
         else:
@@ -623,20 +617,23 @@ def install_service(roots, state, repository, *, python=None, gh=None, interval=
         _private_mkdir(state, parents=True, exist_ok=True)
         manifest_bytes = (json.dumps(config, ensure_ascii=True, indent=2) + "\n").encode("utf-8")
         if sys.platform == "win32":
+            user_disabled = bool(ensure and loaded and loaded.get("state") == "Disabled")
             common._check_reporting_consent(reporting_config, expected_consent_revision)
-            if changed:
+            if changed and not user_disabled:
                 _write(unit, payload)
                 _write(manifest, manifest_bytes)
             common._check_reporting_consent(reporting_config, expected_consent_revision)
-            if changed or loaded is None:
+            if (changed or loaded is None) and not user_disabled:
                 _ps(runner, "Register-ScheduledTask -TaskName " + _ps_quote(label) + " -TaskPath '\\' -Xml "
                     "([IO.File]::ReadAllText(" + _ps_quote(unit) + ")) -Force|Out-Null", action="task.register")
-            if start:
+            if start and not user_disabled:
                 common._check_reporting_consent(reporting_config, expected_consent_revision)
                 if existing and changed:
                     _ps(runner, "Stop-ScheduledTask -TaskName " + _ps_quote(label), action="task.stop")
                 common._check_reporting_consent(reporting_config, expected_consent_revision)
                 _ps(runner, "Start-ScheduledTask -TaskName " + _ps_quote(label), action="task.start")
+            elif user_disabled:
+                start = False
         elif sys.platform == "darwin":
             if loaded["returncode"] == 0 and changed:
                 common._check_reporting_consent(reporting_config, expected_consent_revision)
@@ -745,8 +742,11 @@ def remove_service(*, unit_dir=None, runner=None, expected_reporting_config=None
         elif sys.platform == "darwin":
             if _launchd_status(runner, label, manifest, config)["returncode"] == 0:
                 _launchctl(runner, "bootout", _domain(label))
+                _await_bootout(runner, label)
         else:
             _linux_stop_worker(manifest, config, deadline=getattr(runner, "deadline", None))
+        from .wake_schedule import clear_retry_wake
+        clear_retry_wake(config.get("state") or unit.parent, unit_dir=manifest.parent, runner=runner, force_probe=True)
         if _read(manifest) != config:
             raise common.ServiceError("unit_changed_during_removal")
         unit.unlink(missing_ok=True)

@@ -1,19 +1,22 @@
-"""Atomic local worker liveness and progress heartbeat (`worker-health.json`).
+"""Atomic local worker stage and Scale-to-Zero completion state (`worker-health.json`).
 
 [Role]
-Maintains `<state>/worker-health.json` with a background 15s daemon heartbeat
-thread and stage progress timestamps, and provides `read_health` for local
-status inspection.
+Maintains `<state>/worker-health.json` with stage progress timestamps and
+Scale-to-Zero (`mode="on_demand"`) idle completion receipts, and provides
+`read_health` for local status inspection—with zero background heartbeat threads
+or periodic idle `fsync` loops.
 
 [Invariants]
-- A worker is considered `stale` if `now - heartbeat_at > 60s` and
-  `progress_stalled` if `status == "running"` for `> max(1200s, interval * 3)`.
+- Scale-to-Zero workers exit immediately after draining (`mode="on_demand"`,
+  `status="idle"`): missing idle heartbeats are NEVER treated as stale or crashed.
+- Active in-progress workers (`status == "running"`) remain `stale` if
+  `now - heartbeat_at > 60s` and `progress_stalled` if `> max(1200s, interval * 3)`.
 - Records `runtime_source` (generation SHA-256) and `process_created` (on Windows)
   to prevent PID-reuse false positives and verify runtime handoffs.
 
 [Timeouts & Locks]
-- `self.lock` (`threading.RLock`) serializes concurrent heartbeat and stage
-  updates; `__exit__` joins the heartbeat thread with a 2.0s timeout.
+- `self.lock` (`threading.RLock`) serializes stage and drain-completion updates;
+  spawns zero background threads.
 
 [Side-Effect Policy]
 - Writes `worker-health.json` atomically via `_write_output`; write failures log
@@ -24,8 +27,8 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-import threading
 import sys
+import threading
 import time
 
 from .bundle import _write_output
@@ -42,7 +45,8 @@ def read_health(state, *, clock=time.time):
             raise ValueError('invalid health file')
         data = json.loads(path.read_text(encoding='utf-8'))
         now = clock()
-        data['stale'] = now - data['heartbeat_at'] > 60
+        on_demand_idle = data.get('mode') == 'on_demand' and data.get('status') == 'idle'
+        data['stale'] = False if on_demand_idle else (now - data['heartbeat_at'] > 60)
         data['progress_stalled'] = (data['status'] == 'running' and
                                     now - data['progress_at'] > max(1200, data['interval'] * 3))
         data['healthy'] = not data['stale'] and not data['progress_stalled'] and data['status'] in {'running', 'idle'}
@@ -56,7 +60,8 @@ def read_health(state, *, clock=time.time):
 class Health:
     def __init__(self, state, recorder, *, interval=60, clock=time.time):
         self.path, self.recorder, self.clock = Path(state) / 'worker-health.json', recorder, clock
-        self.lock, self.stop = threading.RLock(), threading.Event()
+        self.lock = threading.RLock()
+        self.finished_drain = False
         self.data = {'schema': 1, 'pid': os.getpid(), 'started_at': clock(), 'interval': interval,
                      'heartbeat_at': clock(), 'progress_at': clock(), 'status': 'running', 'stage': 'starting'}
         if os.name == 'nt':
@@ -76,11 +81,23 @@ class Health:
                 self.data['runtime_source'] = digest
         except (ValueError, TypeError, AttributeError):
             pass
-        self.thread = None
 
     def update(self, **fields):
         with self.lock:
             self.data.update(fields, progress_at=self.clock())
+            self.write()
+
+    def finish_drain(self, *, status='idle', next_wake_at=None):
+        with self.lock:
+            self.finished_drain = True
+            stage = 'retry_scheduled' if next_wake_at is not None else 'idle'
+            self.data.update(
+                mode='on_demand',
+                status=status,
+                stage=stage,
+                next_wake_at=next_wake_at,
+                progress_at=self.clock(),
+            )
             self.write()
 
     def write(self):
@@ -91,17 +108,13 @@ class Health:
             except Exception as exc:
                 self.recorder.event('WARNING', 'worker.health_unavailable', error_type=type(exc).__name__)
 
-    def _heartbeat(self):
-        while not self.stop.wait(15):
-            self.write()
-
     def __enter__(self):
         self.write()
-        self.thread = threading.Thread(target=self._heartbeat, name='mindie-worker-heartbeat', daemon=True)
-        self.thread.start()
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        self.stop.set()
-        self.thread.join(timeout=2)
-        self.update(status='failed' if exc_type or self.data['status'] == 'failed' else 'stopped', stage='stopped')
+        if exc_type or self.data['status'] == 'failed':
+            self.finished_drain = False
+            self.update(status='failed', stage='stopped')
+        elif not self.finished_drain:
+            self.update(status='stopped', stage='stopped')

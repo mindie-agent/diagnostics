@@ -760,7 +760,11 @@ def append_failure_event(component, root, event) -> bool:
             recorder.logging_failed = True
             return False
         logger.error(encoded)
-        return recorder.dropped_records == before
+        ok = recorder.dropped_records == before
+        if ok and event.get("reporting"):
+            from .fallback import _touch_notify
+            _touch_notify(Path(os.path.realpath(selected_root)) if selected_root.is_symlink() else selected_root)
+        return ok
     except Exception:
         if recorder is not None:
             recorder.logging_failed = True

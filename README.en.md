@@ -163,8 +163,8 @@ result = record_failure(
 | Topic | 中文 | English |
 | --- | --- | --- |
 | Documentation Index | [docs/README.md](./docs/README.md) | [docs/README.en.md](./docs/README.en.md) |
-| Architecture, Privacy Allowlist & Log Rotation | [docs/architecture-and-privacy.md](./docs/architecture-and-privacy.md) | [docs/architecture-and-privacy.en.md](./docs/architecture-and-privacy.en.md) |
-| Bounded Outbound Reconciliation & Prune Budget Alignment | [docs/outbound-reconciliation-followup.md](./docs/outbound-reconciliation-followup.md) | [docs/outbound-reconciliation-followup.en.md](./docs/outbound-reconciliation-followup.en.md) |
+| Architecture, Scale-to-Zero Drain, Privacy Allowlist & Log Rotation | [docs/architecture-and-privacy.md](./docs/architecture-and-privacy.md) | [docs/architecture-and-privacy.en.md](./docs/architecture-and-privacy.en.md) |
+| Archived Historical Notes | [docs/archive/README.md](./docs/archive/README.md) | [docs/archive/README.md](./docs/archive/README.md) |
 
 ---
 

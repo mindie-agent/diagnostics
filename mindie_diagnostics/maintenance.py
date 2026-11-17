@@ -282,9 +282,7 @@ def release_recovery(root) -> None:
 def prune(root: str | Path, *, max_bytes: int = 128 * 1024 * 1024,
           max_age_days: int = 7, max_files: int = 512, clock=time.time, queue=None,
           timeout: float = 5.0) -> dict:
-    root = Path(root).absolute()
-    if root.is_symlink():
-        raise ValueError("retention root must not traverse symlinks")
+    root = Path(os.path.realpath(root))
     events = root / 'events'
     result = {"removed_files": 0, "removed_bytes": 0, "remaining_bytes": 0,
               "remaining_files": 0, "limited": False, "reader_unknown": False,

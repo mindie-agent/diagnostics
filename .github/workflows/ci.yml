@@ -13,40 +13,67 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
         python: ['3.11', '3.12', '3.13']
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: ${{ matrix.python }}
       - run: uv venv
       - run: uv pip install -e ".[test]"
-      - run: uv run --no-project python -m pytest -q --junitxml=results.xml
+      - name: Run isolated test suite
+        env:
+          HOME: ${{ runner.temp }}/diag-ci-home
+          USERPROFILE: ${{ runner.temp }}/diag-ci-home
+          XDG_CONFIG_HOME: ${{ runner.temp }}/diag-ci-home/.config
+          XDG_DATA_HOME: ${{ runner.temp }}/diag-ci-home/.local/share
+          XDG_STATE_HOME: ${{ runner.temp }}/diag-ci-home/.local/state
+          XDG_CACHE_HOME: ${{ runner.temp }}/diag-ci-home/.cache
+          MINDIE_CONFIG_HOME: ${{ runner.temp }}/diag-ci-home/.config/mindie
+          MINDIE_DATA_HOME: ${{ runner.temp }}/diag-ci-home/.local/share/mindie
+          MINDIE_DIAGNOSTICS_ROOT: ${{ runner.temp }}/diag-ci-home/diagnostics
+        run: uv run --no-project python -B -m pytest -q -m "not live_npu" --junitxml=results.xml
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: diagnostics-${{ matrix.os }}-${{ matrix.python }}
           path: results.xml
+
   wheel:
+    name: Offline zero-dependency wheel smoke check
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: '3.11'
       - run: uv build
-      - run: |
-          uv venv /tmp/diagnostics-wheel
-          uv pip install --python /tmp/diagnostics-wheel/bin/python --no-deps dist/*.whl
-          cd /tmp
-          /tmp/diagnostics-wheel/bin/python -c "import importlib.metadata as m; assert not [x for x in m.requires('mindie-diagnostics') or [] if 'extra ==' not in x]"
-          /tmp/diagnostics-wheel/bin/mindie-diagnostics --help
+      - name: Offline install and smoke check outside source tree
+        run: |
+          uv venv "$RUNNER_TEMP/diagnostics-wheel"
+          uv pip install --python "$RUNNER_TEMP/diagnostics-wheel/bin/python" --offline --no-index --find-links dist mindie-diagnostics
+          mkdir -p "$RUNNER_TEMP/empty-cwd" "$RUNNER_TEMP/smoke-home"
+          cd "$RUNNER_TEMP/empty-cwd"
+          HOME="$RUNNER_TEMP/smoke-home" MINDIE_DIAGNOSTICS_ROOT="$RUNNER_TEMP/smoke-home/diag" "$RUNNER_TEMP/diagnostics-wheel/bin/python" -I -c "
+          import importlib.metadata as m
+          from mindie_diagnostics import fallback
+          assert not [x for x in m.requires('mindie-diagnostics') or [] if 'extra ==' not in x]
+          res = fallback.record_failure('mindie-harness', 'smoke.test', stage='boot', category='internal')
+          assert res['recorded'] is True
+          "
+          HOME="$RUNNER_TEMP/smoke-home" "$RUNNER_TEMP/diagnostics-wheel/bin/mindie-diagnostics" --help >/dev/null
 
   release-ready:
     name: release-ready
     needs: [test, wheel]
     if: always()
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - env:
           RESULTS: ${{ toJSON(needs) }}

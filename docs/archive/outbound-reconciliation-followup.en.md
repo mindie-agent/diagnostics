@@ -1,6 +1,11 @@
+> **[Archived Historical Specification]**
+> - **Archived from baseline SHA**: `96c40049e2fc` · **Original path**: `docs/outbound-reconciliation-followup.en.md`
+> - **Status**: Retained strictly for historical design provenance; this file is not an active architecture or release gate.
+> - **Current living specification**: See [`../architecture-and-privacy.en.md`](../architecture-and-privacy.en.md).
+
 # Bounding the Outbound Reconciliation Read
 
-[中文](./outbound-reconciliation-followup.md) · **English** · [Back to Documentation](./README.en.md)
+[中文](./outbound-reconciliation-followup.md) · **English** · [Back to Documentation](../README.en.md)
 
 **Implementation status (October 29, 2026):** attempt timestamps, positive-only search with bounded listing, window-exhaustion classification, and prune budget admission are implemented. Sections 1–7 retain the original design rationale; their line references describe `838480a`, not current source locations. Sections 8–9 describe the implementation and local verification scope.
 

@@ -1,6 +1,11 @@
+> **[历史归档文档 / Archived Historical Spec]**
+> - **归档基准提交（Baseline SHA）**：`96c40049e2fc` · **原路径**：`docs/outbound-reconciliation-followup.md`
+> - **状态说明**：本文档记录早期出站对账后续设计讨论，仅作历史溯源参考，不再作为当前发版或架构门禁依据。
+> - **当前生效规范（Living Spec）**：请参阅 [`../architecture-and-privacy.md`](../architecture-and-privacy.md)。
+
 # 出站对账读取的有界化跟进
 
-**中文** · [English](./outbound-reconciliation-followup.en.md) · [返回文档中心](./README.md)
+**中文** · [English](./outbound-reconciliation-followup.en.md) · [返回文档中心](../README.md)
 
 **实施状态（2026-10-29）**：已实现尝试时间戳迁移、阳性搜索与有界列举、窗口耗尽分类，以及 prune 剩余预算准入。第 1–7 节保留实施前的设计依据；其中行号基于 `838480a`，不代表当前实现位置。当前行为及本地验证范围见第 8–9 节。
 

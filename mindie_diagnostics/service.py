@@ -442,19 +442,20 @@ def install_service(roots, state, repository, *, python=None, gh=None, interval=
                 "\n[Install]\nWantedBy=default.target\n")
         changed = existing is None or existing[0] != text or network_changed
         state.mkdir(parents=True, exist_ok=True, mode=0o700)
-        # Consent recheck after the native lock and blocking verifies, before
-        # writing/enabling changed owned descriptions.
+        _, loaded_facts = _loaded_properties(runner, path) if (ensure and existing) else (None, {})
+        user_disabled = bool(ensure and existing and loaded_facts.get("UnitFileState") in {"disabled", "masked"})
         _check_reporting_consent(reporting_config, expected_consent_revision)
-        verification = _publish(path, text, runner) if changed else "unchanged"
-        # Recheck after the blocking publish verification, before enablement.
+        verification = _publish(path, text, runner) if (changed and not user_disabled) else "unchanged"
         _check_reporting_consent(reporting_config, expected_consent_revision)
         _systemctl(runner, "daemon-reload")
-        _systemctl(runner, "enable", str(path))
+        if not user_disabled:
+            _systemctl(runner, "enable", str(path))
         _check_loaded_owner(runner, path)
-        if start:
-            # Recheck immediately before the owned stop/start mutation.
+        if start and not user_disabled:
             _check_reporting_consent(reporting_config, expected_consent_revision)
             _systemctl(runner, "restart" if existing and changed else "start", path.name)
+        elif user_disabled:
+            start = False
         return {"status": "installed", "unit": str(path), "since": fixed_since,
                 "changed": changed, "start_requested": start, "python": str(interpreter),
                 "package_version": version, "state": str(state), "unit_verification": verification}
@@ -534,6 +535,10 @@ def remove_service(*, unit_dir=None, runner=None, expected_reporting_config=None
                 return {"status": "different_profile", "unit": str(path)}
         _check_loaded_owner(runner, path, allow_missing=True, repair=True)
         _systemctl(runner, "disable", "--now", path.name)
+        timer_path = path.with_name(path.stem + "-retry.timer")
+        if timer_path.exists() or timer_path.is_symlink():
+            _systemctl(runner, "disable", "--now", timer_path.name, check=False)
+            timer_path.unlink(missing_ok=True)
         if _read_owned(path) != existing:
             raise ServiceError("unit_changed_during_removal")
         path.unlink()

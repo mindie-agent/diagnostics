@@ -2,11 +2,11 @@
 
 **中文** · [English](./README.en.md) · [返回项目主页](../README.md)
 
-这里详细说明了 `mindie-diagnostics` 是如何保护你的隐私安全、区分“用户报错”与“产品 Bug”、以及管理本地循环日志和授权队列的。
+这里详细说明了 `mindie-diagnostics` 如何保护隐私安全、区分“用户日常报错”与“组件自身缺陷”、通过 Scale-to-Zero 按需排空消灭常驻后台开销，以及安全管理本地循环日志和授权队列。
 
 ## 文档导航
 
 | 文档主题 | 中文 | English | 你能在这里查到什么 |
 | --- | --- | --- | --- |
-| 架构、隐私白名单与日志轮转详解 | [architecture-and-privacy.md](./architecture-and-privacy.md) | [architecture-and-privacy.en.md](./architecture-and-privacy.en.md) | 哪些信息允许进诊断包、哪些绝对禁止？为什么策略文件坏了不能当成首次使用？4 × 1 MiB 循环日志怎么防丢数据？ |
-| 出站对账窗口有界化与日志回收预算对齐 | [outbound-reconciliation-followup.md](./outbound-reconciliation-followup.md) | [outbound-reconciliation-followup.en.md](./outbound-reconciliation-followup.en.md) | 为什么不确定状态的 POST 绝不能重放？如何通过 `attempt_timestamp` + 阳性搜索 + 有界列举完成 8 MiB 预算内的安全对账，并与 `prune` 游标读取预算对齐？ |
+| 架构、Scale-to-Zero 排空、隐私白名单与日志轮转 | [architecture-and-privacy.md](./architecture-and-privacy.md) | [architecture-and-privacy.en.md](./architecture-and-privacy.en.md) | 白名单投影、`mindie-harness` 共管栈归因、Scale-to-Zero 按需排空（零常驻空闲进程与零 15 秒心跳 `fsync`）、`7d` 仅限未发送 `pending` 过期（保留 `uncertain` 对账与已发布指纹）以及 4 × 1 MiB 环形日志轮转 |
+| 历史方案归档索引 | [archive/README.md](./archive/README.md) | [archive/README.md](./archive/README.md) | 早期出站对账后续设计讨论归档（仅供历史溯源，不作为当前门禁） |

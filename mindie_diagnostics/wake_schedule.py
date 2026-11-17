@@ -386,9 +386,37 @@ def sync_retry_wake(
 
 @contextmanager
 def _try_timer_lock(state: Path):
-    import fcntl
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
-    fd = os.open(state / "retry-timer.lock", os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    lock_file = state / "retry-timer.lock"
+    if os.name == "nt":
+        import msvcrt
+
+        fh = lock_file.open("a+b")
+        acquired = False
+        try:
+            fh.seek(0)
+            if lock_file.stat().st_size == 0:
+                fh.write(b"\x00")
+                fh.flush()
+                fh.seek(0)
+            try:
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                acquired = True
+            except OSError:
+                acquired = False
+            yield acquired
+        finally:
+            try:
+                if acquired:
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            finally:
+                fh.close()
+        return
+
+    import fcntl
+
+    fd = os.open(lock_file, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
     acquired = False
     try:
         try:

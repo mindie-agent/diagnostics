@@ -137,8 +137,13 @@ def test_symlink_and_overwrite_guards(tmp_path):
         raise
     except OSError:
         pytest.skip("symlink creation unavailable")
+    # Legitimate symlinked log roots (e.g. Stow/Nix/worktrees) resolve cleanly,
+    # whereas symlinked output files or symlinked internal `events/` dirs are refused.
+    assert collect_bundle(link)["summary"]["event_count"] == 1
+    out_link = tmp_path / "bundle-link.json"
+    out_link.symlink_to(tmp_path / "real-out.json")
     with pytest.raises(ValueError, match="symlink"):
-        collect_bundle(link)
+        collect_bundle(tmp_path, output=out_link)
 
 
 def test_output_write_failure_leaves_existing_artifact(tmp_path, monkeypatch):

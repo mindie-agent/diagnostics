@@ -26,7 +26,7 @@ import json
 import re
 from typing import Any
 
-from .evidence import component_module_name
+from .evidence import component_module_name, is_owned_module
 from .redact import scan_text
 
 MARKER = "<!-- mindie-incident:"
@@ -36,6 +36,7 @@ _MODULE_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{0,159}\Z")
 
 _COMPONENT_REPOS: dict[str, tuple[str, str]] = {
     "mindie-diagnostics": ("mindie-agent/diagnostics", "package"),
+    "mindie-harness": ("mindie-agent/harness", "package"),
     "mindie-knowledge": ("mindie-agent/knowledge", "package"),
     "remote-dev": ("mindie-agent/remote-dev", "package"),
     "mindie-coordinator": ("mindie-agent/coordinator", "package"),
@@ -55,13 +56,11 @@ _COMPONENT_REPOS: dict[str, tuple[str, str]] = {
 
 
 def owned_frames(component: str, raw_frames: Any) -> list[dict[str, Any]]:
-    module = component_module_name(component)
-    if not module or not isinstance(raw_frames, list):
+    if not component_module_name(component) or not isinstance(raw_frames, list):
         return []
     return [
         frame for frame in raw_frames
-        if isinstance(frame, dict)
-        and (frame.get("module") == module or str(frame.get("module", "")).startswith(module + "."))
+        if isinstance(frame, dict) and is_owned_module(component, frame.get("module"))
     ]
 
 
@@ -194,6 +193,13 @@ def component_source_permalink(
         return None, None
     clean_mod = module[:-9] if module.endswith(".__init__") else module
     pkg_init = is_init or module.endswith(".__init__")
+    if component.startswith("mindie-agent-") and (
+        clean_mod == "mindie_harness" or clean_mod.startswith("mindie_harness.")
+    ):
+        if clean_mod == "mindie_harness":
+            return "mindie_harness/__init__.py", None
+        base = clean_mod.replace(".", "/")
+        return (f"{base}/__init__.py" if pkg_init else f"{base}.py"), None
     if layout == "package":
         if clean_mod == pkg:
             rel_path = f"{pkg}/__init__.py"

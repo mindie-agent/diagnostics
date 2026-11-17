@@ -120,7 +120,7 @@ def _component_meta(component):
         return (None, None)
 
 
-def _frame_dict(frame, component_module, line=None, source_root=None):
+def _frame_dict(frame, component_module, line=None, source_root=None, *, co_owned=()):
     name = frame.f_globals.get("__name__")
     filename = frame.f_code.co_filename
     is_init = isinstance(filename, str) and os.path.basename(filename.replace("\\", "/")) == "__init__.py"
@@ -149,7 +149,8 @@ def _frame_dict(frame, component_module, line=None, source_root=None):
         name == "mindie_diagnostics" or name.startswith("mindie_diagnostics.")
     ):
         return None
-    if name != component_module and not name.startswith(component_module + "."):
+    prefixes = (component_module, *co_owned)
+    if not any(name == pfx or name.startswith(pfx + ".") for pfx in prefixes):
         return None
     function = frame.f_code.co_name
     if not isinstance(function, str) or (
@@ -170,6 +171,7 @@ def _stack_frames(component, exception, *, source_root=None):
     module = _module_name(component)
     if not module:
         return [], False, False
+    co_owned = ("mindie_harness",) if isinstance(component, str) and component.startswith("mindie-agent-") else ()
     norm_root = os.path.normpath(os.fspath(source_root)) if source_root is not None else None
     if norm_root is not None and not os.path.isabs(norm_root):
         norm_root = None
@@ -188,7 +190,7 @@ def _stack_frames(component, exception, *, source_root=None):
         if tb is not None:
             truncated, incomplete = True, True
         for frm, lineno in tail_tbs:
-            item = _frame_dict(frm, module, lineno, source_root=norm_root)
+            item = _frame_dict(frm, module, lineno, source_root=norm_root, co_owned=co_owned)
             if item is not None:
                 frames.append(item)
         if len(frames) > _MAX_FRAMES:
@@ -207,7 +209,7 @@ def _stack_frames(component, exception, *, source_root=None):
         hops += 1
     walked = 0
     while frame is not None and walked < 256:
-        item = _frame_dict(frame, module, source_root=norm_root)
+        item = _frame_dict(frame, module, source_root=norm_root, co_owned=co_owned)
         if item is not None:
             frames.append(item)
         frame = frame.f_back
@@ -353,7 +355,11 @@ def _merge_roots(existing, supplied):
 
 
 def _write_policy(path, payload):
-    if path.is_symlink() or (path.exists() and not path.is_file()):
+    if path.is_symlink():
+        path = f._as_local_absolute(os.path.realpath(path))
+        if path is None:
+            return False
+    if path.exists() and not path.is_file():
         return False
     try:
         f._private_mkdir(path.parent, parents=True, exist_ok=True)
@@ -510,6 +516,8 @@ def _worker_view(config):
             raise ValueError
         status = _safe_label(data.get("status"))
         stage = _safe_label(data.get("stage"))
+        mode = _safe_label(data.get("mode"))
+        next_wake = _finite_number(data.get("next_wake_at"))
         heartbeat = _finite_number(data.get("heartbeat_at"))
         progress = _finite_number(data.get("progress_at"))
         interval = _finite_number(data.get("interval"))
@@ -536,10 +544,10 @@ def _worker_view(config):
             if observed is False:
                 alive = False
             elif observed is True and type(expected) is int and expected > 0:
-                # A reused PID must not make a stopped worker look healthy.
                 alive = created == expected
+        on_demand_idle = mode == "on_demand" and status == "idle"
         running = status in {"running", "idle", "degraded"}
-        if running:
+        if running and not on_demand_idle:
             if alive is False:
                 status = "stopped"
             elif age > 60:
@@ -549,8 +557,12 @@ def _worker_view(config):
             elif stalled:
                 status = "stalled"
         view = {"status": status, "pid": pid, "healthy": status in {"running", "idle"},
-                "running": running and alive is True and age <= 60 and not stalled,
+                "running": (False if on_demand_idle else (running and alive is True and age <= 60 and not stalled)),
                 "heartbeat_age_s": age, "progress_stalled": stalled}
+        if mode:
+            view["mode"] = mode
+        if next_wake is not None:
+            view["next_wake_at"] = next_wake
         if stage:
             view["stage"] = stage
         view['version'] = _usable_version(data.get('package_version'))

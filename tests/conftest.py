@@ -1,6 +1,10 @@
 import pytest
 
 
+def pytest_configure(config):
+    config.addinivalue_line('markers', 'live_npu: requires standing A2/A3 SSH access')
+
+
 @pytest.fixture(autouse=True)
 def isolated_runtime(tmp_path, monkeypatch):
     # Tests must not use a developer's real contribution or GitHub settings.
@@ -8,17 +12,22 @@ def isolated_runtime(tmp_path, monkeypatch):
     # runner-under-test code, even when the original variable did not exist.
     for key in ('GH_TOKEN', 'GITHUB_TOKEN', 'MINDIE_COMMUNITY_POLICY'):
         monkeypatch.setenv(key, '')
-    home = tmp_path.resolve() / 'home'
+    base = tmp_path.resolve()
+    home = base / 'home'
     for key, value in (
         ('HOME', home),
         ('USERPROFILE', home),
-        ('XDG_CONFIG_HOME', tmp_path.resolve() / 'xdg-config'),
-        ('XDG_DATA_HOME', tmp_path.resolve() / 'xdg-data'),
-        ('XDG_STATE_HOME', tmp_path.resolve() / 'xdg-state'),
-        ('LOCALAPPDATA', tmp_path.resolve() / 'localappdata'),
-        ('MINDIE_CONFIG_HOME', tmp_path.resolve() / 'mindie-config'),
-        ('MINDIE_DATA_HOME', tmp_path.resolve() / 'mindie-data'),
-        ('MINDIE_DIAGNOSTICS_SERVICE_DIR', tmp_path.resolve() / 'service'),
+        ('APPDATA', base / 'appdata'),
+        ('XDG_CONFIG_HOME', base / 'xdg-config'),
+        ('XDG_DATA_HOME', base / 'xdg-data'),
+        ('XDG_STATE_HOME', base / 'xdg-state'),
+        ('XDG_CACHE_HOME', base / 'xdg-cache'),
+        ('LOCALAPPDATA', base / 'localappdata'),
+        ('MINDIE_CONFIG_HOME', base / 'mindie-config'),
+        ('MINDIE_DATA_HOME', base / 'mindie-data'),
+        ('MINDIE_DIAGNOSTICS_SERVICE_DIR', base / 'service'),
+        ('REMOTE_DEV_AUTH_DIR', base / 'remote-dev-auth'),
+        ('UV_CACHE_DIR', base / 'uv-cache'),
     ):
         monkeypatch.setenv(key, str(value))
     monkeypatch.setenv('MINDIE_DIAGNOSTICS_ROOT', str(tmp_path.resolve() / 'isolated-diagnostics'))

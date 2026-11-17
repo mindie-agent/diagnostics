@@ -35,16 +35,12 @@ except ImportError:
     ssl = None
 
 _HTTP_TRANSPORT_ERRORS = (
-    http.client.IncompleteRead,
-    http.client.RemoteDisconnected,
-    http.client.BadStatusLine,
+    http.client.IncompleteRead, http.client.RemoteDisconnected, http.client.BadStatusLine,
 )
-_DNS_ERRORS = tuple(
-    dict.fromkeys(
-        cls for cls in (getattr(socket, "gaierror", OSError), getattr(socket, "herror", OSError))
-        if isinstance(cls, type) and issubclass(cls, OSError) and cls is not OSError
-    )
-)
+_DNS_ERRORS = tuple(dict.fromkeys(
+    cls for cls in (getattr(socket, "gaierror", OSError), getattr(socket, "herror", OSError))
+    if isinstance(cls, type) and issubclass(cls, OSError) and cls is not OSError
+))
 
 _POLICY_SCHEMA = "mindie.diagnostics.reporting.v1"
 _POLICY_PURPOSE = "tool_fault_reporting"
@@ -60,14 +56,7 @@ _VERSION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:+-]{0,79}\Z")
 _REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}\Z")
 _ERROR_TYPE_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,119}\Z")
 _NEVER_REPORTABLE = frozenset({
-    "caller",
-    "cancelled",
-    "business",
-    "connectivity",
-    "credentials",
-    "permission",
-    "disabled",
-    "prerequisite",
+    "caller", "cancelled", "business", "connectivity", "credentials", "permission", "disabled", "prerequisite",
 })
 _CONSENT_KEYS = frozenset({"config_file", "revision", "repository", "purpose"})
 _STATIC_WARN = "mindie diagnostics: local failure record was not written\n"
@@ -184,7 +173,7 @@ def read_policy(config=None):
             raise PolicyUnavailable()
         if _lstat_or_missing(path) is None:
             return None
-        raw = _read_regular_bounded(path, _MAX_POLICY_BYTES)
+        raw = _read_regular_bounded(path, _MAX_POLICY_BYTES, allow_symlink=True)
         if raw is None:
             raise PolicyUnavailable()
         data = json.loads(raw.decode("utf-8"))
@@ -206,7 +195,7 @@ def read_policy(config=None):
 
 def contribution_authority(path):
     """Read the shared consent contract without depending on Knowledge runtime."""
-    raw = _read_regular_bounded(Path(path), 65536)
+    raw = _read_regular_bounded(Path(path), 65536, allow_symlink=True)
     try:
         data = json.loads(raw) if raw is not None else None
         if not isinstance(data, dict) or data.get("schema") != "mindie-consent/1":
@@ -477,17 +466,9 @@ def _build_event(
             return None
         attributes["host"] = host
         mapped_harness = {
-            "codex": "codex",
-            "claude-code": "claude_code",
-            "claude_code": "claude_code",
-            "kimi": "kimi",
-            "dsh": "dsh",
-            "antigravity": "antigravity",
-            "agy": "antigravity",
-            "workbuddy": "workbuddy",
-            "wb": "workbuddy",
-            "opencode": "opencode",
-            "oc": "opencode",
+            "codex": "codex", "claude-code": "claude_code", "claude_code": "claude_code",
+            "kimi": "kimi", "dsh": "dsh", "antigravity": "antigravity", "agy": "antigravity",
+            "workbuddy": "workbuddy", "wb": "workbuddy", "opencode": "opencode", "oc": "opencode",
         }.get(host)
         if mapped_harness and "harness" not in attributes:
             attributes["harness"] = mapped_harness
@@ -514,17 +495,10 @@ def _build_event(
     effective = False if category in _NEVER_REPORTABLE else reportable
     consent = current_consent() if effective else None
     event = {
-        "schema": 1,
-        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
-        "monotonic_ns": time.monotonic_ns(),
-        "pid": os.getpid(),
-        "component": component,
-        "severity": "ERROR",
-        "event": "operation.end",
-        "operation_id": incident,
-        "trace_id": incident,
-        "operation": operation,
-        "status": "error",
+        "schema": 1, "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        "monotonic_ns": time.monotonic_ns(), "pid": os.getpid(), "component": component,
+        "severity": "ERROR", "event": "operation.end", "operation_id": incident,
+        "trace_id": incident, "operation": operation, "status": "error",
     }
     if duration is not None:
         event["duration_ms"] = duration
@@ -551,6 +525,10 @@ def _append_event(root, component, event) -> bool:
         base = _as_local_absolute(default_root() if root is None else root)
         if base is None:
             return False
+        if base.is_symlink():
+            base = _as_local_absolute(os.path.realpath(base))
+            if base is None:
+                return False
         if _retention_blocked(base):
             return False
         leaf = base / "events" / component
@@ -563,7 +541,10 @@ def _append_event(root, component, event) -> bool:
         if len(line) > _MAX_EVENT_BYTES:
             return False
         filename = "%s-%s.jsonl" % (os.getpid(), proc)
-        return _append_line(leaf, filename, line)
+        ok = _append_line(leaf, filename, line)
+        if ok and event.get("reporting"):
+            _touch_notify(base)
+        return ok
     except Exception:
         return False
     finally:
@@ -578,6 +559,20 @@ def _retention_blocked(root):
         raise
     except (OSError, ValueError, TypeError):
         return False
+
+
+def _touch_notify(base: Path) -> None:
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(os.fspath(base / "events" / ".notify"), flags, 0o600)
+        try:
+            os.write(fd, b"1\n")
+        finally:
+            os.close(fd)
+    except TimeoutError:
+        raise
+    except OSError:
+        pass
 
 
 def _append_line(directory, filename, payload) -> bool:
@@ -602,7 +597,7 @@ def _append_line(directory, filename, payload) -> bool:
 def _ensure_owned_tree(root, leaf) -> bool:
     """Create leaf directory without modifying existing ancestor permissions."""
     try:
-        if root.is_symlink() or leaf.is_symlink():
+        if leaf.is_symlink() or (root / "events").is_symlink():
             return False
         _private_mkdir(leaf, parents=True, exist_ok=True)
         return not leaf.is_symlink() and leaf.is_dir()
@@ -612,17 +607,23 @@ def _ensure_owned_tree(root, leaf) -> bool:
         return False
 
 
-def _read_regular_bounded(path, limit):
-    """Read a regular file without following a symlink or blocking on a FIFO."""
+def _read_regular_bounded(path, limit, *, allow_symlink=False):
+    """Read a regular file without blocking on a FIFO; resolves symlinks only when `allow_symlink=True`."""
     flags = os.O_RDONLY
     if hasattr(os, "O_NONBLOCK"):
         flags |= os.O_NONBLOCK
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
-        if Path(path).is_symlink():
-            return None
-        fd = os.open(os.fspath(path), flags)
+        p = Path(path)
+        if p.is_symlink():
+            if not allow_symlink:
+                return None
+            resolved = _as_local_absolute(os.path.realpath(p))
+            if resolved is None:
+                return None
+            p = resolved
+        fd = os.open(os.fspath(p), flags)
     except TimeoutError:
         raise
     except OSError:

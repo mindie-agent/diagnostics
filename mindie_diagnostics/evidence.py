@@ -43,6 +43,26 @@ def component_module_name(component) -> str:
     return component.replace('-', '_')
 
 
+def owned_module_prefixes(component) -> tuple[str, ...]:
+    """Return owned Python module roots, including co-owned `mindie_harness` for host plugins."""
+    module = component_module_name(component)
+    if not module:
+        return ()
+    if isinstance(component, str) and component.startswith('mindie-agent-'):
+        return (module, 'mindie_harness')
+    return (module,)
+
+
+def is_owned_module(component, module_name) -> bool:
+    """True when `module_name` belongs to `component` or its co-owned `mindie_harness` substrate."""
+    if type(module_name) is not str or not module_name:
+        return False
+    return any(
+        module_name == prefix or module_name.startswith(prefix + '.')
+        for prefix in owned_module_prefixes(component)
+    )
+
+
 def validate_evidence(component, evidence):
     """Project untrusted JSON transport; fingerprints are always recomputed."""
     from .redact import scan_text
@@ -62,7 +82,7 @@ def validate_evidence(component, evidence):
             name, function, line = (frame.get(k) for k in ('module', 'function', 'line'))
             if type(name) is not str or len(name) > 160 or not _MODULE.fullmatch(name):
                 continue
-            if name != module and not name.startswith(module + '.'):
+            if not is_owned_module(component, name):
                 continue
             if type(function) is not str or not (_IDENT.fullmatch(function) or function in _SPECIAL_FUNCTIONS):
                 continue

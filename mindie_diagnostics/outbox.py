@@ -43,8 +43,10 @@ from .fallback import _private_mkdir
 
 TERMINAL_HISTORY_LIMIT = 1000
 TERMINAL_HISTORY_SECONDS = 30 * 86400
+PENDING_TTL_SECONDS = 7 * 86400
 _ACTIVE_STATES = ("pending", "retry", "uncertain")
 _TERMINAL_STATES = ("published", "withdrawn", "expired", "exhausted", "blocked", "permanent-failed")
+_AGE_PRUNABLE_TERMINAL_STATES = ("expired", "exhausted", "blocked", "permanent-failed")
 _RECEIPT_TOKEN_LIMIT = 128
 
 
@@ -150,12 +152,11 @@ class Outbox:
         path = self.path
         if path.is_symlink() or (path.exists() and not path.is_file()):
             raise ValueError("diagnostic queue path must be a regular SQLite file")
-        parent = path.parent
-        if parent.is_symlink():
-            raise ValueError("diagnostic queue directory must not be a symlink")
+        parent = Path(os.path.realpath(path.parent)) if path.parent.is_symlink() else path.parent
         _private_mkdir(parent, parents=True, exist_ok=True)
         if not parent.is_dir():
             raise NotADirectoryError("diagnostic queue parent is not a directory")
+        self.path = parent / path.name
 
     @contextmanager
     def connect(self):
@@ -256,10 +257,11 @@ class Outbox:
         return True
 
     def maintain(self) -> None:
-        """Compact completed history without discarding unpublished evidence."""
+        """Expire stale never-dispatched pending work (>7d) and compact terminal history."""
         now = self.clock()
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
+            self._expire_stale_pending(db, now)
             self._prune_published(db, now)
 
     @staticmethod
@@ -349,12 +351,25 @@ class Outbox:
             if receipt != row["payload"]:
                 db.execute("UPDATE incidents SET payload=? WHERE fingerprint=?", (receipt, row["fingerprint"]))
 
+    def _expire_stale_pending(self, db, now) -> int:
+        """Expire strictly never-dispatched `pending` incidents older than 7 days."""
+        cur = db.execute(
+            "UPDATE incidents SET state='expired',last_error='pending_ttl_expired',"
+            "lease_until=0,lease_token=NULL "
+            "WHERE state='pending' AND attempts=0 AND attempt_timestamp IS NULL "
+            "AND issue_number IS NULL AND issue_url IS NULL "
+            "AND (last_error IS NULL OR last_error NOT LIKE 'submission_uncertain%') "
+            "AND last_seen < ?",
+            (now - PENDING_TTL_SECONDS,),
+        )
+        return cur.rowcount
+
     def _prune_published(self, db, now):
-        # Terminal markers only. Active unpublished evidence is never evicted.
+        # Terminal markers only. Uncertain POSTs, published dedup fingerprints, and withdrawal receipts never age-expire.
         self._compact_terminal(db)
         db.execute(
             "DELETE FROM incidents WHERE state IN "
-            "('published','withdrawn','expired','exhausted','blocked','permanent-failed') AND last_seen < ?",
+            "('expired','exhausted','blocked','permanent-failed') AND last_seen < ?",
             (now - TERMINAL_HISTORY_SECONDS,),
         )
         db.execute(
@@ -364,6 +379,18 @@ class Outbox:
             "ORDER BY last_seen DESC, fingerprint DESC LIMIT -1 OFFSET ?)",
             (TERMINAL_HISTORY_LIMIT,),
         )
+
+    def next_retry_at(self) -> float | None:
+        """Earliest due timestamp among active (`pending`, `retry`, `uncertain`) incidents, or None."""
+        now = self.clock()
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT MIN(MAX(next_attempt, lease_until, ?)) FROM incidents "
+                "WHERE state IN ('pending','retry','uncertain')",
+                (now,),
+            ).fetchone()
+        val = row[0] if row is not None else None
+        return float(val) if isinstance(val, (int, float)) else None
 
     def claim(self, *, lease_seconds: float = 300) -> dict[str, Any] | None:
         now, token = self.clock(), uuid.uuid4().hex

@@ -86,9 +86,7 @@ def ingest(root, queue: Outbox, *, max_files=256, max_bytes=8 * 1024 * 1024, sin
            config=None, cancel=None, deadline=None):
     from .reporter import fingerprint, issue_payload
     from .filesystem import path_identity
-    root = Path(root).absolute()
-    if root.is_symlink():
-        raise ValueError('diagnostic root must not traverse symlinks')
+    root = Path(os.path.realpath(root))
     register_reader(root, queue.path)
     counts = {'enqueued': 0, 'invalid': 0, 'scanned_bytes': 0, 'limited': 0, 'files': 0, 'caller_errors': 0, 'before_start': 0, 'consent_skipped': 0}
     with queue.connect() as db:

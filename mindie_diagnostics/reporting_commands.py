@@ -50,8 +50,10 @@ from .integration import reporting_status, _worker_view
 
 def _state(config):
     path = f._as_local_absolute(f.state_path(config))
-    if path is None or path.is_symlink():
+    if path is None:
         raise ValueError('unsafe_state_directory')
+    if path.is_symlink() or any(item.is_symlink() for item in path.parents):
+        path = Path(os.path.realpath(path))
     try:
         f._private_mkdir(path, parents=True, exist_ok=True)
     except TimeoutError:
@@ -66,30 +68,9 @@ def _state(config):
 def maintain(config=None, *, update_running=False, unit_dir=None, budget_seconds=75):
     """Offline queue expiry/intake and log retention, including reporting OFF.
 
-    One absolute budget (finite, nonnegative) is captured at
-    entry (capped at ``max(75, _UPDATE_BUDGET_S + 15)``) and shared by offline
-    cleanup and the optional handoff; the clock is
-    never reset. It admits stages rather than capping total runtime: a root,
-    its intake or its retention starts only while ``_SETTLEMENT_RESERVE_S``
-    remains, intake scans until ``deadline - _SETTLEMENT_RESERVE_S``, and work
-    already inside a lawful SQLite wait may finish after the budget. A budget
-    smaller than that reserve therefore completes no root and says so
-    (``budget_exhausted``) instead of starting a scan it must cut off.
-    With ``update_running`` an additional bounded automatic
-    handoff of an already running owned reporter to the installed source is
-    attempted via :func:`upgrade_running`, but only when at least 61s remain
-    (complete 60s handoff plus 1s exit margin). OFF, unconfigured,
-    not-running, current, older-source and insufficient-budget skips are
-    normal; a failed, suppressed or conflicting handoff degrades the
-    aggregate status.
-
-    Phases are independent: consent withdrawal, per-root intake and per-root
-    local retention each report their own outcome and degrade the aggregate
-    status without cancelling the others. Intake stays fail-closed (it runs
-    only under an enabled policy); retention is purely local and runs for the
-    roots this policy already declares. A policy file that exists but cannot
-    be read still returns ``configuration_unavailable`` before any root is
-    known, so its retention remains blocked by design, not by accident.
+    Shares one capped monotonic budget (`_SETTLEMENT_RESERVE_S = 3.0s` per stage);
+    consent withdrawal, intake (enabled policies only), and local retention run
+    independently without cancelling sibling phases.
     """
     from .maintenance import prune
     from .outbox import Outbox
@@ -193,6 +174,14 @@ def maintain(config=None, *, update_running=False, unit_dir=None, budget_seconds
             result['retention'].append({'status': 'unavailable', 'category': type(exc).__name__})
     if any(row.get('limited') for row in result['ingestion'] + result['retention']):
         result['status'] = 'degraded'
+    if enabled and active_queue is not None and deadline - time.monotonic() >= 1.0:
+        next_due = active_queue.next_retry_at()
+        if next_due is not None:
+            from .wake_schedule import sync_retry_wake
+            sync_retry_wake(
+                f.state_path(config), config, next_wake_at=next_due, now=active_queue.clock(),
+                unit_dir=unit_dir, runner=_bounded_runner(min(deadline, time.monotonic() + 5.0)),
+            )
     if update_running:
         if deadline - time.monotonic() < 61:
             update = {'status': 'skipped', 'reason': 'insufficient_budget'}
@@ -254,23 +243,30 @@ def ensure(config=None, *, unit_dir=None):
             queue = Outbox(state / 'reporter.sqlite3')
             for root_dir in policy['roots']:
                 register_reader(root_dir, queue.path)
-            migration = None
-            if policy.get("consent_config"):
-                # Only the legacy owned instance bound to this exact policy
-                # may retire. Another profile's service remains untouched.
-                migration = remove_service(expected_reporting_config=config, runner=runner)
+            from .wake_schedule import retire_legacy_services
+            migration = retire_legacy_services(config, active_unit_dir=unit_dir, runner=runner)
             native = ensure_reporter_service(policy['roots'], state, policy['repository'],
                 python=runtime['python'], gh=gh, reporting_config=str(f.policy_path(config)), unit_dir=unit_dir,
                 expected_consent_revision=consent_revision, runner=runner,
                 since="1970-01-01T00:00:00Z")
+            native_status = service_status(unit_dir=unit_dir, runner=runner)
+            if native_status.get('status') == 'disabled' or native.get('start_requested') is False:
+                return {'status': 'disabled_by_user', 'mode': 'on_demand',
+                        'runtime': runtime, 'service': native, 'service_status': native_status,
+                        'worker': _worker_view(config), 'legacy_service': migration}
             readback_deadline = min(deadline - 5, time.monotonic() + 8)
             worker = _worker_view(config)
             while time.monotonic() < readback_deadline and not (worker.get('healthy') and worker.get('runtime_source') == runtime['source_hash']):
                 time.sleep(.1)
                 worker = _worker_view(config)
             native_status = service_status(unit_dir=unit_dir, runner=runner)
-            ready = worker.get('healthy') and worker.get('runtime_source') == runtime['source_hash'] and native_status.get('status') == 'active'
+            ready = bool(
+                worker.get('healthy')
+                and worker.get('runtime_source') == runtime['source_hash']
+                and native_status.get('status') in {'active', 'idle', 'inactive'}
+            )
             response = {'status': 'running' if ready else 'degraded',
+                        'mode': 'on_demand',
                         'runtime': runtime, 'service': native, 'service_status': native_status, 'worker': worker,
                         'legacy_service': migration,
                         'recovery_hint': 'Inspect reporting status; an explicit reporting ensure may restart a stopped worker.'}
@@ -392,21 +388,22 @@ def _service_definition_files(unit_dir, config, deadline=None):
             raise
         except OSError:
             pass
-    try:
-        from .service import _unit_path
-        files.append(_unit_path(unit_dir))
-    except TimeoutError:
-        raise
-    except (AttributeError, OSError, ValueError):
-        pass
-    try:
-        from .platform_service import _paths as service_paths
-        manifest, _label, unit = service_paths(unit_dir)
-        files.extend((manifest, unit))
-    except TimeoutError:
-        raise
-    except (AttributeError, OSError, ValueError):
-        pass
+    for candidate_dir in ({unit_dir, None} if unit_dir is not None else {None}):
+        try:
+            from .service import _unit_path
+            files.append(_unit_path(candidate_dir))
+        except TimeoutError:
+            raise
+        except (AttributeError, OSError, ValueError):
+            pass
+        try:
+            from .platform_service import _paths as service_paths
+            manifest, _label, unit = service_paths(candidate_dir)
+            files.extend((manifest, unit))
+        except TimeoutError:
+            raise
+        except (AttributeError, OSError, ValueError):
+            pass
     return files
 
 
@@ -625,7 +622,7 @@ def upgrade_running(config=None, *, unit_dir=None, deadline=None):
         if not gh:
             return {'status': 'skipped', 'reason': 'gh_unavailable'}
         native = service_status(unit_dir=unit_dir, runner=runner)
-        if native.get('status') != 'active':
+        if native.get('status') not in {'active', 'idle', 'inactive'}:
             return {'status': 'skipped', 'reason': 'reporter_service_not_running',
                     'service_status': native.get('status')}
         worker = _worker_view(config)
@@ -693,7 +690,7 @@ def upgrade_running(config=None, *, unit_dir=None, deadline=None):
                     worker = _worker_view(config)
                 native_status = service_status(unit_dir=unit_dir, runner=runner)
                 if (worker.get('healthy') and worker.get('runtime_source') == source_hash
-                        and native_status.get('status') == 'active'):
+                        and native_status.get('status') in {'active', 'idle', 'inactive'}):
                     _publish(root, {'schema': 1, 'source_hash': source_hash,
                                     'version': version, 'revision': revision})
                     updated = {'status': 'updated', 'reason': 'reporter_updated',
@@ -760,7 +757,7 @@ def upgrade_running(config=None, *, unit_dir=None, deadline=None):
                     rollback = ('restored'
                                 if worker.get('healthy')
                                 and worker.get('runtime_source') == current['source_hash']
-                                and native_status.get('status') == 'active'
+                                and native_status.get('status') in {'active', 'idle', 'inactive'}
                                 else 'unproven')
                 except subprocess.TimeoutExpired:
                     rollback = 'deadline_exceeded'

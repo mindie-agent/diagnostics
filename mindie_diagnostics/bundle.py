@@ -239,7 +239,7 @@ def export_issue_event(record):
 
 
 def _safe_open(path):
-    if any(parent.is_symlink() for parent in (path, *path.parents)):
+    if Path(path).is_symlink():
         raise ValueError("symlink diagnostics input refused")
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
     if not stat.S_ISREG(os.fstat(fd).st_mode):
@@ -250,16 +250,18 @@ def _safe_open(path):
 
 def _write_output(path, raw):
     path = Path(path).absolute()
-    if any(parent.is_symlink() for parent in (path, *path.parents)):
-        raise ValueError("bundle output must not traverse symlinks")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, stage = tempfile.mkstemp(prefix=".diagnostics-", dir=path.parent)
+    if path.is_symlink():
+        raise ValueError("bundle output must not be a symlink")
+    parent = Path(os.path.realpath(path.parent)) if (path.parent.is_symlink() or any(p.is_symlink() for p in path.parents)) else path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    target = parent / path.name
+    fd, stage = tempfile.mkstemp(prefix=".diagnostics-", dir=parent)
     try:
         with os.fdopen(fd, "wb") as stream:
             stream.write(raw)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(stage, path)
+        os.replace(stage, target)
     finally:
         if os.path.exists(stage):
             os.unlink(stage)
@@ -274,9 +276,7 @@ def collect_bundle(root=None, *, operation_id=None, output=None, max_bytes=MAX_B
     if root is None:
         from .fallback import default_root
         root = default_root()
-    root = Path(root).expanduser().absolute()
-    if any(parent.is_symlink() for parent in (root, *root.parents)):
-        raise ValueError("bundle root must not traverse symlinks")
+    root = Path(os.path.realpath(Path(root).expanduser()))
     events_root = root / "events"
     if events_root.is_symlink():
         raise ValueError("event directory must not be a symlink")

@@ -1,9 +1,10 @@
 """CLI entry point (`mindie-diagnostics`) for bundles, services, reporting, and Scale-to-Zero drain worker.
 
 [Role]
-Provides the `mindie-diagnostics` command-line interface (`bundle`, `status`,
-`service`, `reporting`, `worker`) and executes the bounded coalesced Scale-to-Zero
-drain worker (`run_cycle`: `consent` -> `ingest` -> `retention` -> `report`).
+Provides the `mindie-diagnostics` command-line interface (`doctor`, `bundle`,
+`status`, `service`, `reporting`, `worker`) and executes the bounded coalesced
+Scale-to-Zero drain worker (`run_cycle`: `consent` -> `ingest` -> `retention` ->
+`report`).
 
 [Invariants]
 - Each stage in `run_cycle` is isolated so an ingestion or retention failure
@@ -135,6 +136,12 @@ def run_cycle(args, queue, github, recorder, health, *, since=None, cancel=None)
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(prog="mindie-diagnostics", description="Local diagnostics and independently enabled automatic issue reporting")
     sub = result.add_subparsers(dest="command", required=True)
+    doctor = sub.add_parser("doctor", help="inspect the local installation read-only and print one JSON report")
+    doctor.add_argument("--adapter-config", help="optional host adapter profile JSON")
+    doctor.add_argument("--cwd", help="project directory used for scope containment (defaults to the process cwd)")
+    doctor.add_argument("--reporting-config", help="optional independent reporting policy JSON")
+    doctor.add_argument("--state", dest="state_dir", help="optional local diagnostics state directory (inspected read-only)")
+    doctor.add_argument("--probe-remote", action="store_true", help="run one bounded read-only SSH/NPU reachability probe")
     bundle = sub.add_parser("bundle", help="export a bounded sanitized support bundle, without uploading")
     bundle.add_argument("--root", default=None, help="optional diagnostic log root (defaults to platform local state root)")
     bundle.add_argument("--operation-id")
@@ -191,6 +198,19 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    if args.command == 'doctor':
+        from .doctor import run_doctor
+        try:
+            result = run_doctor(adapter_config=args.adapter_config, cwd=args.cwd,
+                                reporting_config=args.reporting_config, state_dir=args.state_dir,
+                                probe_remote=args.probe_remote)
+        except TimeoutError:
+            raise
+        except Exception as exc:
+            result = {'schema': 'mindie-doctor/1', 'overall_status': 'degraded',
+                      'category': 'doctor_failed', 'error_type': type(exc).__name__}
+        print(json.dumps(result, ensure_ascii=True))
+        return 0
     if args.command == 'reporting':
         from .integration import reporting_status, configure_reporting
         from .reporting_commands import ensure, maintain

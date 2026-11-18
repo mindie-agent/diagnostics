@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mindie-agent/diagnostics/releases"><img src="https://img.shields.io/badge/Release-v0.5.16-blue" alt="Release v0.5.16"></a>
+  <a href="https://github.com/mindie-agent/diagnostics/releases"><img src="https://img.shields.io/badge/Release-v0.5.17-blue" alt="Release v0.5.17"></a>
   <img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/Execution-100%25%20Model--Free-success" alt="100% Model-Free">
   <img src="https://img.shields.io/badge/Privacy-Strict%20Allowlist-blue" alt="Strict Allowlist Privacy">
@@ -86,6 +86,22 @@ If you are an AI Agent receiving the prompt above, follow these steps to install
 4. **Report Back**: Show the user the output of `reporting status` and let them know how to export offline bundles or toggle opt-in reporting anytime.
 
 </details>
+
+---
+
+## One-Command Installation Check (Read-Only `doctor`)
+
+`mindie-diagnostics doctor` summarizes the current runtime, consent tier, remote NPU endpoints, GitHub channel, and local diagnostics in one `mindie-doctor/1` JSON report. It is **strictly read-only**: it never creates config, databases, WAL/SHM sidecars, or background workers, and never echoes password fields from endpoint files.
+
+```bash
+# Local inspection; missing optional gh / NPU endpoints do not become degraded
+python3 -m mindie_diagnostics.cli doctor
+
+# Optional: run one bounded read-only SSH/NPU reachability probe
+python3 -m mindie_diagnostics.cli doctor --probe-remote
+```
+
+`overall_status` is `healthy`, `attention_needed`, or `degraded`; `remediations` provides concise next steps. If a helper tool is temporarily unavailable, agents can always continue through native `ssh` or local scripts.
 
 ---
 

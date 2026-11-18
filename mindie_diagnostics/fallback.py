@@ -200,7 +200,7 @@ def contribution_authority(path):
         data = json.loads(raw) if raw is not None else None
         if not isinstance(data, dict) or data.get("schema") != "mindie-consent/1":
             raise PolicyUnavailable()
-        if data.get("choice") not in (None, "contribute", "read-only", "later", "disabled"):
+        if data.get("choice") not in (None, "contribute", "local-only", "read-only", "later", "disabled"):
             raise PolicyUnavailable()
         revision = data.get("choice_revision")
         if revision is not None and not _valid_incident(revision):

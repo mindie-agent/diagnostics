@@ -19,7 +19,9 @@ from .logging import configure, get_recorder
 from .bundle import collect_bundle, export_public_event
 from .redact import redact_text
 from .process_output import capture_output
+from .doctor import run_doctor
 
-__version__ = "0.5.16"
+__version__ = "0.5.17"
 __all__ = ["configure", "get_recorder", "current_context", "bind_context",
-           "wrap_context", "collect_bundle", "export_public_event", "redact_text", "capture_output"]
+           "wrap_context", "collect_bundle", "export_public_event", "redact_text",
+           "capture_output", "run_doctor"]

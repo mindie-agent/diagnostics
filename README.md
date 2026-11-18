@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/mindie-agent/diagnostics/releases"><img src="https://img.shields.io/badge/Release-v0.5.16-blue" alt="Release v0.5.16"></a>
+  <a href="https://github.com/mindie-agent/diagnostics/releases"><img src="https://img.shields.io/badge/Release-v0.5.17-blue" alt="Release v0.5.17"></a>
   <img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/Execution-100%25%20Model--Free-success" alt="100% Model-Free">
   <img src="https://img.shields.io/badge/Privacy-Strict%20Allowlist-blue" alt="Strict Allowlist Privacy">
@@ -86,6 +86,22 @@ flowchart LR
 4. **告知用户**：向用户展示当前 `reporting status` 的结果，并说明如何随时开启/关闭自动上报或导出离线诊断包。
 
 </details>
+
+---
+
+## 一键安装体检（只读 `doctor`）
+
+`mindie-diagnostics doctor` 会以一份 `mindie-doctor/1` JSON 汇总当前运行时、授权档位、远程 NPU 端点、GitHub 通道与本地诊断状态。它**严格只读**：不会创建配置、数据库、WAL/SHM 伴随文件或后台 Worker，也不会回显端点文件里的密码字段。
+
+```bash
+# 本地体检；缺少可选的 gh / NPU 端点不会误报 degraded
+python3 -m mindie_diagnostics.cli doctor
+
+# 可选：额外执行一次有界只读 SSH/NPU 可达性探测
+python3 -m mindie_diagnostics.cli doctor --probe-remote
+```
+
+`overall_status` 为 `healthy`、`attention_needed` 或 `degraded`；`remediations` 会给出下一步修复建议。即使任何辅助工具暂时不可用，Agent 仍可通过原生 `ssh` 或本地脚本继续任务。
 
 ---
 

@@ -9,4 +9,5 @@
 | 文档主题 | 中文 | English | 你能在这里查到什么 |
 | --- | --- | --- | --- |
 | 架构、Scale-to-Zero 排空、隐私白名单与日志轮转 | [architecture-and-privacy.md](./architecture-and-privacy.md) | [architecture-and-privacy.en.md](./architecture-and-privacy.en.md) | 白名单投影、`mindie-harness` 共管栈归因、Scale-to-Zero 按需排空（零常驻空闲进程与零 15 秒心跳 `fsync`）、`7d` 仅限未发送 `pending` 过期（保留 `uncertain` 对账与已发布指纹）以及 4 × 1 MiB 环形日志轮转 |
+| 子进程有界异常证据采集与白名单校验接口 | [exception-evidence.md](./exception-evidence.md) | [exception-evidence.en.md](./exception-evidence.en.md) | `exception_evidence` / `validate_evidence` 纯内存有界栈帧提取、`source_root` 词法命名空间映射、`mindie_harness` 共管栈保留与跨进程不可信输入投影 |
 | 历史方案归档索引 | [archive/README.md](./archive/README.md) | [archive/README.md](./archive/README.md) | 早期出站对账后续设计讨论归档（仅供历史溯源，不作为当前门禁） |
